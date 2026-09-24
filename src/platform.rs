@@ -221,3 +221,152 @@ pub fn advise_sequential(file: &File) -> io::Result<()> {
 pub fn advise_sequential(_file: &File) -> io::Result<()> {
     Ok(())
 }
+
+/// Lightweight per-path filesystem info used by preallocation, BufWriter
+/// tuning, and the auto-tune startup logic.
+#[derive(Clone, Debug)]
+pub struct FsInfo {
+    /// Filesystem type from statfs — "apfs", "exfat", "msdos", "ntfs", "hfs", …
+    pub fs_type: String,
+    /// Optimal I/O block size the OS suggests for this filesystem (bytes).
+    pub iosize: u32,
+    /// Fundamental block size (bytes) — often the cluster/allocation unit.
+    #[allow(dead_code)]
+    pub bsize: u32,
+    /// Mount point.
+    #[allow(dead_code)]
+    pub mount_point: std::path::PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+pub fn fs_info(path: &Path) -> io::Result<FsInfo> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL"))?;
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(cpath.as_ptr(), &mut sfs) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fs_type = unsafe { std::ffi::CStr::from_ptr(sfs.f_fstypename.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let mount_point = unsafe { std::ffi::CStr::from_ptr(sfs.f_mntonname.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    Ok(FsInfo {
+        fs_type,
+        iosize: sfs.f_iosize.max(0) as u32,
+        bsize: sfs.f_bsize as u32,
+        mount_point: std::path::PathBuf::from(mount_point),
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn fs_info(path: &Path) -> io::Result<FsInfo> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL"))?;
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(cpath.as_ptr(), &mut sfs) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Best-effort fs_type on Linux — libc gives us f_type as a magic number,
+    // not a name. Just report "unknown" and rely on other signals.
+    Ok(FsInfo {
+        fs_type: "unknown".into(),
+        iosize: sfs.f_bsize as u32,
+        bsize: sfs.f_bsize as u32,
+        mount_point: std::path::PathBuf::from("/"),
+    })
+}
+
+#[cfg(not(unix))]
+pub fn fs_info(_path: &Path) -> io::Result<FsInfo> {
+    Ok(FsInfo {
+        fs_type: "unknown".into(),
+        iosize: 65536,
+        bsize: 4096,
+        mount_point: std::path::PathBuf::from("/"),
+    })
+}
+
+/// Reserve `len` bytes of extents for `file` WITHOUT changing its logical
+/// size. Best-effort — errors are swallowed by the caller since a failed
+/// preallocation just means writes fall back to normal growth.
+///
+/// - macOS: `F_PREALLOCATE` — first attempt contiguous (`F_ALLOCATECONTIG`),
+///   fall back to any layout (`F_ALLOCATEALL`).
+/// - Linux: `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)`.
+/// - Others: no-op.
+#[cfg(target_os = "macos")]
+pub fn preallocate(file: &File, len: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    // fstore_t struct (from <sys/fcntl.h>):
+    //   uint32_t fst_flags;    // F_ALLOCATECONTIG | F_ALLOCATEALL | F_ALLOCATEPERSIST
+    //   int32_t  fst_posmode;  // F_PEOFPOSMODE | F_VOLPOSMODE
+    //   off_t    fst_offset;
+    //   off_t    fst_length;
+    //   off_t    fst_bytesalloc;
+    #[repr(C)]
+    struct FStore {
+        fst_flags: u32,
+        fst_posmode: i32,
+        fst_offset: i64,
+        fst_length: i64,
+        fst_bytesalloc: i64,
+    }
+    const F_PREALLOCATE: libc::c_int = 42;
+    const F_ALLOCATECONTIG: u32 = 0x0000_0002;
+    const F_ALLOCATEALL: u32 = 0x0000_0004;
+    const F_PEOFPOSMODE: i32 = 3;
+
+    let fd = file.as_raw_fd();
+
+    // Try contiguous first (best for exFAT / FAT-family — avoids extent bloat).
+    let mut fs = FStore {
+        fst_flags: F_ALLOCATECONTIG,
+        fst_posmode: F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: len as i64,
+        fst_bytesalloc: 0,
+    };
+    let rc = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut fs as *mut _) };
+    if rc == -1 {
+        // Fall back to non-contiguous
+        fs.fst_flags = F_ALLOCATEALL;
+        fs.fst_bytesalloc = 0;
+        let rc = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut fs as *mut _) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn preallocate(file: &File, len: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let rc = unsafe {
+        libc::fallocate(
+            fd,
+            libc::FALLOC_FL_KEEP_SIZE,
+            0,
+            len as libc::off_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn preallocate(_file: &File, _len: u64) -> io::Result<()> {
+    Ok(())
+}

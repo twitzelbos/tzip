@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 
 mod cli;
 mod compress;
@@ -18,8 +18,16 @@ mod bulk_walker;
 #[cfg(target_os = "macos")]
 mod dispatch_io;
 
+#[cfg(target_os = "macos")]
+mod usb_info;
+
 fn main() -> Result<()> {
-    let args = cli::Args::parse();
-    let opts = args.into_options()?;
+    // Parse via ArgMatches so we can inspect which flags came from the
+    // command line vs took the default (needed by the auto-tune step to
+    // avoid overriding user intent).
+    let matches = cli::Args::command().get_matches();
+    let args = cli::Args::from_arg_matches(&matches)?;
+    let user_flags = cli::UserSetFlags::from_matches(&matches);
+    let opts = args.into_options(user_flags)?;
     pipeline::run(opts)
 }

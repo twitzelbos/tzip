@@ -251,6 +251,14 @@ pipeline finishes in-flight items before exiting.
 
 ### Design summary
 
+- **Output preallocation.** At archive open, tzip reserves extents on
+  disk via `F_PREALLOCATE` (macOS) / `fallocate(FALLOC_FL_KEEP_SIZE)`
+  (Linux) sized to `1.05 × uncompressed_bytes` in batch mode, or 256 MiB
+  in streaming mode. Unused tail is trimmed via `ftruncate` at finish.
+  Big win on exFAT (single-extent output vs fragmented growth).
+- **FS-aware writer buffer.** `BufWriter` capacity defaults to 4 MiB but
+  scales up to 16 MiB on exFAT/msdos to align with large clusters, and
+  scales with `f_iosize` on other filesystems.
 - **Per-file parallelism.** Rayon-sized pool of CPU workers (default =
   physical core count). Each worker owns a `Scratch` with a reusable
   DEFLATE output buffer and cached `libdeflater::Compressor` (no
@@ -314,6 +322,24 @@ Same 124 MB / 500-file corpus:
 | `.7z` solid `-x 6` | 13.04s | 89% | 51.2 MB |
 
 ---
+
+## Auto-tuned defaults
+
+At startup tzip probes each source path and the output archive's parent
+directory. If any of them lives on **APFS-over-USB** it switches to a
+safe combo (`keep_cache=on, read_jobs=1, dispatch_io=on`) and prints a
+one-line notice. If any lives on **NTFS-on-macOS** it enables
+`keep_cache=on`. Any flag you set explicitly on the command line is
+left alone.
+
+```
+$ tzip out.zip /Volumes/BadDrive/src/
+tzip: auto-tuned defaults for APFS-on-USB source (keep_cache=on, read_jobs=1, dispatch_io=on). Override with the same flag.
+[...]
+```
+
+Suppress the notice with `-q`. See [Known limitations](#known-limitations)
+for what auto-tune does and doesn't cover.
 
 ## External-drive tuning
 

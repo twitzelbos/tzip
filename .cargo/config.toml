@@ -1,0 +1,6 @@
+# Enable native codegen so `aes`/`sha1`/`crc32fast` runtime dispatch selects
+# the ARMv8 crypto and NEON paths (Apple Silicon) or SHA-NI/AES-NI/AVX2 paths
+# (x86_64). Without this, cpufeatures still runs but the compiler may not have
+# inlined the accelerated code paths.
+[build]
+rustflags = ["-C", "target-cpu=native"]

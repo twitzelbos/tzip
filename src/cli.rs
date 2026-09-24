@@ -1,6 +1,27 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, Parser, ValueEnum};
 use std::path::PathBuf;
+
+/// Tracks which auto-tunable flags came from the command line (vs took the
+/// default). Auto-tune only overrides fields marked `false` here.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UserSetFlags {
+    pub keep_cache: bool,
+    pub read_jobs: bool,
+    pub dispatch_io: bool,
+}
+
+impl UserSetFlags {
+    pub fn from_matches(m: &ArgMatches) -> Self {
+        let is_cli = |name: &str| m.value_source(name) == Some(ValueSource::CommandLine);
+        Self {
+            keep_cache: is_cli("keep_cache"),
+            read_jobs: is_cli("read_jobs"),
+            dispatch_io: is_cli("dispatch_io"),
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Method {
@@ -74,6 +95,12 @@ pub struct Args {
     #[arg(long)]
     pub dispatch_io: bool,
 
+    /// Print a USB/drive diagnostic for any inputs or output on a USB bus
+    /// before archiving. macOS only; a no-op elsewhere. Shows negotiated link
+    /// speed, filesystem, media name, and tuning advisories.
+    #[arg(long)]
+    pub usb_info: bool,
+
     /// Encryption password. Use `-` to read from stdin (tty prompt if interactive).
     #[arg(short = 'p', long)]
     pub password: Option<String>,
@@ -131,10 +158,12 @@ pub struct Options {
     pub tui: bool,
     pub classic_walk: bool,
     pub dispatch_io: bool,
+    pub usb_info: bool,
+    pub user_flags: UserSetFlags,
 }
 
 impl Args {
-    pub fn into_options(self) -> Result<Options> {
+    pub fn into_options(self, user_flags: UserSetFlags) -> Result<Options> {
         let cpu_jobs = self
             .jobs
             .unwrap_or_else(|| num_cpus::get_physical().max(1));
@@ -183,6 +212,8 @@ impl Args {
             tui: self.tui,
             classic_walk: self.classic_walk,
             dispatch_io: self.dispatch_io,
+            usb_info: self.usb_info,
+            user_flags,
         })
     }
 }

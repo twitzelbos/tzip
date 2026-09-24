@@ -73,6 +73,20 @@ struct RawItem {
 }
 
 pub fn run(opts: Options) -> Result<()> {
+    // Optional USB / drive diagnostic — only prints if the workload actually
+    // touches a USB-backed filesystem. Cheap when everything is internal.
+    #[cfg(target_os = "macos")]
+    {
+        if opts.usb_info {
+            let reports = crate::usb_info::probe_workload(&opts.paths, &opts.archive);
+            crate::usb_info::print_reports(&reports, opts.read_jobs, opts.keep_cache);
+        }
+    }
+
+    // Auto-tune defaults based on source/output filesystem. User-set flags
+    // are never overridden.
+    let opts = auto_tune(opts);
+
     // .7z solid needs the full list up front (it's serial LZMA2 and the
     // sevenz-rust API takes an ordered iterator). Use the batch walk.
     if opts.solid {
@@ -126,10 +140,32 @@ pub fn run(opts: Options) -> Result<()> {
         None
     };
 
-    // 2. Open archive
+    // 2. Open archive + best-effort preallocation + FS-aware buffer sizing
     let file = File::create(&opts.archive)
         .with_context(|| format!("create archive {}", opts.archive.display()))?;
-    let writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    let out_info = platform::fs_info(
+        opts.archive
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new(".")),
+    )
+    .ok();
+
+    // Preallocate extents if we know an upper-bound size. Upper-bound for
+    // any compression method is `uncompressed_total × 1.05` (AES adds
+    // ~28 bytes/entry + CDR overhead). Streaming mode with unknown total
+    // preallocates a modest 256 MiB default.
+    let preallocate_len: u64 = if total_bytes_hint > 0 {
+        (total_bytes_hint as f64 * 1.05).round() as u64
+    } else {
+        256 * 1024 * 1024
+    };
+    let _ = platform::preallocate(&file, preallocate_len);
+
+    // BufWriter capacity — bump on exFAT/msdos (large clusters, sequential
+    // writes benefit from big flushes) and scale to iosize otherwise.
+    let cap = choose_writer_capacity(out_info.as_ref());
+    let writer = BufWriter::with_capacity(cap, file);
     let mut zw = ZipWriter::new(writer);
 
     // 3. Channels: feed → read → cpu → writer
@@ -339,14 +375,116 @@ pub fn run(opts: Options) -> Result<()> {
 
     let inner = zw.finish()?;
     let mut buf_writer = inner;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     buf_writer.flush()?;
+    // Trim any unused preallocated tail so the archive's on-disk size
+    // matches its logical size. Ignore errors — worst case the file uses
+    // slightly more disk than st_size reports until next mount cycle.
+    let actual_len = buf_writer.stream_position().unwrap_or(0);
+    if actual_len > 0 {
+        let file = buf_writer.get_mut();
+        let _ = file.set_len(actual_len);
+        let _ = file.seek(SeekFrom::End(0));
+    }
 
     progress.finish("done");
     if let Some(t) = tui_handle {
         t.finish();
     }
     Ok(())
+}
+
+/// Pick BufWriter capacity for the output based on filesystem info.
+fn choose_writer_capacity(info: Option<&platform::FsInfo>) -> usize {
+    const MIN: usize = 4 * 1024 * 1024;
+    const EXFAT_CAP: usize = 16 * 1024 * 1024;
+    let Some(info) = info else {
+        return MIN;
+    };
+    let fs = info.fs_type.to_ascii_lowercase();
+    if fs == "exfat" || fs == "msdos" {
+        return EXFAT_CAP;
+    }
+    let scaled = (info.iosize as usize).saturating_mul(4);
+    scaled.max(MIN)
+}
+
+/// Auto-adjust defaults based on the source/output filesystem when the user
+/// hasn't set the relevant flags explicitly. Prints a one-line note when
+/// anything changes so behavior stays transparent.
+///
+/// Current rules (macOS only — non-macOS defaults are already reasonable):
+///   * source or output on APFS-over-USB → keep_cache=true, read_jobs=1,
+///     dispatch_io=true. F_NOCACHE and multi-reader thrash on this combo.
+///   * source or output on NTFS-on-macOS → keep_cache=true. Apple's stock
+///     NTFS driver is heavily page-cache-oriented; F_NOCACHE hurts reads.
+fn auto_tune(mut opts: Options) -> Options {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return opts;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use crate::usb_info::probe_path;
+
+        // Collect fs snapshots for every input + the output's parent dir.
+        let mut probes: Vec<crate::usb_info::SourceReport> = Vec::new();
+        for p in &opts.paths {
+            if let Ok(r) = probe_path(p) {
+                probes.push(r);
+            }
+        }
+        let out_parent = opts
+            .archive
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if let Ok(r) = probe_path(&out_parent) {
+            probes.push(r);
+        }
+
+        let apfs_on_usb = probes.iter().any(|r| {
+            r.fs_type.eq_ignore_ascii_case("apfs")
+                && r.bus_protocol.as_deref() == Some("USB")
+        });
+        let ntfs_on_mac = probes
+            .iter()
+            .any(|r| r.fs_type.to_ascii_lowercase().contains("ntfs"));
+
+        let mut changes: Vec<String> = Vec::new();
+
+        if apfs_on_usb {
+            if !opts.user_flags.keep_cache && !opts.keep_cache {
+                opts.keep_cache = true;
+                changes.push("keep_cache=on".into());
+            }
+            if !opts.user_flags.read_jobs && opts.read_jobs > 1 {
+                opts.read_jobs = 1;
+                changes.push("read_jobs=1".into());
+            }
+            if !opts.user_flags.dispatch_io && !opts.dispatch_io {
+                opts.dispatch_io = true;
+                changes.push("dispatch_io=on".into());
+            }
+        } else if ntfs_on_mac {
+            if !opts.user_flags.keep_cache && !opts.keep_cache {
+                opts.keep_cache = true;
+                changes.push("keep_cache=on".into());
+            }
+        }
+
+        if !changes.is_empty() && !opts.quiet {
+            let reason = if apfs_on_usb { "APFS-on-USB" } else { "NTFS-on-macOS" };
+            eprintln!(
+                "tzip: auto-tuned defaults for {} source ({}). Override with the same flag.",
+                reason,
+                changes.join(", ")
+            );
+        }
+        opts
+    }
 }
 
 fn encode_one(

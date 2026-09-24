@@ -18,7 +18,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 
 - Written in Rust (edition 2021)
 - Single static binary, `cargo build --release`
-- MIT OR Apache-2.0
+- BSD-3-Clause
 
 ---
 
@@ -610,4 +610,4 @@ The suite in `tests/roundtrip.rs` covers:
 
 ## License
 
-MIT OR Apache-2.0 at your option.
+BSD-3-Clause. See [LICENSE](LICENSE).

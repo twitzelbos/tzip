@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Thomas Witzel <thomas@q.bio>"]
 description = "The best zip tool ever — parallel, hardware-AES-256, DEFLATE via libdeflater"
-license = "MIT OR Apache-2.0"
+license = "BSD-3-Clause"
 
 [[bin]]
 name = "tzip"

@@ -599,6 +599,78 @@ impl<R: Read + Seek> ApfsVolume<R> {
         Ok(buf)
     }
 
+    /// Batch-fetch inode records for every obj_id in `[min_oid, max_oid]`
+    /// via one B-tree range scan. Massively cheaper than N `lookup_inode`
+    /// calls when a caller has children OIDs from `list_directory_names`
+    /// and needs their metadata — interior B-tree nodes are walked once
+    /// instead of N times. LOCAL PATCH (tzip).
+    pub fn batch_inodes_in_range(
+        &mut self,
+        min_oid: u64,
+        max_oid: u64,
+    ) -> Result<Vec<(u64, catalog::InodeVal)>> {
+        catalog::batch_inodes_in_range(
+            &mut self.reader,
+            self.catalog_root_block,
+            self.vol_omap_root_block,
+            self.block_size,
+            min_oid,
+            max_oid,
+        )
+    }
+
+    /// Read a file by its OID, reusing a pre-fetched inode instead of
+    /// looking it up again. LOCAL PATCH (tzip). Use in the reader hot
+    /// path when the walker has already batch-fetched inodes for the
+    /// same directory — cuts one B-tree walk per file.
+    pub fn read_file_by_oid_with_inode(
+        &mut self,
+        oid: u64,
+        inode: &catalog::InodeVal,
+    ) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.read_file_with_inode_to(oid, inode, &mut buf)?;
+        Ok(buf)
+    }
+
+    fn read_file_with_inode_to<W: Write>(
+        &mut self,
+        oid: u64,
+        inode: &catalog::InodeVal,
+        writer: &mut W,
+    ) -> Result<u64> {
+        // Symlink: target stored in xattr
+        if inode.kind() == catalog::INODE_SYMLINK_TYPE
+            && let Some(target) = self.symlink_target(oid)?
+        {
+            writer.write_all(&target)?;
+            return Ok(target.len() as u64);
+        }
+        // Compressed: read decmpfs
+        if inode.kind() != catalog::INODE_SYMLINK_TYPE
+            && let Some(header) = self.compression(oid)?
+        {
+            let data = self.read_compressed(oid, &header)?;
+            writer.write_all(&data)?;
+            return Ok(data.len() as u64);
+        }
+        // Regular extents (keyed by private_id, not OID).
+        let file_extents = catalog::lookup_extents(
+            &mut self.reader,
+            self.catalog_root_block,
+            self.vol_omap_root_block,
+            self.block_size,
+            inode.private_id,
+        )?;
+        extents::read_file_data(
+            &mut self.reader,
+            self.block_size,
+            &file_extents,
+            inode.size(),
+            writer,
+        )
+    }
+
     pub fn read_file_by_oid_to<W: Write>(&mut self, oid: u64, writer: &mut W) -> Result<u64> {
         let inode = catalog::lookup_inode(
             &mut self.reader,

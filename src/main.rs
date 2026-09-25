@@ -21,6 +21,9 @@ mod dispatch_io;
 #[cfg(target_os = "macos")]
 mod usb_info;
 
+#[cfg(target_os = "macos")]
+mod contention;
+
 fn main() -> Result<()> {
     // Parse via ArgMatches so we can inspect which flags came from the
     // command line vs took the default (needed by the auto-tune step to

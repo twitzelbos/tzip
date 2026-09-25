@@ -566,13 +566,12 @@ fn auto_tune(mut opts: Options) -> Options {
                 changes.push("keep_cache=on".into());
             }
             // --raw-block bypasses VFS so keep_cache/dispatch_io don't
-            // apply. It wants enough reader threads to keep multiple
-            // raw device I/Os in flight (each fd is one USB Attached
-            // SCSI queue slot) but not so many that contention on the
-            // shared block cache lock costs more than the extra
-            // parallelism buys. Empirically 8 is the sweet spot on a
-            // 10-core M1 Max against Qbio; 16 regressed to +5% wall
-            // time from mutex contention.
+            // apply. Empirically 8 is the sweet spot on Qbio USB SSD
+            // even with a sharded block cache: 16 readers doubled
+            // per-file `read` time (13 ms → 28 ms) — the drive itself
+            // serializes beyond ~8 concurrent commands, so extra fds
+            // add coordination cost without throughput. Sharded cache
+            // is kept so a faster drive would scale further.
             if opts.raw_block {
                 if !opts.user_flags.read_jobs {
                     let target = 8;

@@ -678,6 +678,67 @@ fn catalog_key(oid: u64, j_type: u8) -> impl Fn(&[u8]) -> Result<std::cmp::Order
     move |key| compare_key_to(key, oid, j_type)
 }
 
+/// LOCAL PATCH (tzip): comparator selecting every catalog record whose
+/// obj_id falls in `[min_oid, max_oid]`, regardless of record type.
+/// Used with `btree_scan` to batch-fetch e.g. all inode records for a
+/// directory's children in one B-tree walk instead of N `btree_lookup`
+/// descents. The scan visits a contiguous range of leaves; the caller
+/// filters the results to the record type it wants.
+fn catalog_key_range(
+    min_oid: u64,
+    max_oid: u64,
+) -> impl Fn(&[u8]) -> Result<std::cmp::Ordering> {
+    move |key| {
+        let (key_oid, _key_type) = decode_catalog_key(key)?;
+        Ok(if key_oid < min_oid {
+            std::cmp::Ordering::Less
+        } else if key_oid > max_oid {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        })
+    }
+}
+
+/// Batch-fetch inode records for every obj_id in `[min_oid, max_oid]`.
+/// One B-tree range scan, filtered to `J_TYPE_INODE` leaves. Massively
+/// cheaper than N `lookup_inode` calls when the caller has a bunch of
+/// child OIDs from `list_directory_names` and wants their metadata —
+/// interior B-tree nodes are traversed once instead of N times.
+pub fn batch_inodes_in_range<R: Read + Seek>(
+    reader: &mut R,
+    catalog_root: u64,
+    omap_root: u64,
+    block_size: u32,
+    min_oid: u64,
+    max_oid: u64,
+) -> Result<Vec<(u64, InodeVal)>> {
+    let compare_fn = catalog_key_range(min_oid, max_oid);
+    let entries = btree::btree_scan(
+        reader,
+        catalog_root,
+        block_size,
+        0,
+        0,
+        &compare_fn,
+        Some(omap_root),
+    )?;
+    let mut out = Vec::with_capacity(entries.len() / 4);
+    for (key, val) in entries {
+        let (key_oid, key_type) = match decode_catalog_key(&key) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if key_type != J_TYPE_INODE {
+            continue;
+        }
+        if let Ok(inode) = InodeVal::parse(&val) {
+            out.push((key_oid, inode));
+        }
+    }
+    Ok(out)
+}
+
 /// Resolve a path like "/Applications/Upscayl.app/Contents/Info.plist" to its (OID, InodeVal).
 pub fn resolve_path<R: Read + Seek>(
     reader: &mut R,

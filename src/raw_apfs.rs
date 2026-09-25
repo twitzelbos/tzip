@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use apfs::{ApfsVolume, EntryKind};
+use apfs::catalog::InodeVal;
 
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -72,15 +73,31 @@ pub struct AlignedRawReader {
     pos: u64,
     block: u64,
     scratch: Vec<u8>,
-    cache: SharedBlockCache,
+    cache: SharedBlockCacheRef,
 }
 
 /// Shared, thread-safe block cache. Keys are block-aligned device
-/// offsets; values are one block of bytes. A single `parking_lot::Mutex`
-/// guards the whole map — reads are Vec-copy fast so hold time is
-/// microseconds. If contention ever shows up in profiles, switch to
-/// `DashMap` for finer sharding.
-pub type SharedBlockCache = std::sync::Arc<parking_lot::Mutex<BlockCacheInner>>;
+/// offsets; values are one block of bytes.
+///
+/// **Sharded** across `SHARDS` independent `parking_lot::Mutex` buckets
+/// so N reader threads on different offsets don't contend on a single
+/// lock. Shard is picked by `(offset >> 12) % SHARDS` — since offsets
+/// are always block-aligned (4 KiB), the low 12 bits carry no shard
+/// entropy. FIFO eviction is per-shard, bounding total capacity to
+/// `SHARDS × per_shard_capacity` entries.
+///
+/// Contrast with the earlier single-Mutex design: at 16 reader threads
+/// against a 10-core M1 Max the single lock became the hot spot and
+/// per-file `read` regressed from 13 ms → 29 ms. This design serializes
+/// only readers hitting the same shard.
+const SHARDS: usize = 16;
+
+pub struct SharedBlockCache {
+    shards: Vec<parking_lot::Mutex<BlockCacheInner>>,
+    /// Total block-shift needed for shard picking; cached to avoid
+    /// recomputing per get/put.
+    block_shift: u32,
+}
 
 pub struct BlockCacheInner {
     map: HashMap<u64, std::sync::Arc<Vec<u8>>>,
@@ -122,15 +139,41 @@ impl BlockCacheInner {
     }
 }
 
-pub fn new_shared_block_cache(capacity_blocks: usize, block_size: usize) -> SharedBlockCache {
-    std::sync::Arc::new(parking_lot::Mutex::new(BlockCacheInner::new(
-        capacity_blocks,
-        block_size,
-    )))
+impl SharedBlockCache {
+    fn shard_for(&self, off: u64) -> &parking_lot::Mutex<BlockCacheInner> {
+        let idx = ((off >> self.block_shift) as usize) % self.shards.len();
+        &self.shards[idx]
+    }
+    pub fn get(&self, off: u64) -> Option<std::sync::Arc<Vec<u8>>> {
+        self.shard_for(off).lock().get(off)
+    }
+    pub fn put(&self, off: u64, data: &[u8]) {
+        self.shard_for(off).lock().put(off, data)
+    }
+}
+
+pub type SharedBlockCacheRef = std::sync::Arc<SharedBlockCache>;
+
+pub fn new_shared_block_cache(
+    total_capacity_blocks: usize,
+    block_size: usize,
+) -> SharedBlockCacheRef {
+    let per_shard = (total_capacity_blocks / SHARDS).max(1);
+    let mut shards = Vec::with_capacity(SHARDS);
+    for _ in 0..SHARDS {
+        shards.push(parking_lot::Mutex::new(BlockCacheInner::new(
+            per_shard, block_size,
+        )));
+    }
+    let block_shift = (block_size as u32).trailing_zeros();
+    std::sync::Arc::new(SharedBlockCache {
+        shards,
+        block_shift,
+    })
 }
 
 impl AlignedRawReader {
-    pub fn new(file: File, block: u64, cache: SharedBlockCache) -> Self {
+    pub fn new(file: File, block: u64, cache: SharedBlockCacheRef) -> Self {
         Self {
             file,
             pos: 0,
@@ -166,10 +209,11 @@ impl Read for AlignedRawReader {
         let req_aligned_len = (aligned_end - aligned_start) as usize;
 
         // Cache hit path — only applies when the caller's request fits
-        // inside one cached block (the common B-tree case).
+        // inside one cached block (the common B-tree case). Sharded
+        // lookup: no contention unless another thread is racing for
+        // the same shard.
         if req_aligned_len == self.block as usize {
-            let cached = self.cache.lock().get(aligned_start);
-            if let Some(cached) = cached {
+            if let Some(cached) = self.cache.get(aligned_start) {
                 let off = (start - aligned_start) as usize;
                 let n = want.min((self.block as usize) - off);
                 out[..n].copy_from_slice(&cached[off..off + n]);
@@ -205,14 +249,15 @@ impl Read for AlignedRawReader {
         }
         // Cache every whole block we pulled — but only for the widened
         // (small-request) path. An extent slurp bypasses the cache to
-        // preserve the interior-node hot set. One lock for the whole
-        // batch amortizes acquisition cost.
+        // preserve the interior-node hot set. Each block goes to its
+        // own shard, so per-block put calls parallelize with other
+        // readers on different shards.
         if widen {
-            let mut c = self.cache.lock();
             let mut off = 0usize;
             let mut abs = aligned_start;
             while off + (self.block as usize) <= got {
-                c.put(abs, &self.scratch[off..off + self.block as usize]);
+                self.cache
+                    .put(abs, &self.scratch[off..off + self.block as usize]);
                 off += self.block as usize;
                 abs += self.block;
             }
@@ -264,10 +309,16 @@ pub struct RawApfsSource {
     /// Populated lazily: a miss triggers `open_directory` on the parent
     /// and `list_directory_by_oid` of that parent's children.
     oid_cache: RwLock<HashMap<String, u64>>,
+    /// Inode data cache keyed by OID, populated by the walker via one
+    /// B-tree range scan per directory instead of N `lookup_inode`s.
+    /// Reader hot path clones the inode out and hands it to
+    /// `read_file_by_oid_with_inode`, saving one B-tree walk per file.
+    inode_cache: RwLock<HashMap<u64, InodeVal>>,
     /// Block cache shared across every `ApfsVolume` reader on this
     /// source — interior B-tree nodes are read once and served from
-    /// RAM to every reader thread.
-    block_cache: SharedBlockCache,
+    /// RAM to every reader thread. Sharded so N readers on different
+    /// offsets don't contend on a single lock.
+    block_cache: SharedBlockCacheRef,
     stats: ReadStats,
 }
 
@@ -374,6 +425,7 @@ impl RawApfsSource {
             pool_send,
             pool_recv,
             oid_cache: RwLock::new(HashMap::new()),
+            inode_cache: RwLock::new(HashMap::new()),
             block_cache,
             stats: ReadStats::default(),
         })
@@ -702,6 +754,38 @@ impl RawApfsSource {
             }
         }
 
+        // Batch-fetch inodes ONLY when the children's OID range is tight
+        // enough that one range scan is actually cheaper than N per-file
+        // lookups. If the range spans a huge chunk of the tree (e.g. a
+        // dir mixing files created months apart), the scan visits far
+        // more leaves than N individual descents would touch and we lose.
+        //
+        // Heuristic: skip when max - min > 16 × N (each lookup ~5 leaf
+        // reads worst case; scan visits ~(range / entries_per_leaf) leaves;
+        // break-even is roughly range/10 ≈ 5N, so 16N gives comfortable
+        // slack).
+        if !children_files.is_empty() {
+            let (min_oid, max_oid) = children_files.iter().map(|(_, o)| *o).fold(
+                (u64::MAX, 0u64),
+                |(mn, mx), o| (mn.min(o), mx.max(o)),
+            );
+            let n = children_files.len() as u64;
+            let range = max_oid.saturating_sub(min_oid);
+            let range_ok = range <= n.saturating_mul(16).max(64);
+            if range_ok {
+                if let Ok(inodes) = vol.batch_inodes_in_range(min_oid, max_oid) {
+                    let mut w = self.inode_cache.write().unwrap();
+                    for (oid, inode) in inodes {
+                        w.insert(oid, inode);
+                    }
+                }
+                // On error, the reader falls back to `lookup_inode` in
+                // `read_file_by_oid` — correctness preserved.
+            }
+            // When the range is too wide, the reader's per-file
+            // `lookup_inode` is the cheaper path; skip the batch.
+        }
+
         // Emit files — no per-file inode lookup, size=0, DOS epoch mtime.
         let dos_epoch: (u16, u16) = (((1 << 9) | (1 << 5)) as u16, 0);
         for (name, _oid) in &children_files {
@@ -787,8 +871,18 @@ impl Source for RawApfsSource {
         let (bytes_result, read_time) = match oid_result {
             Ok(oid) => {
                 let t_read = std::time::Instant::now();
-                let br = vol.read_file_by_oid(oid)
-                    .map_err(|e| anyhow!("read_file_by_oid({oid}) for {rel_str}: {e}"));
+                // Fast path: if the walker pre-fetched this OID's inode
+                // via `batch_inodes_in_range`, skip the reader's own
+                // `lookup_inode` (one fewer B-tree walk per file).
+                let cached_inode = self.inode_cache.read().unwrap().get(&oid).cloned();
+                let br = match cached_inode {
+                    Some(inode) => vol
+                        .read_file_by_oid_with_inode(oid, &inode)
+                        .map_err(|e| anyhow!("read_file_by_oid_with_inode({oid}) for {rel_str}: {e}")),
+                    None => vol
+                        .read_file_by_oid(oid)
+                        .map_err(|e| anyhow!("read_file_by_oid({oid}) for {rel_str}: {e}")),
+                };
                 (br, t_read.elapsed())
             }
             Err(e) => (Err(e), std::time::Duration::ZERO),
@@ -815,7 +909,7 @@ fn split_parent_name(rel: &str) -> (String, String) {
 
 fn open_volume(
     device: &Path,
-    cache: SharedBlockCache,
+    cache: SharedBlockCacheRef,
 ) -> Result<ApfsVolume<AlignedRawReader>> {
     let f = OpenOptions::new()
         .read(true)

@@ -101,6 +101,14 @@ pub struct Args {
     #[arg(long)]
     pub usb_info: bool,
 
+    /// Warn about running processes that will contend for the source drive:
+    /// Spotlight indexing, on-access AV scanners (Sophos, CrowdStrike,
+    /// SentinelOne, McAfee, Symantec, ESET, Malwarebytes, Carbon Black,
+    /// Trend Micro, Elastic, Bitdefender), and Apple's own indexers.
+    /// Print-only — never blocks the run. macOS only.
+    #[arg(long)]
+    pub warn_contention: bool,
+
     /// Encryption password. Use `-` to read from stdin (tty prompt if interactive).
     #[arg(short = 'p', long)]
     pub password: Option<String>,
@@ -159,6 +167,7 @@ pub struct Options {
     pub classic_walk: bool,
     pub dispatch_io: bool,
     pub usb_info: bool,
+    pub warn_contention: bool,
     pub user_flags: UserSetFlags,
 }
 
@@ -213,6 +222,7 @@ impl Args {
             classic_walk: self.classic_walk,
             dispatch_io: self.dispatch_io,
             usb_info: self.usb_info,
+            warn_contention: self.warn_contention,
             user_flags,
         })
     }

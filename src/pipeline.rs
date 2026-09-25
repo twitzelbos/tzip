@@ -81,6 +81,30 @@ pub fn run(opts: Options) -> Result<()> {
             let reports = crate::usb_info::probe_workload(&opts.paths, &opts.archive);
             crate::usb_info::print_reports(&reports, opts.read_jobs, opts.keep_cache);
         }
+        if opts.warn_contention {
+            // Collect distinct mount points for every source + output
+            let mut mounts: Vec<std::path::PathBuf> = Vec::new();
+            for p in &opts.paths {
+                if let Ok(info) = platform::fs_info(p) {
+                    if !mounts.contains(&info.mount_point) {
+                        mounts.push(info.mount_point);
+                    }
+                }
+            }
+            let out_parent = opts
+                .archive
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            if let Ok(info) = platform::fs_info(&out_parent) {
+                if !mounts.contains(&info.mount_point) {
+                    mounts.push(info.mount_point);
+                }
+            }
+            let report = crate::contention::probe(&mounts);
+            crate::contention::print_warnings(&report);
+        }
     }
 
     // Auto-tune defaults based on source/output filesystem. User-set flags
@@ -460,13 +484,21 @@ fn auto_tune(mut opts: Options) -> Options {
                 opts.keep_cache = true;
                 changes.push("keep_cache=on".into());
             }
-            if !opts.user_flags.read_jobs && opts.read_jobs > 1 {
-                opts.read_jobs = 1;
-                changes.push("read_jobs=1".into());
-            }
             if !opts.user_flags.dispatch_io && !opts.dispatch_io {
                 opts.dispatch_io = true;
                 changes.push("dispatch_io=on".into());
+            }
+            // With dispatch_io enabled, each reader submits a synchronous
+            // dispatch_io_read and blocks on its completion semaphore. One
+            // reader = one in-flight read at a time; GCD can't pipeline.
+            // Bump reader count so the queue stays populated. Without
+            // dispatch_io, keep the conservative anti-thrash value.
+            if !opts.user_flags.read_jobs {
+                let target = if opts.dispatch_io { 4 } else { 1 };
+                if opts.read_jobs != target {
+                    opts.read_jobs = target;
+                    changes.push(format!("read_jobs={}", target));
+                }
             }
         } else if ntfs_on_mac {
             if !opts.user_flags.keep_cache && !opts.keep_cache {

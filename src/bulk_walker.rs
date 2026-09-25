@@ -260,7 +260,7 @@ fn walk_recursive(
     Ok(())
 }
 
-fn is_excluded(name: &str, globs: &[String]) -> bool {
+pub(crate) fn is_excluded(name: &str, globs: &[String]) -> bool {
     globs.iter().any(|g| glob_match(g, name))
 }
 
@@ -296,7 +296,7 @@ fn dos_time_from_meta(meta: &std::fs::Metadata) -> (u16, u16) {
     dos_time_from_unix(secs)
 }
 
-fn dos_time_from_unix(unix: i64) -> (u16, u16) {
+pub(crate) fn dos_time_from_unix(unix: i64) -> (u16, u16) {
     let secs = if unix < 0 { 0 } else { unix };
     let days = secs / 86_400;
     let sec_of_day = (secs % 86_400) as u32;

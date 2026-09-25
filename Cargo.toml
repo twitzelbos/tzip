@@ -19,8 +19,10 @@ default = []
 raw-apfs = ["dep:apfs"]
 
 [dependencies]
-# Vendored APFS parser (MIT, from Dil4rd/dpp).
-apfs = { path = "vendor/dpp/apfs", optional = true }
+# Vendored (patched) APFS parser (MIT, upstream Dil4rd/dpp).
+# Local patch to extents.rs batches file reads to 4 MiB instead of 4 KiB,
+# raising throughput 26× on USB drives. See docs/RAW_BLOCK.md.
+apfs = { path = "vendor/apfs", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 thiserror = "1"
@@ -67,6 +69,7 @@ rpassword = "7"
 # Misc
 byteorder = "1.5"
 libc = "0.2"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
@@ -89,3 +92,11 @@ strip = "symbols"
 [profile.bench]
 opt-level = 3
 lto = "thin"
+
+# Release-perf but with symbols kept so `sample` / Instruments produce
+# readable stack traces. Build with:
+#   cargo build --profile profiling --features raw-apfs
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"

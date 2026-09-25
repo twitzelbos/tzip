@@ -1,0 +1,24 @@
+[package]
+name = "apfs"
+version = "0.4.0"
+edition = "2024"
+description = "Read-only APFS (Apple File System) parser"
+license = "MIT"
+repository = "https://github.com/Dil4rd/dpp"
+keywords = ["apfs", "apple", "macos", "filesystem"]
+categories = ["parsing", "filesystem"]
+
+[dependencies]
+byteorder = "1.5"
+cmpfs = { version = "0.1.0", path = "../cmpfs" }
+# NOTE (tzip): kept `../cmpfs` — works because we copied both crates side-by-side.
+thiserror = "2"
+
+[dev-dependencies]
+# Also a normal dependency, but `tests/` links only dev-dependencies.
+byteorder = "1.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "parse_benchmark"
+harness = false

@@ -1528,6 +1528,7 @@ dependencies = [
  "libdeflater",
  "memmap2",
  "num_cpus",
+ "parking_lot",
  "pbkdf2 0.12.2",
  "rand",
  "ratatui",

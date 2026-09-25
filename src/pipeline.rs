@@ -264,10 +264,53 @@ pub fn run(opts: Options) -> Result<()> {
 
     // 5. Reader pool
     #[cfg(target_os = "macos")]
-    let source: Arc<dyn Source> = if opts.dispatch_io {
-        Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
-    } else {
-        Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
+    let source: Arc<dyn Source> = {
+        // --raw-block wins if enabled (feature-gated).
+        #[cfg(feature = "raw-apfs")]
+        {
+            if opts.raw_block {
+                // Use the first source path's mount as the target volume.
+                let first = opts.paths.first().cloned()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                match crate::platform::fs_info(&first) {
+                    Ok(info) => match crate::raw_apfs::RawApfsSource::open_for_mount(&info.mount_point) {
+                        Ok(s) => {
+                            eprintln!("tzip: --raw-block active for {}", info.mount_point.display());
+                            let s: Arc<dyn Source> = Arc::new(s);
+                            s
+                        }
+                        Err(e) => {
+                            eprintln!("tzip: --raw-block requested but unavailable: {e:#}");
+                            eprintln!("tzip: falling back to default reader");
+                            if opts.dispatch_io {
+                                Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
+                            } else {
+                                Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        if opts.dispatch_io {
+                            Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
+                        } else {
+                            Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
+                        }
+                    }
+                }
+            } else if opts.dispatch_io {
+                Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
+            } else {
+                Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
+            }
+        }
+        #[cfg(not(feature = "raw-apfs"))]
+        {
+            if opts.dispatch_io {
+                Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
+            } else {
+                Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
+            }
+        }
     };
     #[cfg(not(target_os = "macos"))]
     let source: Arc<dyn Source> = Arc::new(LocalFsSource { keep_cache: opts.keep_cache });

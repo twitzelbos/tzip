@@ -101,6 +101,14 @@ pub struct Args {
     #[arg(long)]
     pub usb_info: bool,
 
+    /// EXPERIMENTAL: read files by parsing APFS directly off `/dev/rdiskN`
+    /// instead of the mounted filesystem. Bypasses the VFS + on-access AV
+    /// hooks. Requires root or membership in the `operator` group and the
+    /// `raw-apfs` Cargo feature. macOS only.
+    #[cfg(all(feature = "raw-apfs", target_os = "macos"))]
+    #[arg(long)]
+    pub raw_block: bool,
+
     /// Warn about running processes that will contend for the source drive:
     /// Spotlight indexing, on-access AV scanners (Sophos, CrowdStrike,
     /// SentinelOne, McAfee, Symantec, ESET, Malwarebytes, Carbon Black,
@@ -168,6 +176,8 @@ pub struct Options {
     pub dispatch_io: bool,
     pub usb_info: bool,
     pub warn_contention: bool,
+    #[cfg(all(feature = "raw-apfs", target_os = "macos"))]
+    pub raw_block: bool,
     pub user_flags: UserSetFlags,
 }
 
@@ -223,6 +233,8 @@ impl Args {
             dispatch_io: self.dispatch_io,
             usb_info: self.usb_info,
             warn_contention: self.warn_contention,
+            #[cfg(all(feature = "raw-apfs", target_os = "macos"))]
+            raw_block: self.raw_block,
             user_flags,
         })
     }

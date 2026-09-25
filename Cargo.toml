@@ -10,7 +10,17 @@ license = "BSD-3-Clause"
 name = "tzip"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable the raw-APFS-block reader (`--raw-block`, macOS-only source that
+# reads files directly from `/dev/rdiskN` by parsing APFS on-disk format).
+# Bypasses the VFS layer and any AV that hooks it. Adds the vendored
+# `apfs` crate as a dependency (see vendor/dpp).
+raw-apfs = ["dep:apfs"]
+
 [dependencies]
+# Vendored APFS parser (MIT, from Dil4rd/dpp).
+apfs = { path = "vendor/dpp/apfs", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 thiserror = "1"

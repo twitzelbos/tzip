@@ -5,18 +5,41 @@
 //! `/dev/rdiskN` directly. This avoids the per-file `open()` syscall
 //! that Sophos/CrowdStrike/etc. hook via Endpoint Security.
 //!
+//! See [`docs/RAW_BLOCK.md`](../../docs/RAW_BLOCK.md) for the full
+//! design + testing notes.
+//!
 //! **Access requirements** (`/dev/rdisk*` is root:operator 0640):
 //! - `sudo tzip …` — per-invocation elevation, or
 //! - `sudo dseditgroup -o edit -a $USER -t user operator` + reboot — persistent
+//!
+//! **Supported volumes:**
+//! - Unencrypted external APFS drives ✓  (tzip's actual target)
+//! - Unencrypted internal APFS volumes ✓
+//! - Sealed system volumes ✓ (they're read-only and structurally stable)
+//!
+//! **NOT supported — FileVault-encrypted volumes:**
+//! On FileVault-enabled volumes, the container/volume superblocks are
+//! stored unencrypted (they must be, to bootstrap decryption) — so the
+//! parser reports a volume, its size, and its file count. But the
+//! catalog B-tree pages, inode records, and file extents are all
+//! FileVault-encrypted, and decryption happens in the *APFS software
+//! driver*, above the block layer. Raw reads via `/dev/rdiskN` return
+//! ciphertext for those objects, and Fletcher-64 checksum validation
+//! fails immediately with `invalid checksum` on the first B-tree walk.
+//!
+//! Fixing this requires obtaining the Volume Encryption Key from the
+//! system keybag via `SecKeychain` + user auth, then decrypting the
+//! FileVault stream in userspace. Substantial engineering, not planned.
 //!
 //! **Live-volume caveats:**
 //! - The APFS parser is currently a *skeleton* here. We surface the entry
 //!   points and CLI flag now; the real path-resolution + extent read
 //!   implementation will land as we vet the vendored crate against real
-//!   macOS-generated volumes (snapshots, sealed volumes, FileVault, T2).
-//! - For consistency on a mounted (i.e. actively-being-written) volume,
-//!   we should target a snapshot created via `fs_snapshot_create`.
-//!   That work is future.
+//!   macOS-generated volumes.
+//! - For consistency on a mounted (actively-being-written) volume, we
+//!   should target a snapshot created via `fs_snapshot_create`. On idle
+//!   external drives (tzip's actual target) this is unnecessary — the
+//!   latest committed checkpoint is stable across reads.
 
 #![cfg(all(feature = "raw-apfs", target_os = "macos"))]
 

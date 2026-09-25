@@ -128,8 +128,50 @@ pub fn run(opts: Options) -> Result<()> {
         return sevenz::write_solid(&opts, &items, total_bytes, total_files);
     }
 
-    // `--sort` also uses the batch walk — we need the full list to reorder
-    // arrivals into deterministic order.
+    // Try to open a `--raw-block` source up front (macOS + raw-apfs
+    // feature). When available, we also do the walk via the raw parser
+    // and switch the pipeline into batch mode with those items — this
+    // bypasses `bulk_walker`'s VFS syscalls entirely, so the walk stage
+    // stops competing with the read stage for macOS Endpoint Security
+    // auth hooks. Failure falls back to the normal reader + walker.
+    #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
+    let raw_apfs_source: Option<Arc<crate::raw_apfs::RawApfsSource>> = if opts.raw_block {
+        let first = opts.paths.first().cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // Pool = reader-thread count so `pool_recv.recv()` is contention-free.
+        // Cap at 32 to keep ~50 ms/volume open costs bounded.
+        let pool_size = opts.read_jobs.max(4).min(32);
+        match crate::platform::fs_info(&first) {
+            Ok(info) => match crate::raw_apfs::RawApfsSource::open_for_mount(
+                &info.mount_point,
+                pool_size,
+            ) {
+                Ok(s) => {
+                    eprintln!(
+                        "tzip: --raw-block active for {} (pool size {})",
+                        info.mount_point.display(),
+                        pool_size
+                    );
+                    Some(Arc::new(s))
+                }
+                Err(e) => {
+                    eprintln!("tzip: --raw-block unavailable ({e:#}) — falling back");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("tzip: --raw-block fs_info failed ({e:#}) — falling back");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Batch-mode item list. Set only for `--sort` (which needs the full
+    // list up front to reorder). Streaming is the default, and the
+    // streaming feeder below will use `RawApfsSource::walk_stream` when
+    // `--raw-block` is on and skip `bulk_walker` entirely.
     let batch_items: Option<Vec<WorkItem>> = if opts.sort {
         let items = walker::walk(WalkOpts {
             roots: &opts.paths,
@@ -223,13 +265,25 @@ pub fn run(opts: Options) -> Result<()> {
                 Ok(())
             })
         } else {
-            // Streaming walker → wrap send with index assignment
-            let (wtx, wrx) = bounded::<WorkItem>(read_bound.max(16));
+            // Streaming walker → wrap send with index assignment.
+            // When `--raw-block` is on and the raw source opened, we
+            // walk via the raw APFS parser (no VFS syscalls → macOS
+            // Endpoint Security has nothing to hook). Otherwise fall
+            // back to `bulk_walker` (getattrlistbulk) or classic jwalk.
+            let (wtx, wrx) = bounded::<WorkItem>(read_bound.max(64));
             let roots = opts.paths.clone();
             let exclude = opts.exclude.clone();
             let walk_jobs = opts.walk_jobs;
             let use_bulk = cfg!(target_os = "macos") && !opts.classic_walk;
+            #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
+            let raw_src_for_walk = raw_apfs_source.clone();
             let walker_thread = thread::spawn(move || -> Result<()> {
+                #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
+                {
+                    if let Some(src) = raw_src_for_walk {
+                        return src.walk_stream(&roots, &exclude, wtx);
+                    }
+                }
                 #[cfg(target_os = "macos")]
                 {
                     if use_bulk {
@@ -268,34 +322,18 @@ pub fn run(opts: Options) -> Result<()> {
         // --raw-block wins if enabled (feature-gated).
         #[cfg(feature = "raw-apfs")]
         {
-            if opts.raw_block {
-                // Use the first source path's mount as the target volume.
-                let first = opts.paths.first().cloned()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                match crate::platform::fs_info(&first) {
-                    Ok(info) => match crate::raw_apfs::RawApfsSource::open_for_mount(&info.mount_point) {
-                        Ok(s) => {
-                            eprintln!("tzip: --raw-block active for {}", info.mount_point.display());
-                            let s: Arc<dyn Source> = Arc::new(s);
-                            s
-                        }
-                        Err(e) => {
-                            eprintln!("tzip: --raw-block requested but unavailable: {e:#}");
-                            eprintln!("tzip: falling back to default reader");
-                            if opts.dispatch_io {
-                                Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
-                            } else {
-                                Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
-                            }
-                        }
-                    },
-                    Err(_) => {
-                        if opts.dispatch_io {
-                            Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
-                        } else {
-                            Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
-                        }
-                    }
+            if let Some(src) = raw_apfs_source.clone() {
+                // OID cache was populated by walk_to_items above, so the
+                // reader hot path is pure hashmap lookup + extent read.
+                let s: Arc<dyn Source> = src;
+                s
+            } else if opts.raw_block {
+                // Raw-block was requested but source open failed earlier;
+                // fall through to the default reader.
+                if opts.dispatch_io {
+                    Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
+                } else {
+                    Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
                 }
             } else if opts.dispatch_io {
                 Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
@@ -527,20 +565,38 @@ fn auto_tune(mut opts: Options) -> Options {
                 opts.keep_cache = true;
                 changes.push("keep_cache=on".into());
             }
-            if !opts.user_flags.dispatch_io && !opts.dispatch_io {
-                opts.dispatch_io = true;
-                changes.push("dispatch_io=on".into());
-            }
-            // With dispatch_io enabled, each reader submits a synchronous
-            // dispatch_io_read and blocks on its completion semaphore. One
-            // reader = one in-flight read at a time; GCD can't pipeline.
-            // Bump reader count so the queue stays populated. Without
-            // dispatch_io, keep the conservative anti-thrash value.
-            if !opts.user_flags.read_jobs {
-                let target = if opts.dispatch_io { 4 } else { 1 };
-                if opts.read_jobs != target {
-                    opts.read_jobs = target;
-                    changes.push(format!("read_jobs={}", target));
+            // --raw-block bypasses VFS so keep_cache/dispatch_io don't
+            // apply. It wants enough reader threads to keep multiple
+            // raw device I/Os in flight (each fd is one USB Attached
+            // SCSI queue slot) but not so many that contention on the
+            // shared block cache lock costs more than the extra
+            // parallelism buys. Empirically 8 is the sweet spot on a
+            // 10-core M1 Max against Qbio; 16 regressed to +5% wall
+            // time from mutex contention.
+            if opts.raw_block {
+                if !opts.user_flags.read_jobs {
+                    let target = 8;
+                    if opts.read_jobs != target {
+                        opts.read_jobs = target;
+                        changes.push(format!("read_jobs={}", target));
+                    }
+                }
+            } else {
+                if !opts.user_flags.dispatch_io && !opts.dispatch_io {
+                    opts.dispatch_io = true;
+                    changes.push("dispatch_io=on".into());
+                }
+                // With dispatch_io enabled, each reader submits a synchronous
+                // dispatch_io_read and blocks on its completion semaphore. One
+                // reader = one in-flight read at a time; GCD can't pipeline.
+                // Bump reader count so the queue stays populated. Without
+                // dispatch_io, keep the conservative anti-thrash value.
+                if !opts.user_flags.read_jobs {
+                    let target = if opts.dispatch_io { 4 } else { 1 };
+                    if opts.read_jobs != target {
+                        opts.read_jobs = target;
+                        changes.push(format!("read_jobs={}", target));
+                    }
                 }
             }
         } else if ntfs_on_mac {

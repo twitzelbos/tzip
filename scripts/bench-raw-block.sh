@@ -45,17 +45,24 @@ sudo -v || { echo "sudo auth failed" >&2; exit 1; }
 echo "== bench: $SOURCE ($SIZE_HUMAN, $FILE_COUNT files)"
 echo
 
+now_epoch() {
+    # macOS `date` has no %N; use python for subsecond wall time.
+    python3 -c 'import time; print(f"{time.time():.3f}")'
+}
+
 run_and_time() {
     local label="$1"; shift
     local out="$TMP/bench-$$-$label.zip"
     rm -f "$out"
-    # Bash-builtin `time` writes to fd 2 in a format we can grep.
     local start end elapsed
-    start=$(date +%s.%N)
+    start=$(now_epoch)
+    # Filter tzip's output to just the interesting lines and send it to
+    # STDERR so it prints without contaminating this function's return
+    # value (command substitution captures stdout only).
     sudo "$BIN" "$out" "$SOURCE" \
         -m store --exclude '._*' --exclude '.DS_Store' \
-        "$@" -v 2>&1 | grep -E 'raw-block|auto-tuned' || true
-    end=$(date +%s.%N)
+        "$@" -v 2>&1 | grep -E 'raw-block|auto-tuned' 1>&2 || true
+    end=$(now_epoch)
     elapsed=$(echo "$end - $start" | bc)
     rm -f "$out"
     echo "$elapsed"

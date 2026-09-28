@@ -107,8 +107,18 @@ pub struct Args {
     /// instead of the mounted filesystem. Bypasses the VFS + on-access AV
     /// hooks. Requires root or membership in the `operator` group and the
     /// `raw-apfs` Cargo feature. macOS only.
+    /// Read files by parsing APFS on-disk format directly from
+    /// `/dev/rdiskN` (bypasses the VFS + on-access AV hooks). Auto-
+    /// enabled when running as root on an APFS-on-USB source. Pass
+    /// `--raw-block=false` to force the default VFS path.
     #[cfg(all(feature = "raw-apfs", target_os = "macos"))]
-    #[arg(long)]
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = false,
+    )]
     pub raw_block: bool,
 
     /// Warn about running processes that will contend for the source drive:

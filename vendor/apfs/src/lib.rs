@@ -87,6 +87,13 @@ pub struct VolumeInfo {
     pub num_files: u64,
     pub num_directories: u64,
     pub num_symlinks: u64,
+    /// LOCAL PATCH (tzip): true if the volume's data is encrypted at
+    /// the block layer (FileVault or Apple-Silicon single-key). When
+    /// true, raw `/dev/rdiskN` reads return ciphertext — catalog
+    /// pages fail Fletcher-64 checks and the whole `--raw-block`
+    /// path is unusable. Computed from `APSB fs_flags`:
+    /// `APFS_FS_UNENCRYPTED = 0x1` — clear ⇒ encrypted.
+    pub encrypted: bool,
 }
 
 /// Pair each attribute name with its kind.
@@ -165,12 +172,14 @@ impl<R: Read + Seek> ApfsVolume<R> {
         )?;
 
         // Step 9: Store state
+        const APFS_FS_UNENCRYPTED: u64 = 0x1;
         let info = VolumeInfo {
             name: vol_sb.volume_name.clone(),
             block_size,
             num_files: vol_sb.num_files,
             num_directories: vol_sb.num_directories,
             num_symlinks: vol_sb.num_symlinks,
+            encrypted: (vol_sb.fs_flags & APFS_FS_UNENCRYPTED) == 0,
         };
 
         Ok(ApfsVolume {

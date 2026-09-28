@@ -464,6 +464,19 @@ impl RawApfsSource {
 
         // One open for real: if this fails, the whole feature is unavailable.
         let first = open_volume(&whole, block_cache.clone())?;
+        // FileVault / block-layer encryption check — bail early with a
+        // clear message instead of failing deep inside the metadata
+        // scan with `invalid checksum`. Catalog pages on encrypted
+        // volumes are ciphertext at the block layer; Fletcher-64 would
+        // reject every one of them.
+        if first.volume_info().encrypted {
+            return Err(anyhow!(
+                "volume {:?} is block-layer encrypted (FileVault / Apple-Silicon single-key) — \
+                 `/dev/rdiskN` reads return ciphertext, so --raw-block cannot parse the catalog. \
+                 See docs/RAW_BLOCK.md for details.",
+                first.volume_info().name
+            ));
+        }
         pool_send
             .send(first)
             .map_err(|_| anyhow!("pool send after first open"))?;

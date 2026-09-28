@@ -10,6 +10,7 @@ pub struct UserSetFlags {
     pub keep_cache: bool,
     pub read_jobs: bool,
     pub dispatch_io: bool,
+    pub raw_block: bool,
 }
 
 impl UserSetFlags {
@@ -19,6 +20,7 @@ impl UserSetFlags {
             keep_cache: is_cli("keep_cache"),
             read_jobs: is_cli("read_jobs"),
             dispatch_io: is_cli("dispatch_io"),
+            raw_block: is_cli("raw_block"),
         }
     }
 }

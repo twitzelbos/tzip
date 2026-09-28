@@ -631,6 +631,22 @@ fn auto_tune(mut opts: Options) -> Options {
                 opts.keep_cache = true;
                 changes.push("keep_cache=on".into());
             }
+            // Auto-enable --raw-block when it's likely to win.
+            // Requirements: raw-apfs feature compiled in, running as root
+            // (needed to open /dev/rdiskN), and the user didn't explicitly
+            // disable it. Threshold for a workload worth the ~14 s
+            // metadata prefetch cost is a soft one — we can't cheaply
+            // enumerate size upfront in streaming mode, so we always
+            // enable when eligible. On a workload too small to be worth
+            // the prefetch, the fallback path is fine anyway.
+            #[cfg(feature = "raw-apfs")]
+            {
+                let is_root = unsafe { libc::geteuid() == 0 };
+                if !opts.user_flags.raw_block && !opts.raw_block && is_root {
+                    opts.raw_block = true;
+                    changes.push("raw_block=on (root+APFS-on-USB)".into());
+                }
+            }
             // --raw-block bypasses VFS so keep_cache/dispatch_io don't
             // apply. Empirically 8 is the sweet spot on TestDrive USB SSD
             // even with a sharded block cache: 16 readers doubled

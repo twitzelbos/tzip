@@ -44,10 +44,18 @@ transparently.
 | Workload | Default VFS | `--raw-block` | Speedup |
 |---|---|---|---|
 | reference-archive (79 K files, 11.7 GB → 3.3 GB deflate -x 9 + AES-256) | 2:52 | 1:26 | 2.0× |
-| One MRIUnenhance exam (11 K files, 1.7 GB, `-m store`) | 2:15 | 0:22 | 6.1× |
+| One exam, aged data (11 K files, 1.7 GB, `-m store`) | 2:15 | 0:22 | 6.1× |
+| One exam, **fresh copy** (same data, freshly `cp -R`'d) | 2:22 | 0:17 | **8.2×** |
+
+Fresh vs. aged: on a freshly-populated drive, files created together
+share adjacent disk offsets, so the bulk reader's extent-order sort
+collapses many extents into one big pread. On an aged drive (files
+added over months), files are scattered and the sort barely coalesces
+— but the whole-tree metadata prefetch alone still delivers ~6×.
 
 Byte-verified: extracted trees are recursively identical between the
 two paths (see [`scripts/verify-raw-block.sh`](../scripts/verify-raw-block.sh)).
+Reproduce these numbers with [`scripts/bench-raw-block.sh`](../scripts/bench-raw-block.sh).
 
 ## Architecture
 

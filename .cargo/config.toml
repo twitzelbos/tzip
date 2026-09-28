@@ -2,5 +2,32 @@
 # the ARMv8 crypto and NEON paths (Apple Silicon) or SHA-NI/AES-NI/AVX2 paths
 # (x86_64). Without this, cpufeatures still runs but the compiler may not have
 # inlined the accelerated code paths.
+#
+# Belt-and-suspenders: explicitly add +aes/+sha2/+neon (Apple Silicon) and
+# +aes/+sha (x86_64) on top of target-cpu=native. Empirically
+# `target-cpu=native` alone did NOT surface the ARMv8 crypto backend in
+# the `aes` crate on macOS 26 — profile showed `aes::soft::fixslice`
+# (software) rather than the hardware path. Explicit target-features
+# ensure the aes crate's `#[cfg(target_feature = "aes")]`-gated backend
+# is compiled in; cpufeatures still handles runtime dispatch.
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+[target.'cfg(target_arch = "aarch64")']
+# `aes_armv8` and `polyval_armv8` are cfg gates the RustCrypto crates use
+# to opt into their ARMv8 crypto extension backends on stable Rust — they
+# are NOT the same as `target_feature="aes"` (which is enabled by
+# `target-cpu=native` but doesn't itself flip the aes crate's backend
+# selection). Without these cfg flags the aes/sha1 crates fall back to
+# their software (fixslice / soft) implementations even on M-series
+# CPUs. Verified by profile: `aes::soft::fixslice` disappears after
+# adding `--cfg aes_armv8`.
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+aes,+sha2,+neon",
+    "--cfg", "aes_armv8",
+    "--cfg", "polyval_armv8",
+]
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+aes,+sha"]

@@ -214,7 +214,7 @@ Password sourcing (in precedence order):
 `--solid` (or archive extension `.7z`) switches to `sevenz-rust` and emits an
 LZMA2 solid stream:
 
-- Substantially better ratio on similar-file corpora (generic-file, logs, source
+- Substantially better ratio on similar-file corpora (logs, source
   trees, JSON dumps) — the dictionary spans all files
 - With a password, header encryption is enabled (filenames are hidden)
 - **Single-threaded**: sevenz-rust 0.6 does not expose multi-threaded LZMA2
@@ -236,8 +236,8 @@ Workarounds if speed matters more than ratio on `.7z`:
 │ [===============================>............................] 25%   │
 └───────────────────────────────────────────────────────────────────────┘
 ┌ workers ──────────────────────────────────────────────────────────────┐
-│ worker  0: ▶ ...ry/study-1/MRIUnenhance/2103_ax_DWI.../IM_82.dcm  511 MB/s
-│ worker  1: ▶ ...ry/study-2/MRIUnenhance/1804_localizer.../IM_3.dcm  489 MB/s
+│ worker  0: ▶ .../subdir-a/file-001.dat                       511 MB/s
+│ worker  1: ▶ .../subdir-b/file-023.dat                       489 MB/s
 │ worker  2: · idle                                                 0 MB/s
 │ ...
 └───────────────────────────────────────────────────────────────────────┘
@@ -308,8 +308,8 @@ Reference: `7z a -tzip -mx=9` on the same 500-file corpus completes in
 ~2.5s. On DEFLATE+AES with `--read-jobs auto`, tzip is **~10× faster**
 than p7zip's wall time on the same hardware.
 
-**`--raw-block` on APFS-on-USB** (M1 Max, TestDrive USB SSD, large-archive-style
-medical-imaging archive):
+**`--raw-block` on APFS-on-USB** (M1 Max, USB SSD, large archive with
+many small files):
 
 | workload | default VFS | `--raw-block` | speedup |
 |---|---|---|---|
@@ -401,9 +401,9 @@ tzip out.zip src/ --keep-cache --read-jobs 1 --dispatch-io
 tzip out.zip /Volumes/share/src/ --read-jobs 1 --keep-cache
 ```
 
-**Deep generic-file trees (many small files, deep dirs):**
+**Deep directory trees with many small files:**
 ```
-tzip out.zip /path/to/studies/ --read-jobs auto --walk-jobs 8
+tzip out.zip /path/to/trees/ --read-jobs auto --walk-jobs 8
 # on macOS the getattrlistbulk walker + openat run automatically
 ```
 
@@ -433,8 +433,8 @@ Finder use internally.
 WorkItems from the bulk walker carry an `Arc<OwnedDirFd>` pointing at the
 parent directory. The reader uses `openat(dirfd, basename, O_RDONLY)`
 instead of `open(full_path)`, which skips per-component path resolution.
-On generic-file trees (5-6 levels deep) this saves 5-6 metadata lookups per
-file open.
+On deep directory trees (5-6 levels) this saves 5-6 metadata lookups
+per file open.
 
 ### `F_RDADVISE` prefetch hint
 

@@ -849,7 +849,7 @@ impl RawApfsSource {
 /// Bulk (disk-extent-order) reader. Consumes a full item list, sorts
 /// every file's extents by disk offset within bounded windows, and
 /// serves them via coalesced sequential preads — turning ~2 lookups +
-/// small random reads per file (~13 ms/file on TestDrive) into
+/// small random reads per file (~13 ms/file on a typical USB SSD) into
 /// sequential-throughput I/O, which USB SSDs handle at ~10× the random
 /// rate.
 ///
@@ -867,7 +867,7 @@ impl RawApfsSource {
     /// Processes in `WINDOW` files at a time so memory stays bounded
     /// (only ~one window's worth of file buffers held simultaneously)
     /// while still capturing most sequential-locality wins within
-    /// walker-adjacent files (generic-file series files that were created
+    /// walker-adjacent files (files in a sibling series that were created
     /// together and land near each other on disk).
     pub fn bulk_read_all(
         &self,
@@ -875,7 +875,7 @@ impl RawApfsSource {
         raw_tx: crossbeam_channel::Sender<crate::pipeline::RawItem>,
     ) -> Result<()> {
         /// Files per bulk-read window. Sized so per-window buffer
-        /// footprint stays modest (~50-100 MB for typical generic-file sizes)
+        /// footprint stays modest (~50-100 MB for typical file sizes)
         /// while still coalescing enough extents to make each pread
         /// meaningfully sequential.
         const WINDOW: usize = 512;
@@ -964,7 +964,7 @@ impl RawApfsSource {
         // the range is tight enough that one scan is cheaper than N
         // individual descents. Guard: `range ≤ 32 × N` — a bit wider
         // than the walker's `16 × N` because ranges within a bulk
-        // window tend to be tighter (walker-adjacent generic-files) and the
+        // window tend to be tighter (walker-adjacent files) and the
         // scan reads through the shared block cache anyway. Populates
         // `inode_cache`, so the per-item loop below hits it.
         let t_meta = std::time::Instant::now();

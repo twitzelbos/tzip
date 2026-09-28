@@ -3,7 +3,7 @@
 # source. Useful for comparing drives / datasets — in particular,
 # fresh-populated drives (where files-in-a-dir share adjacent disk
 # offsets, so extent-order coalescing actually helps) vs
-# aged-populated drives (TestDrive-style, files scattered).
+# aged-populated drives (files scattered across the volume).
 #
 # Usage:
 #   sudo ./scripts/bench-raw-block.sh <source-path> [runs]

@@ -39,7 +39,7 @@ impl Source for LocalFsSource {
     fn read(&self, item: &WorkItem) -> Result<platform::ReadBuf> {
         // Fast path: openat(dirfd, basename) when the walker gave us a dirfd.
         // This skips per-component path resolution — a real win on the deep
-        // directory layouts we see in generic-file trees.
+        // directory layouts we see in deep hierarchical trees.
         if let (Some(dirfd), Some(basename)) = (&item.dirfd, &item.basename) {
             match platform::open_at(dirfd.as_raw(), basename) {
                 Ok(f) => {
@@ -651,8 +651,8 @@ fn auto_tune(mut opts: Options) -> Options {
                 }
             }
             // --raw-block bypasses VFS so keep_cache/dispatch_io don't
-            // apply. Empirically 8 is the sweet spot on TestDrive USB SSD
-            // even with a sharded block cache: 16 readers doubled
+            // apply. Empirically 8 is the sweet spot on a typical USB
+            // SSD even with a sharded block cache: 16 readers doubled
             // per-file `read` time (13 ms → 28 ms) — the drive itself
             // serializes beyond ~8 concurrent commands, so extra fds
             // add coordination cost without throughput. Sharded cache

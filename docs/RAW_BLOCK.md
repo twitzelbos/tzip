@@ -15,7 +15,7 @@ AV hooks (Sophos / CrowdStrike / SentinelOne / etc.) that intercept
 `open()` via Endpoint Security see nothing.
 
 It's also a straight-up performance win on this drive class: **~2×
-faster than the default VFS path on large-archive-style workloads**, and
+faster than the default VFS path on large mixed-file workloads**, and
 larger multiples on smaller ones.
 
 ## Auto-enable
@@ -39,13 +39,13 @@ tzip: auto-tuned defaults for APFS-on-USB source (
 If any prerequisite is missing, tzip runs the default VFS reader path
 transparently.
 
-## Performance (measured on TestDrive USB SSD, M1 Max, macOS 26.6.2)
+## Performance (measured on a USB SSD, M1 Max, macOS 26.6.2)
 
 | Workload | Default VFS | `--raw-block` | Speedup |
 |---|---|---|---|
-| reference-archive (79 K files, 11.7 GB → 3.3 GB deflate -x 9 + AES-256) | 2:52 | 1:26 | 2.0× |
-| One exam, aged data (11 K files, 1.7 GB, `-m store`) | 2:15 | 0:22 | 6.1× |
-| One exam, **fresh copy** (same data, freshly `cp -R`'d) | 2:22 | 0:17 | **8.2×** |
+| Large mixed archive (79 K files, 11.7 GB → 3.3 GB deflate -x 9 + AES-256) | 2:52 | 1:26 | 2.0× |
+| Single-directory subset, aged data (11 K files, 1.7 GB, `-m store`) | 2:15 | 0:22 | 6.1× |
+| Same subset, **fresh copy** (files freshly `cp -R`'d, adjacent extents) | 2:22 | 0:17 | **8.2×** |
 
 Fresh vs. aged: on a freshly-populated drive, files created together
 share adjacent disk offsets, so the bulk reader's extent-order sort
@@ -67,7 +67,7 @@ The catalog B-tree on a typical APFS volume is small (tens to a few
 hundred MB). A single sequential-ish walk of the whole tree reads
 every leaf once, extracting every `INODE` and `FILE_EXTENT` record
 into two HashMaps: `oid → InodeVal` and `private_id → [(logical_addr,
-extent)]`. On TestDrive: 325 K inodes + 320 K extent-lists in ~14 s.
+extent)]`. Test volume: 325 K inodes + 320 K extent-lists in ~14 s.
 
 After this, every per-file B-tree lookup becomes a hashmap hit. The
 alternative — N per-file `lookup_inode` + `lookup_extents` descents —
@@ -124,12 +124,12 @@ on this drive.
 
 ### Why sequential-order alone didn't win
 
-On a freshly-populated drive where generic-files in one MRI series were
-written back-to-back, extents cluster on disk and sorting collapses
-tens of files into a single big pread. On TestDrive (files added over
+On a freshly-populated drive where similar files were written
+back-to-back, extents cluster on disk and sorting collapses tens of
+files into a single big pread. On an aged drive (files added over
 months), files are scattered — sorting by disk offset produces `1
 extent/run` on average, no coalescing. The metadata prefetch is what
-carries the win here; sequential-order is a small marginal
+carries the win in that case; sequential-order is a small marginal
 improvement.
 
 ## Access requirements

@@ -13,12 +13,21 @@
 
 set -euo pipefail
 
-EXAM="/Volumes/TestDrive/studies/exam-a/sub-a/study-1/MRIUnenhance"
+SOURCE="${VERIFY_SOURCE:-${1:-}}"
 TMP="/tmp/tzip-verify"
 BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/tzip"
 
-if [[ ! -d "$EXAM" ]]; then
-    echo "workload missing: $EXAM" >&2
+if [[ -z "$SOURCE" || ! -d "$SOURCE" ]]; then
+    cat >&2 <<EOF
+usage: $0 <source-directory>
+
+  or set VERIFY_SOURCE in the environment.
+
+  Runs tzip twice on the same source — once via the default VFS path,
+  once via --raw-block — with -m store (no compression, no encryption)
+  so the two archives are byte-comparable after extraction. Exits
+  non-zero if file lists or content differ.
+EOF
     exit 1
 fi
 if [[ ! -x "$BIN" ]]; then
@@ -31,18 +40,18 @@ mkdir -p "$TMP"
 
 sudo -v || { echo "sudo auth failed" >&2; exit 1; }
 
-echo "== workload: $EXAM ($(du -sh "$EXAM" | awk '{print $1}'))"
+echo "== workload: $SOURCE ($(du -sh "$SOURCE" | awk '{print $1}'))"
 echo
 
 echo "== default path =="
-time sudo "$BIN" "$TMP/default.zip" "$EXAM" \
+time sudo "$BIN" "$TMP/default.zip" "$SOURCE" \
     -m store \
     --exclude '._*' --exclude '.DS_Store' \
     -q
 echo
 
 echo "== --raw-block =="
-time sudo "$BIN" "$TMP/raw.zip" "$EXAM" \
+time sudo "$BIN" "$TMP/raw.zip" "$SOURCE" \
     -m store \
     --exclude '._*' --exclude '.DS_Store' \
     --raw-block -q

@@ -1,7 +1,7 @@
 //! `.7z` solid output via `sevenz-rust`.
 //!
 //! Trades tzip's per-file parallelism for a single LZMA2 solid stream that
-//! yields substantially better ratios on similar-file corpora (generic-file, logs,
+//! yields substantially better ratios on similar-file corpora (logs,
 //! source trees). Reads still go through our reader pool → we throttle disk
 //! contention even when the compressor is serial.
 //!

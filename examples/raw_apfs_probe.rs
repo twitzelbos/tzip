@@ -3,8 +3,8 @@
 //!
 //! Build:  cargo build --example raw_apfs_probe --features raw-apfs --release
 //! Run:    sudo ./target/release/examples/raw_apfs_probe /dev/rdisk3
-//!         sudo ./target/release/examples/raw_apfs_probe /dev/rdisk5 /studies/exam_summary.csv
-//!         sudo ./target/release/examples/raw_apfs_probe /dev/rdisk5 /studies /some/big/file.dcm
+//!         sudo ./target/release/examples/raw_apfs_probe /dev/rdiskN /some-dir/some-file
+//!         sudo ./target/release/examples/raw_apfs_probe /dev/rdiskN /dir-to-list /path/to/big/file
 //!
 //! On Apple Silicon internal storage or any FileVault-enabled volume,
 //! catalog reads fail at "invalid checksum" — see docs/RAW_BLOCK.md.

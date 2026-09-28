@@ -67,7 +67,7 @@ pub fn write_solid(
         );
     }
 
-    let progress = Progress::new(total_bytes, total_files, opts.quiet && !opts.tui);
+    let progress = Progress::new(total_bytes, total_files, opts.quiet || opts.tui);
 
     let mut written = 0u64;
     for item in items {

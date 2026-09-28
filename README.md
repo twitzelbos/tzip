@@ -228,23 +228,33 @@ Workarounds if speed matters more than ratio on `.7z`:
 
 ## TUI mode
 
-`--tui` when stdout is a TTY enables a ratatui alternate-screen dashboard:
+`--tui` when stdout is a TTY enables a ratatui alternate-screen
+dashboard: overall progress, a live throughput sparkline with peak
+MB/s and active-worker count, and one line per compressor worker
+showing the file currently being encoded and its instantaneous rate.
 
 ```
 ┌ tzip ─────────────────────────────────────────────────────────────────┐
 │ 2.3 GB / 9.1 GB  •  38k / 143k files  •  412 MB/s  •  ETA 0m17s       │
 │ [===============================>............................] 25%   │
+├ throughput  •  peak 620 MB/s  •  workers 8/10 ────────────────────────┤
+│ ▁▂▄▇█▇▆▆▆▆▇▇█▇▆▆▆▅▄▄▃▃▂▂▂▃▄▅▆▆▇▇██▇▇▆▆▆▆▆▅▅▄▄▃▃▂▂▁▁▁▁▁▁▁▁▁▁▁         │
 └───────────────────────────────────────────────────────────────────────┘
 ┌ workers ──────────────────────────────────────────────────────────────┐
-│ worker  0: ▶ .../subdir-a/file-001.dat                       511 MB/s
-│ worker  1: ▶ .../subdir-b/file-023.dat                       489 MB/s
-│ worker  2: · idle                                                 0 MB/s
-│ ...
+│ worker  0: ▶ .../subdir-a/file-001.dat                       511 MB/s │
+│ worker  1: ▶ .../subdir-b/file-023.dat                       489 MB/s │
+│ worker  2: · idle                                              0 MB/s │
+│ ...                                                                   │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-Keys: `q` or Esc to signal cancel. Cancel is currently cooperative — the
-pipeline finishes in-flight items before exiting.
+In streaming mode the walker doesn't know the total upfront, so the
+top row switches to `1.4 GB written • 10k files • 341 MB/s •
+discovering…` and the gauge stays at 0% until the walker finishes —
+the sparkline and worker rows still show live activity.
+
+Keys: `q` or Esc to signal cancel. Cancel is currently cooperative
+— the pipeline finishes in-flight items before exiting.
 
 ---
 

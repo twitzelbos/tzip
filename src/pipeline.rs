@@ -203,7 +203,7 @@ pub fn run(opts: Options) -> Result<()> {
     let progress = Arc::new(Progress::new(
         total_bytes_hint,
         total_files_hint,
-        opts.quiet && !opts.tui,
+        opts.quiet || opts.tui,
     ));
     let tui_handle = if opts.tui {
         Some(tui::start(total_bytes_hint, total_files_hint, opts.cpu_jobs))

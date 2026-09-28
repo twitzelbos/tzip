@@ -8,6 +8,7 @@
 //!
 //!     ┌──────────────────────── tzip ─────────────────────────┐
 //!     │ overall bar   |   bytes / total   |   MB/s   |   ETA  │
+//!     │ throughput ▁▂▄█▇▅▄▃▂▂▁▁  peak N MB/s  workers X/Y     │
 //!     ├───────────────────────────────────────────────────────┤
 //!     │ worker 0: <file>          <MB/s>                      │
 //!     │ worker 1: <file>          <MB/s>                      │
@@ -27,8 +28,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline};
 use ratatui::Terminal;
+use std::collections::VecDeque;
 use std::io::stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -121,6 +123,16 @@ fn run_ui(
     let started = Instant::now();
     let mut last_draw = Instant::now() - Duration::from_secs(1);
 
+    // Throughput history: one sample every ~500 ms of aggregate MB/s
+    // over that interval. Rolling window of ~30 seconds (60 samples).
+    // Rendered as a Sparkline in the header — shows if the pipeline is
+    // steady-state, ramping, or stalling.
+    const SPARK_CAP: usize = 60;
+    let mut throughput_samples: VecDeque<u64> = VecDeque::with_capacity(SPARK_CAP);
+    let mut last_sample_at = Instant::now();
+    let mut last_sample_bytes = 0u64;
+    let mut peak_mbps = 0.0f64;
+
     loop {
         // Drain events non-blocking
         loop {
@@ -164,6 +176,25 @@ fn run_ui(
             }
         }
 
+        // Take a throughput sample every ~500 ms — instantaneous MB/s
+        // over the last interval, so the sparkline reflects live rate
+        // rather than lifetime average. Skip while last_draw is fresh
+        // to keep sampling regular.
+        if last_sample_at.elapsed() >= Duration::from_millis(500) {
+            let dt = last_sample_at.elapsed().as_secs_f64();
+            let dbytes = done_bytes.saturating_sub(last_sample_bytes);
+            let inst_mbps = (dbytes as f64 / 1_048_576.0) / dt.max(0.001);
+            if inst_mbps > peak_mbps {
+                peak_mbps = inst_mbps;
+            }
+            if throughput_samples.len() >= SPARK_CAP {
+                throughput_samples.pop_front();
+            }
+            throughput_samples.push_back(inst_mbps.round() as u64);
+            last_sample_at = Instant::now();
+            last_sample_bytes = done_bytes;
+        }
+
         if last_draw.elapsed() < Duration::from_millis(80) {
             continue;
         }
@@ -173,32 +204,53 @@ fn run_ui(
             let area = f.area();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(4), Constraint::Min(3)])
+                .constraints([Constraint::Length(6), Constraint::Min(3)])
                 .split(area);
 
-            let pct = if total_bytes == 0 {
-                0
-            } else {
-                ((done_bytes.min(total_bytes) as u128 * 100) / total_bytes as u128) as u16
-            };
+            // Header: outer box, with gauge on top row and sparkline
+            // on the row below.
+            let header = chunks[0];
+            let header_inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Length(3)])
+                .split(header);
+
+            // Total-known path shows a real percentage + ETA; streaming
+            // mode (total_bytes == 0) shows an indeterminate label
+            // instead of "0.0 MB / 0.0 MB • ETA 0m00s" nonsense.
             let elapsed = started.elapsed().as_secs_f64().max(0.001);
             let mbps = (done_bytes as f64 / 1_048_576.0) / elapsed;
-            let eta = if mbps > 0.0 {
-                let remaining_mb = (total_bytes.saturating_sub(done_bytes)) as f64 / 1_048_576.0;
-                let secs = (remaining_mb / mbps) as u64;
-                format!("{}m{:02}s", secs / 60, secs % 60)
+            let known_total = total_bytes > 0;
+            let pct = if known_total {
+                ((done_bytes.min(total_bytes) as u128 * 100) / total_bytes as u128) as u16
             } else {
-                "…".into()
+                0
             };
-            let label = format!(
-                "{:.1} MB / {:.1} MB  •  {} / {} files  •  {:.1} MB/s  •  ETA {}  •  press q to cancel",
-                done_bytes as f64 / 1_048_576.0,
-                total_bytes as f64 / 1_048_576.0,
-                done_files,
-                total_files,
-                mbps,
-                eta,
-            );
+            let label = if known_total {
+                let remaining_mb = (total_bytes.saturating_sub(done_bytes)) as f64 / 1_048_576.0;
+                let eta = if mbps > 0.0 {
+                    let secs = (remaining_mb / mbps) as u64;
+                    format!("{}m{:02}s", secs / 60, secs % 60)
+                } else {
+                    "…".into()
+                };
+                format!(
+                    "{:.1} MB / {:.1} MB  •  {} / {} files  •  {:.1} MB/s  •  ETA {}  •  press q to cancel",
+                    done_bytes as f64 / 1_048_576.0,
+                    total_bytes as f64 / 1_048_576.0,
+                    done_files,
+                    total_files,
+                    mbps,
+                    eta,
+                )
+            } else {
+                format!(
+                    "{:.1} MB written  •  {} files  •  {:.1} MB/s  •  discovering…  •  press q to cancel",
+                    done_bytes as f64 / 1_048_576.0,
+                    done_files,
+                    mbps,
+                )
+            };
             let gauge = Gauge::default()
                 .block(Block::default().borders(Borders::ALL).title(Span::styled(
                     "tzip",
@@ -207,7 +259,26 @@ fn run_ui(
                 .gauge_style(Style::default().fg(Color::Cyan))
                 .percent(pct)
                 .label(label);
-            f.render_widget(gauge, chunks[0]);
+            f.render_widget(gauge, header_inner[0]);
+
+            // Sparkline row: throughput history + peak + active workers.
+            let active = workers.iter().filter(|w| w.started.is_some()).count();
+            let spark_data: Vec<u64> = throughput_samples.iter().copied().collect();
+            let sparkline_title = format!(
+                "throughput  •  peak {:.0} MB/s  •  workers {}/{}",
+                peak_mbps,
+                active,
+                workers.len(),
+            );
+            let sparkline = Sparkline::default()
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(sparkline_title),
+                )
+                .data(&spark_data)
+                .style(Style::default().fg(Color::Green));
+            f.render_widget(sparkline, header_inner[1]);
 
             let mut lines: Vec<Line> = Vec::with_capacity(workers.len());
             for (i, w) in workers.iter().enumerate() {

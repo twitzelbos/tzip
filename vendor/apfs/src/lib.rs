@@ -619,6 +619,102 @@ impl<R: Read + Seek> ApfsVolume<R> {
         )
     }
 
+    /// One-shot whole-tree metadata scan. LOCAL PATCH (tzip). Returns
+    /// every inode + every extent record in the volume, keyed for O(1)
+    /// lookup. Amortizes interior-node reads: a single sequential-ish
+    /// walk of the whole catalog tree is dramatically cheaper than
+    /// N per-file `lookup_inode` / `lookup_extents` descents when N is
+    /// large (tens of thousands of files).
+    pub fn scan_all_metadata(
+        &mut self,
+    ) -> Result<(
+        std::collections::HashMap<u64, catalog::InodeVal>,
+        std::collections::HashMap<u64, Vec<(u64, catalog::FileExtentVal)>>,
+    )> {
+        catalog::scan_all_metadata(
+            &mut self.reader,
+            self.catalog_root_block,
+            self.vol_omap_root_block,
+            self.block_size,
+        )
+    }
+
+    /// Batch-fetch file extent records for every private_id in
+    /// `[min_id, max_id]`. Same idea as `batch_inodes_in_range` but on
+    /// the extent side of the catalog. Callers group results by
+    /// `private_id` to reassemble per-file extent lists. LOCAL PATCH.
+    pub fn batch_extents_in_range(
+        &mut self,
+        min_id: u64,
+        max_id: u64,
+    ) -> Result<Vec<(u64, u64, catalog::FileExtentVal)>> {
+        catalog::batch_extents_in_range(
+            &mut self.reader,
+            self.catalog_root_block,
+            self.vol_omap_root_block,
+            self.block_size,
+            min_id,
+            max_id,
+        )
+    }
+
+    /// Look up extent records for `private_id`. LOCAL PATCH (tzip): thin
+    /// public accessor around `catalog::lookup_extents` for callers that
+    /// want to schedule reads across many files (e.g. sort by disk
+    /// offset and coalesce into sequential preads).
+    pub fn lookup_extents_by_private_id(
+        &mut self,
+        private_id: u64,
+    ) -> Result<Vec<catalog::FileExtentRecord>> {
+        catalog::lookup_extents(
+            &mut self.reader,
+            self.catalog_root_block,
+            self.vol_omap_root_block,
+            self.block_size,
+            private_id,
+        )
+    }
+
+    /// Perform a raw block-aligned read at `disk_offset` into `buf` via
+    /// the underlying reader. LOCAL PATCH (tzip): lets a bulk reader
+    /// issue coalesced sequential preads to serve multiple files' worth
+    /// of extents in one syscall, without needing its own reader wrapper.
+    /// `buf.len()` and `disk_offset` must be block-aligned; the caller
+    /// slices out per-file extents afterwards.
+    pub fn read_raw_at(&mut self, disk_offset: u64, buf: &mut [u8]) -> Result<()> {
+        use std::io::SeekFrom;
+        self.reader.seek(SeekFrom::Start(disk_offset))?;
+        self.reader.read_exact(buf)?;
+        Ok(())
+    }
+
+    /// Access to the volume's block size — callers building sequential
+    /// preads need this to align offsets.
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// Look up the inode record for `oid`. LOCAL PATCH (tzip): thin
+    /// accessor around `catalog::lookup_inode` for the bulk reader.
+    pub fn lookup_inode_by_oid(&mut self, oid: u64) -> Result<catalog::InodeVal> {
+        catalog::lookup_inode(
+            &mut self.reader,
+            self.catalog_root_block,
+            self.vol_omap_root_block,
+            self.block_size,
+            oid,
+        )
+    }
+
+    /// LOCAL PATCH (tzip): fetch the decmpfs header for `oid`, or None
+    /// if the file isn't compressed. Same call as the private
+    /// `compression()` used internally but exposed so a bulk reader can
+    /// route compressed files down the per-file path (their bytes
+    /// aren't in the extent tree).
+    pub fn compression_header(&mut self, oid: u64) -> Result<Option<CompressionHeader>> {
+        self.compression(oid)
+    }
+
     /// Read a file by its OID, reusing a pre-fetched inode instead of
     /// looking it up again. LOCAL PATCH (tzip). Use in the reader hot
     /// path when the walker has already batch-fetched inodes for the

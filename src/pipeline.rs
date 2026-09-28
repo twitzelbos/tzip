@@ -66,10 +66,10 @@ impl Source for LocalFsSource {
 
 /// Read stage output — untouched bytes plus enough metadata to identify the
 /// entry downstream.
-struct RawItem {
-    index: u64,
-    item: WorkItem,
-    bytes: platform::ReadBuf,
+pub(crate) struct RawItem {
+    pub(crate) index: u64,
+    pub(crate) item: WorkItem,
+    pub(crate) bytes: platform::ReadBuf,
 }
 
 pub fn run(opts: Options) -> Result<()> {
@@ -352,20 +352,86 @@ pub fn run(opts: Options) -> Result<()> {
     };
     #[cfg(not(target_os = "macos"))]
     let source: Arc<dyn Source> = Arc::new(LocalFsSource { keep_cache: opts.keep_cache });
+    // Reader stage. Two shapes:
+    //   * DEFAULT: pool of `opts.read_jobs` threads, each pulling one
+    //     item at a time from feed_rx, calling `source.read(item)`.
+    //   * --raw-block BULK: single "bulk reader" thread that consumes
+    //     the feed as batches, sorts each batch's extents by disk
+    //     offset, and issues coalesced sequential preads. Turns
+    //     ~2 lookups + small random reads per file into
+    //     sequential-throughput I/O.
     let mut reader_handles = Vec::new();
-    for _ in 0..opts.read_jobs {
-        let feed_rx = feed_rx.clone();
-        let raw_tx = raw_tx.clone();
-        let source = Arc::clone(&source);
-        reader_handles.push(thread::spawn(move || -> Result<()> {
-            while let Ok((index, item)) = feed_rx.recv() {
-                let bytes = source.read(&item)?;
-                if raw_tx.send(RawItem { index, item, bytes }).is_err() {
-                    break;
+    #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
+    let bulk_reader_raw_src = raw_apfs_source.clone();
+    #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
+    let use_bulk = bulk_reader_raw_src.is_some();
+    #[cfg(not(all(target_os = "macos", feature = "raw-apfs")))]
+    let use_bulk = false;
+
+    if use_bulk {
+        #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
+        {
+            // Bulk reader: drain the whole feed, split into N contiguous
+            // walker-order chunks, run bulk_read_all in parallel across
+            // N reader threads.
+            //
+            // Now that `scan_all_metadata` runs once up front and
+            // populates inode + extent caches globally, per-file
+            // lookups are pure hashmap hits — no B-tree contention, no
+            // per-thread cache thrash. Parallel bulk now scales linearly
+            // with device I/O concurrency instead of losing to it.
+            let feed_rx = feed_rx.clone();
+            let n = opts.read_jobs.max(1);
+            let src = bulk_reader_raw_src.unwrap();
+            let (chunk_tx, chunk_rx) = bounded::<Vec<(u64, WorkItem)>>(n.max(1));
+            reader_handles.push(thread::spawn(move || -> Result<()> {
+                let mut items: Vec<(u64, WorkItem)> = Vec::new();
+                while let Ok((index, item)) = feed_rx.recv() {
+                    items.push((index, item));
                 }
+                let total = items.len();
+                let per = (total + n - 1) / n;
+                for i in 0..n {
+                    let start = i * per;
+                    if start >= total {
+                        break;
+                    }
+                    let end = ((i + 1) * per).min(total);
+                    let chunk: Vec<(u64, WorkItem)> = items[start..end].to_vec();
+                    if chunk_tx.send(chunk).is_err() {
+                        break;
+                    }
+                }
+                drop(chunk_tx);
+                Ok(())
+            }));
+            for _ in 0..n {
+                let chunk_rx = chunk_rx.clone();
+                let raw_tx = raw_tx.clone();
+                let src = Arc::clone(&src);
+                reader_handles.push(thread::spawn(move || -> Result<()> {
+                    while let Ok(chunk) = chunk_rx.recv() {
+                        src.bulk_read_all(chunk, raw_tx.clone())?;
+                    }
+                    Ok(())
+                }));
             }
-            Ok(())
-        }));
+        }
+    } else {
+        for _ in 0..opts.read_jobs {
+            let feed_rx = feed_rx.clone();
+            let raw_tx = raw_tx.clone();
+            let source = Arc::clone(&source);
+            reader_handles.push(thread::spawn(move || -> Result<()> {
+                while let Ok((index, item)) = feed_rx.recv() {
+                    let bytes = source.read(&item)?;
+                    if raw_tx.send(RawItem { index, item, bytes }).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            }));
+        }
     }
     drop(feed_rx);
     drop(raw_tx);

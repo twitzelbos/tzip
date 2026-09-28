@@ -739,6 +739,120 @@ pub fn batch_inodes_in_range<R: Read + Seek>(
     Ok(out)
 }
 
+/// One-shot whole-tree metadata scan. LOCAL PATCH (tzip). Walks the
+/// entire catalog B-tree once and returns a full inode + extent
+/// dictionary, keyed by obj_id / private_id respectively. Amortizes
+/// interior-node reads across every subsequent file operation: the
+/// tree is ~200 MB on a busy volume and reads mostly-sequentially, so
+/// even a fully-populated volume costs single-digit seconds — much
+/// cheaper than N per-file `lookup_inode` + `lookup_extents` descents
+/// when N is in the tens of thousands.
+///
+/// Returns `(oid → InodeVal, private_id → [(logical_addr, extent)])`.
+/// Callers keep both maps for the duration of the archive job and hit
+/// them O(1) for every file.
+pub fn scan_all_metadata<R: Read + Seek>(
+    reader: &mut R,
+    catalog_root: u64,
+    omap_root: u64,
+    block_size: u32,
+) -> Result<(
+    std::collections::HashMap<u64, InodeVal>,
+    std::collections::HashMap<u64, Vec<(u64, FileExtentVal)>>,
+)> {
+    // Comparator that returns Equal for every key — force `btree_scan`
+    // to visit every leaf. (The scan's interior-node pruning still
+    // works: no key returns Greater, so we descend into every subtree,
+    // but each subtree is walked in one pass.)
+    let compare_fn = |_key: &[u8]| -> Result<std::cmp::Ordering> {
+        Ok(std::cmp::Ordering::Equal)
+    };
+    let entries = btree::btree_scan(
+        reader,
+        catalog_root,
+        block_size,
+        0,
+        0,
+        &compare_fn,
+        Some(omap_root),
+    )?;
+
+    let mut inodes: std::collections::HashMap<u64, InodeVal> =
+        std::collections::HashMap::with_capacity(entries.len() / 4);
+    let mut extents: std::collections::HashMap<u64, Vec<(u64, FileExtentVal)>> =
+        std::collections::HashMap::with_capacity(entries.len() / 8);
+    for (key, val) in entries {
+        let (key_id, key_type) = match decode_catalog_key(&key) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        match key_type {
+            J_TYPE_INODE => {
+                if let Ok(inode) = InodeVal::parse(&val) {
+                    inodes.insert(key_id, inode);
+                }
+            }
+            J_TYPE_FILE_EXTENT => {
+                let logical_addr = match parse_file_extent_logical_addr(&key) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                if let Ok(v) = FileExtentVal::parse(&val) {
+                    extents.entry(key_id).or_default().push((logical_addr, v));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((inodes, extents))
+}
+
+/// Batch-fetch every file extent record whose key `obj_id` (the file's
+/// `private_id`, not the dir-record OID) is in `[min_id, max_id]`.
+/// Returns `(private_id, logical_addr, FileExtentVal)` triples. The
+/// caller groups by `private_id` to reassemble a per-file extent list.
+///
+/// Uses the same range comparator as `batch_inodes_in_range`; extent
+/// records live in the same catalog B-tree with `J_TYPE_FILE_EXTENT`,
+/// keyed by `(private_id, logical_addr)`.
+pub fn batch_extents_in_range<R: Read + Seek>(
+    reader: &mut R,
+    catalog_root: u64,
+    omap_root: u64,
+    block_size: u32,
+    min_id: u64,
+    max_id: u64,
+) -> Result<Vec<(u64, u64, FileExtentVal)>> {
+    let compare_fn = catalog_key_range(min_id, max_id);
+    let entries = btree::btree_scan(
+        reader,
+        catalog_root,
+        block_size,
+        0,
+        0,
+        &compare_fn,
+        Some(omap_root),
+    )?;
+    let mut out = Vec::with_capacity(entries.len() / 2);
+    for (key, val) in entries {
+        let (key_id, key_type) = match decode_catalog_key(&key) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if key_type != J_TYPE_FILE_EXTENT {
+            continue;
+        }
+        let logical_addr = match parse_file_extent_logical_addr(&key) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if let Ok(v) = FileExtentVal::parse(&val) {
+            out.push((key_id, logical_addr, v));
+        }
+    }
+    Ok(out)
+}
+
 /// Resolve a path like "/Applications/Upscayl.app/Contents/Info.plist" to its (OID, InodeVal).
 pub fn resolve_path<R: Read + Seek>(
     reader: &mut R,

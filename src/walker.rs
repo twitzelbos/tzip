@@ -44,13 +44,34 @@ pub struct WalkOpts<'a> {
     pub exclude: &'a [String],
     pub sort: bool,
     pub walk_threads: usize,
+    /// If true, store just each root's basename in the archive (legacy
+    /// tzip behavior). If false (default), preserve the CLI-given path
+    /// with leading `/` stripped for absolute paths — matches `zip -r`.
+    pub basename_only: bool,
+}
+
+/// Derive the archive-name prefix for a root as the user typed it on
+/// the CLI. Matches `zip -r` convention: strip leading `/` for absolute
+/// paths, trim trailing `/`, otherwise use the path as-is. The
+/// `basename_only` variant keeps the legacy tzip behavior of using just
+/// the last path component.
+pub(crate) fn archive_prefix_for_root(cli_root: &Path, basename_only: bool) -> String {
+    if basename_only {
+        cli_root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        let s = cli_root.to_string_lossy();
+        s.trim_start_matches('/').trim_end_matches('/').to_string()
+    }
 }
 
 /// Batch walk: collects the whole tree before returning. Used only for
 /// `--sort` where deterministic ordering requires the full list up front.
 pub fn walk(opts: WalkOpts) -> Result<Vec<WorkItem>> {
     let (tx, rx) = crossbeam_channel::unbounded::<WorkItem>();
-    walk_stream(opts.roots, opts.exclude, opts.walk_threads, tx)?;
+    walk_stream(opts.roots, opts.exclude, opts.walk_threads, opts.basename_only, tx)?;
     let mut items: Vec<WorkItem> = rx.into_iter().collect();
     if opts.sort {
         items.sort_by(|a, b| a.name_in_archive.cmp(&b.name_in_archive));
@@ -71,27 +92,20 @@ pub fn walk_stream(
     roots: &[PathBuf],
     exclude: &[String],
     walk_threads: usize,
+    basename_only: bool,
     tx: crossbeam_channel::Sender<WorkItem>,
 ) -> Result<()> {
-    for root in roots {
-        let root = root
+    for cli_root in roots {
+        let root = cli_root
             .canonicalize()
-            .with_context(|| format!("canonicalize {}", root.display()))?;
+            .with_context(|| format!("canonicalize {}", cli_root.display()))?;
 
         let base_dir = if root.is_file() {
             root.parent().unwrap_or(Path::new("")).to_path_buf()
         } else {
             root.clone()
         };
-        let base_name = if root.is_file() {
-            root.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        } else {
-            root.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "".to_string())
-        };
+        let base_name = archive_prefix_for_root(cli_root, basename_only);
 
         if root.is_file() {
             let meta = std::fs::metadata(&root)?;

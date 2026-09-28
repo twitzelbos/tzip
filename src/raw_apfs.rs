@@ -624,6 +624,7 @@ impl RawApfsSource {
         &self,
         roots: &[PathBuf],
         exclude: &[String],
+        basename_only: bool,
         tx: crossbeam_channel::Sender<WorkItem>,
     ) -> Result<()> {
         use rayon::prelude::*;
@@ -641,7 +642,7 @@ impl RawApfsSource {
         // amortized over walking thousands of files it's noise.
         roots.par_iter().try_for_each(|root| -> Result<()> {
             let mut vol = open_volume(&self.device, self.block_cache.clone())?;
-            self.walk_root(&mut vol, root, exclude, &tx, &count)
+            self.walk_root(&mut vol, root, exclude, basename_only, &tx, &count)
         })?;
 
         Ok(())
@@ -650,16 +651,23 @@ impl RawApfsSource {
     fn walk_root(
         &self,
         vol: &mut ApfsVolume<AlignedRawReader>,
-        root: &Path,
+        cli_root: &Path,
         exclude: &[String],
+        basename_only: bool,
         tx: &crossbeam_channel::Sender<WorkItem>,
         count: &AtomicUsize,
     ) -> Result<()> {
-        // Convert to volume-relative.
-        let rel_root = root
+        // Canonicalize for filesystem lookup so relative CLI paths
+        // (e.g. `foo/bar` when CWD is under the mount) resolve to
+        // absolute mount-relative form. Preserve `cli_root` unchanged
+        // for the archive-name prefix.
+        let root_abs = cli_root
+            .canonicalize()
+            .unwrap_or_else(|_| cli_root.to_path_buf());
+        let rel_root = root_abs
             .strip_prefix(&self.mount_point)
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| root.to_path_buf());
+            .unwrap_or_else(|_| root_abs.clone());
         let rel_root_str = format!("/{}", rel_root.to_string_lossy().trim_start_matches('/'));
 
         // Resolve the root's OID + kind. Try as a directory first.
@@ -672,11 +680,10 @@ impl RawApfsSource {
                 .write()
                 .unwrap()
                 .insert(rel_root_str.clone(), oid);
-            let base = root
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            self.walk_dir(vol, root, &rel_root_str, oid, &base, exclude, tx, count)
+            let base = crate::walker::archive_prefix_for_root(cli_root, basename_only);
+            // Walker recurses on the ABSOLUTE path for filesystem operations
+            // but the archive prefix comes from `cli_root`.
+            self.walk_dir(vol, &root_abs, &rel_root_str, oid, &base, exclude, tx, count)
         } else {
             // Root is a file. Emit a single item; the reader will fetch
             // the real size during its own inode lookup.
@@ -689,15 +696,12 @@ impl RawApfsSource {
                 },
             };
             let _ = oid;
-            let name = root
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let name = crate::walker::archive_prefix_for_root(cli_root, basename_only);
             if crate::bulk_walker::is_excluded(&name, exclude) {
                 return Ok(());
             }
             let _ = tx.send(WorkItem {
-                path: root.to_path_buf(),
+                path: root_abs.clone(),
                 name_in_archive: name,
                 size: 0,
                 mtime: (((1 << 9) | (1 << 5)) as u16, 0),

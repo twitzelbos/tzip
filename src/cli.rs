@@ -121,6 +121,13 @@ pub struct Args {
     )]
     pub raw_block: bool,
 
+    /// Legacy tzip behavior: store archive paths as just the basename
+    /// of each CLI root (e.g. `foo/bar/baz` → `baz/…` in the archive).
+    /// Default is the `zip -r` convention: preserve the CLI-given path
+    /// (with leading `/` stripped for absolute paths).
+    #[arg(long)]
+    pub basename_only: bool,
+
     /// Warn about running processes that will contend for the source drive:
     /// Spotlight indexing, on-access AV scanners (Sophos, CrowdStrike,
     /// SentinelOne, McAfee, Symantec, ESET, Malwarebytes, Carbon Black,
@@ -190,6 +197,7 @@ pub struct Options {
     pub warn_contention: bool,
     #[cfg(all(feature = "raw-apfs", target_os = "macos"))]
     pub raw_block: bool,
+    pub basename_only: bool,
     pub user_flags: UserSetFlags,
 }
 
@@ -247,6 +255,7 @@ impl Args {
             warn_contention: self.warn_contention,
             #[cfg(all(feature = "raw-apfs", target_os = "macos"))]
             raw_block: self.raw_block,
+            basename_only: self.basename_only,
             user_flags,
         })
     }

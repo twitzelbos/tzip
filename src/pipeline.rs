@@ -119,6 +119,7 @@ pub fn run(opts: Options) -> Result<()> {
             exclude: &opts.exclude,
             sort: opts.sort,
             walk_threads: opts.walk_jobs.max(1),
+            basename_only: opts.basename_only,
         })?;
         if items.is_empty() {
             anyhow::bail!("no files to archive");
@@ -181,6 +182,7 @@ pub fn run(opts: Options) -> Result<()> {
             exclude: &opts.exclude,
             sort: opts.sort,
             walk_threads: opts.walk_jobs.max(1),
+            basename_only: opts.basename_only,
         })?;
         if items.is_empty() {
             anyhow::bail!("no files to archive");
@@ -278,23 +280,24 @@ pub fn run(opts: Options) -> Result<()> {
             let exclude = opts.exclude.clone();
             let walk_jobs = opts.walk_jobs;
             let use_bulk = cfg!(target_os = "macos") && !opts.classic_walk;
+            let basename_only = opts.basename_only;
             #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
             let raw_src_for_walk = raw_apfs_source.clone();
             let walker_thread = thread::spawn(move || -> Result<()> {
                 #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
                 {
                     if let Some(src) = raw_src_for_walk {
-                        return src.walk_stream(&roots, &exclude, wtx);
+                        return src.walk_stream(&roots, &exclude, basename_only, wtx);
                     }
                 }
                 #[cfg(target_os = "macos")]
                 {
                     if use_bulk {
-                        return crate::bulk_walker::walk_stream_bulk(&roots, &exclude, wtx);
+                        return crate::bulk_walker::walk_stream_bulk(&roots, &exclude, basename_only, wtx);
                     }
                 }
                 let _ = use_bulk;
-                walker::walk_stream(&roots, &exclude, walk_jobs, wtx)
+                walker::walk_stream(&roots, &exclude, walk_jobs, basename_only, wtx)
             });
             let feed_tx2 = feed_tx.clone();
             let idx_c = Arc::clone(&index_counter);

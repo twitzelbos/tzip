@@ -52,21 +52,19 @@ const VLNK: u32 = 5;
 pub fn walk_stream_bulk(
     roots: &[PathBuf],
     exclude: &[String],
+    basename_only: bool,
     tx: Sender<WorkItem>,
 ) -> Result<()> {
-    for root in roots {
-        let root_canon = root
+    for cli_root in roots {
+        let root_canon = cli_root
             .canonicalize()
-            .with_context(|| format!("canonicalize {}", root.display()))?;
+            .with_context(|| format!("canonicalize {}", cli_root.display()))?;
 
         if root_canon.is_file() {
             // Fall back to a plain stat for single-file roots — bulk walk is
             // for directories.
             let meta = std::fs::metadata(&root_canon)?;
-            let name = root_canon
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let name = crate::walker::archive_prefix_for_root(cli_root, basename_only);
             if is_excluded(&name, exclude) {
                 continue;
             }
@@ -85,10 +83,7 @@ pub fn walk_stream_bulk(
             continue;
         }
 
-        let base_name = root_canon
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let base_name = crate::walker::archive_prefix_for_root(cli_root, basename_only);
         walk_recursive(&root_canon, &base_name, exclude, &tx)?;
     }
     Ok(())

@@ -324,6 +324,9 @@ pub struct RawApfsSource {
     /// offsets don't contend on a single lock.
     block_cache: SharedBlockCacheRef,
     stats: ReadStats,
+    /// If true, print the per-phase stats + prefetch line at Drop.
+    /// Wired from `Options::verbose` at open time.
+    verbose: bool,
 }
 
 /// Accumulated per-stage cost of the reader hot path. Dumped at `Drop`.
@@ -375,6 +378,11 @@ impl ReadStats {
 impl Drop for RawApfsSource {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // Stats are only interesting for perf debugging — gate on -v so
+        // regular runs don't dump a paragraph of numbers.
+        if !self.verbose {
+            return;
+        }
         let n = self.stats.files.load(Relaxed);
         if n > 0 {
             let bytes = self.stats.total_bytes.load(Relaxed);
@@ -436,7 +444,11 @@ impl Drop for RawApfsSource {
 impl RawApfsSource {
     /// Open `pool_size` independent readers against the APFS container
     /// backing `mount_point`. Requires root or `operator` group.
-    pub fn open_for_mount(mount_point: &Path, pool_size: usize) -> Result<Self> {
+    pub fn open_for_mount(
+        mount_point: &Path,
+        pool_size: usize,
+        verbose: bool,
+    ) -> Result<Self> {
         let bsd = bsd_device_for_mount(mount_point).with_context(|| {
             format!("resolve /dev/... for mount {}", mount_point.display())
         })?;
@@ -494,7 +506,7 @@ impl RawApfsSource {
                 );
                 (HashMap::new(), HashMap::new())
             });
-            if !imap.is_empty() {
+            if verbose && !imap.is_empty() {
                 eprintln!(
                     "tzip: --raw-block prefetched {} inodes, {} extent-lists in {:.2}s",
                     imap.len(),
@@ -515,6 +527,7 @@ impl RawApfsSource {
             extent_cache: RwLock::new(extent_map),
             block_cache,
             stats: ReadStats::default(),
+            verbose,
         })
     }
 

@@ -145,13 +145,16 @@ pub fn run(opts: Options) -> Result<()> {
             Ok(info) => match crate::raw_apfs::RawApfsSource::open_for_mount(
                 &info.mount_point,
                 pool_size,
+                opts.verbose,
             ) {
                 Ok(s) => {
-                    eprintln!(
-                        "tzip: --raw-block active for {} (pool size {})",
-                        info.mount_point.display(),
-                        pool_size
-                    );
+                    if opts.verbose {
+                        eprintln!(
+                            "tzip: --raw-block active for {} (pool size {})",
+                            info.mount_point.display(),
+                            pool_size
+                        );
+                    }
                     Some(Arc::new(s))
                 }
                 Err(e) => {

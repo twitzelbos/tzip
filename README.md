@@ -34,7 +34,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Performance](#performance)
 - [External-drive tuning](#external-drive-tuning)
 - [macOS-specific fast paths](#macos-specific-fast-paths)
-- [APFS-on-USB warning](#apfs-on-usb-warning)
+- [APFS-on-USB](#apfs-on-usb)
 - [Known limitations](#known-limitations)
 - [Architecture](#architecture)
 - [Building from source](#building-from-source)
@@ -135,6 +135,7 @@ tzip [OPTIONS] <ARCHIVE> <PATHS>...
 | `--classic-walk` | off | Use portable jwalk walker instead of the `getattrlistbulk` bulk walker (only useful for debugging) |
 | `--dispatch-io` | off | Route small-file reads (<1 MiB) through GCD `dispatch_io_read` instead of blocking `read()` |
 | `--keep-cache` | off | Skip `F_NOCACHE` — keep read blocks in the OS page cache. Useful on APFS-USB where page-cache bypass hurts more than helps |
+| `--raw-block[=true\|false]` | auto (root+APFS-on-USB) | Read files by parsing APFS on-disk format directly from `/dev/rdiskN` (bypasses VFS + AV hooks). Requires root. Auto-enabled when eligible. See [`docs/RAW_BLOCK.md`](docs/RAW_BLOCK.md). Requires the `raw-apfs` Cargo feature. |
 
 **Output selection & ordering**
 
@@ -307,6 +308,21 @@ Reference: `7z a -tzip -mx=9` on the same 500-file corpus completes in
 ~2.5s. On DEFLATE+AES with `--read-jobs auto`, tzip is **~10× faster**
 than p7zip's wall time on the same hardware.
 
+**`--raw-block` on APFS-on-USB** (M1 Max, TestDrive USB SSD, large-archive-style
+medical-imaging archive):
+
+| workload | default VFS | `--raw-block` | speedup |
+|---|---|---|---|
+| 79 K files / 11.7 GB → 3.3 GB / DEFLATE+AES | 2:52 | **1:26** | **2.0×** |
+| 11 K files / 1.7 GB (aged data) / `-m store` | 2:15 | **0:22** | **6.1×** |
+| 11 K files / 1.7 GB (fresh copy) / `-m store` | 2:22 | **0:17** | **8.2×** |
+
+Byte-verified byte-identical to the default path via
+`scripts/verify-raw-block.sh`. See
+[`docs/RAW_BLOCK.md`](docs/RAW_BLOCK.md) for the architecture that
+unlocked this (whole-tree metadata prefetch + sharded block cache +
+parallel bulk reader with sequential extent-order preads).
+
 ### Method-throughput matrix
 
 Same 124 MB / 500-file corpus:
@@ -326,15 +342,22 @@ Same 124 MB / 500-file corpus:
 ## Auto-tuned defaults
 
 At startup tzip probes each source path and the output archive's parent
-directory. If any of them lives on **APFS-over-USB** it switches to a
-safe combo (`keep_cache=on, read_jobs=1, dispatch_io=on`) and prints a
-one-line notice. If any lives on **NTFS-on-macOS** it enables
-`keep_cache=on`. Any flag you set explicitly on the command line is
-left alone.
+directory. If any of them lives on **APFS-over-USB** it picks the best
+available combo:
+
+- **Running as root + `raw-apfs` feature compiled:** `raw_block=on` +
+  `read_jobs=8`. Uses the raw APFS parser to bypass the VFS entirely
+  (2-8× faster; see benchmarks above).
+- **Otherwise:** the safe VFS combo — `keep_cache=on`, `dispatch_io=on`,
+  `read_jobs=4`.
+
+If any path lives on **NTFS-on-macOS** it enables `keep_cache=on`. Any
+flag you set explicitly on the command line is left alone.
 
 ```
-$ tzip out.zip /Volumes/BadDrive/src/
-tzip: auto-tuned defaults for APFS-on-USB source (keep_cache=on, read_jobs=1, dispatch_io=on). Override with the same flag.
+$ sudo tzip out.zip /Volumes/BadDrive/src/
+tzip: auto-tuned defaults for APFS-on-USB source (
+    keep_cache=on, raw_block=on (root+APFS-on-USB), read_jobs=8).
 [...]
 ```
 
@@ -439,50 +462,86 @@ enter the unified buffer cache, so archiving 10 GB doesn't evict your
 working-set data. Disable with `--keep-cache` on slow filesystems where
 you'd rather benefit from readahead caching.
 
+### `--raw-block` — raw APFS parser (`raw_apfs.rs`, feature `raw-apfs`)
+
+Bypasses the VFS entirely: opens `/dev/rdiskN` as a block device and
+parses the APFS on-disk format directly (via the vendored
+[`apfs`](vendor/apfs) crate). File `open()` never happens as far as
+the kernel is concerned, so on-access AV hooks
+(Sophos/CrowdStrike/SentinelOne/etc.) that intercept via Endpoint
+Security see nothing.
+
+Architecture (see [`docs/RAW_BLOCK.md`](docs/RAW_BLOCK.md) for the
+full story):
+
+1. **Whole-tree metadata prefetch.** One sequential B-tree walk at
+   source open, populates global `oid → InodeVal` and
+   `private_id → extents` HashMaps. Every subsequent per-file lookup
+   is a hashmap hit — no B-tree work per file.
+2. **Sharded 64 MiB block cache** across all reader threads (16
+   shards, `parking_lot::Mutex<HashMap>`) so interior B-tree nodes
+   are read once and served from RAM.
+3. **Bulk reader with sequential extent-order preads.** Reader threads
+   split the item list into walker-order chunks, sort each chunk's
+   extents by disk offset, coalesce adjacent extents, and pread each
+   run in one syscall.
+4. **Parallel bulk readers** (default 8 threads). Each has its own
+   `ApfsVolume` handle on `/dev/rdiskN` for independent USB queue
+   slots.
+
+Access requirements: `/dev/rdisk*` is `root:operator 0640` — run
+`sudo tzip …` or add yourself to the `operator` group.
+
+Not supported: FileVault-encrypted volumes (raw reads return
+ciphertext). Detected upfront; falls back cleanly to the default VFS
+reader with a one-line message.
+
+Auto-enabled when: `raw-apfs` feature compiled + macOS + APFS-on-USB
+source + running as root + user didn't explicitly pass
+`--raw-block=false`.
+
 ---
 
-## APFS-on-USB warning
+## APFS-on-USB
 
-**tl;dr: do not use APFS on USB-attached drives if you care about
-throughput. Use exfat with 32 KB allocation unit instead.**
+**tl;dr:** APFS-on-USB *used* to be catastrophically slow for
+archivers, because APFS's small-random-metadata pattern hits the
+per-command USB-MSC round-trip latency on every B-tree read. With
+`--raw-block` (auto-enabled under sudo on macOS builds with the
+`raw-apfs` feature), tzip **beats the VFS path by 2-8×** on the same
+drive by pre-reading the whole catalog B-tree in one sequential
+pass and doing all subsequent lookups from RAM — see the benchmarks
+above.
 
-APFS's B-tree metadata and extent-based storage are ideal on internal
-NVMe (µs-latency PCIe). Over USB-MSC (USB Mass Storage Class), every
-metadata read becomes a synchronous USB command with ~1-3 ms overhead.
-APFS's small-random-metadata pattern hits USB-MSC's worst-case latency
-profile.
+If you can't use `--raw-block` (no sudo, or on FileVault-encrypted
+volumes), the safe fallback is auto-tuned by tzip:
+`--keep-cache --read-jobs 4 --dispatch-io`. This takes the edge off
+but doesn't match `--raw-block` speed.
 
-Symptoms:
-- `dd if=<any-large-file> of=/dev/null bs=1m count=200` on an APFS-USB
-  volume runs at 3-10 MB/s where exfat on the same hardware runs at
+The classical failure mode when neither is available:
+- `dd if=<file> of=/dev/null bs=1m count=200` on an APFS-USB volume
+  runs at 3-10 MB/s where exfat on the same hardware runs at
   50-150 MB/s
 - `readdir` of a directory with a few thousand files takes 30+ seconds
-- Any archiver (tzip, p7zip, ditto, WinZip) appears "hung"; the
-  archiver isn't the bottleneck, the driver stack is
+- Any archiver (p7zip, ditto, WinZip) appears "hung"; the archiver
+  isn't the bottleneck, the driver stack + APFS metadata pattern is
 
-If you're stuck with APFS on USB and can't reformat, the tzip
-mitigations that help most:
+Manual override on the fallback path:
 
 ```
 tzip out.zip src/ --keep-cache --read-jobs 1 --dispatch-io
 ```
 
-- `--keep-cache` — let readahead work; F_NOCACHE was the wrong default
-- `--read-jobs 1` — one reader stops fighting itself for the USB head
-- `--dispatch-io` — GCD may pipeline requests better than blocking threads
-
-None of these recover exfat parity; they take the edge off.
-
 ### If you can reformat
 
-In Disk Utility, select the *physical disk* (not the volume) → Erase →
-Format `ExFAT` → Allocation Unit Size `32 KB` (or via terminal:
-`newfs_exfat -c 32k`). GUID Partition Map. Then rsync your data back.
+Before `--raw-block` existed, we'd have suggested exfat here. With
+`--raw-block` in place, staying on APFS is now the better choice on
+macOS. Only reformat if you also need to use the drive from
+Windows / older systems that can't read APFS.
 
-- 32 KB clusters eliminate the "1 MiB slack per file" waste that
-  motivates APFS in the first place
-- exfat over USB-MSC is fast because its access pattern is what USB was
-  designed for
+For Windows-compatibility case: Disk Utility → *physical disk* →
+Erase → Format `ExFAT` → Allocation Unit Size `32 KB`. GUID Partition
+Map. Then rsync your data back.
 
 ---
 

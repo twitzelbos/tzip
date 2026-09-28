@@ -581,117 +581,6 @@ impl RawApfsSource {
         })
     }
 
-    /// Walk `roots` (absolute paths — must all be under `self.mount_point`)
-    /// recursively, populating the OID cache with every descendant. After
-    /// this returns, `resolve_oid` on any file in the walked subtree is
-    /// a pure hashmap lookup — the reader hot path does zero B-tree work.
-    ///
-    /// Roots are walked in parallel across the volume pool: one volume per
-    /// root, up to the pool size. Directories are walked sequentially
-    /// within a root (to keep each volume's fd on one seek arm at a time)
-    /// but multiple roots run concurrently on separate fds.
-    ///
-    /// Returns the number of entries added to the cache.
-    pub fn prewalk<P: AsRef<Path>>(&self, roots: &[P]) -> Result<usize> {
-        use rayon::prelude::*;
-        let count = AtomicUsize::new(0);
-
-        // Normalize + de-dup + convert to volume-relative.
-        let mut rel_roots: Vec<String> = Vec::with_capacity(roots.len());
-        for r in roots {
-            let stripped = r
-                .as_ref()
-                .strip_prefix(&self.mount_point)
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|_| r.as_ref().to_path_buf());
-            let rel = format!("/{}", stripped.to_string_lossy().trim_start_matches('/'));
-            rel_roots.push(rel);
-        }
-        rel_roots.sort();
-        rel_roots.dedup();
-
-        rel_roots.par_iter().try_for_each(|root| -> Result<()> {
-            let mut vol = match self.pool_recv.recv() {
-                Ok(v) => v,
-                Err(_) => open_volume(&self.device, self.block_cache.clone())?,
-            };
-            let res = self.prewalk_from(&mut vol, root, &count);
-            let _ = self.pool_send.send(vol);
-            res
-        })?;
-
-        Ok(count.load(AtomicOrdering::Relaxed))
-    }
-
-    /// Ensure `rel_str`'s OID is cached, then if it's a directory recurse
-    /// into it (populating child OIDs). No-op if the path isn't in the
-    /// volume — silently skip so a bogus CLI path doesn't kill the prewalk.
-    fn prewalk_from(
-        &self,
-        vol: &mut ApfsVolume<AlignedRawReader>,
-        rel_str: &str,
-        count: &AtomicUsize,
-    ) -> Result<()> {
-        // Resolve the root. Cache the OID either way; recursion depends
-        // on whether it's a directory. Bind the Option first so the read
-        // guard drops before we ever try to take a write guard — a match
-        // scrutinee holds its temporaries for the whole match, which
-        // would deadlock the write below.
-        let cached = self.oid_cache.read().unwrap().get(rel_str).copied();
-        let oid = match cached {
-            Some(o) => o,
-            None => {
-                // Try as a directory first; if it's a file, `open_directory`
-                // returns NotADirectory — fall back to `resolve_oid`.
-                match vol.open_directory(rel_str) {
-                    Ok(o) => {
-                        self.oid_cache
-                            .write()
-                            .unwrap()
-                            .insert(rel_str.to_string(), o);
-                        o
-                    }
-                    Err(_) => {
-                        // Not a directory — treat as a file and populate via
-                        // the standard resolve. Don't recurse.
-                        let _ = self.resolve_oid(vol, rel_str);
-                        return Ok(());
-                    }
-                }
-            }
-        };
-
-        // List names + oids of children.
-        let entries = match vol.list_directory_names_by_oid(oid) {
-            Ok(e) => e,
-            Err(_) => return Ok(()),
-        };
-
-        // Cache all children and collect subdirectories for recursion.
-        let rel_norm = rel_str.trim_end_matches('/');
-        let mut subdirs: Vec<String> = Vec::new();
-        {
-            let mut w = self.oid_cache.write().unwrap();
-            for (name, child_oid, kind) in &entries {
-                let full = if rel_norm.is_empty() {
-                    format!("/{}", name)
-                } else {
-                    format!("{}/{}", rel_norm, name)
-                };
-                w.insert(full.clone(), *child_oid);
-                count.fetch_add(1, AtomicOrdering::Relaxed);
-                if matches!(kind, EntryKind::Directory) {
-                    subdirs.push(full);
-                }
-            }
-        }
-
-        for sub in &subdirs {
-            self.prewalk_from(vol, sub, count)?;
-        }
-        Ok(())
-    }
-
     /// Walk `roots` recursively via the raw APFS parser and STREAM
     /// `WorkItem`s to `tx` as they are discovered. Replaces
     /// `bulk_walker::walk_stream_bulk` when `--raw-block` is on so we
@@ -1405,19 +1294,6 @@ impl RawApfsSource {
         Ok(false)
     }
 
-    /// Peek at whether an OID has a decmpfs xattr — cheaper than
-    /// fetching the header (skips the parse) and doesn't touch the
-    /// content. Errors treated as "no" so caller falls back to the
-    /// normal read path.
-    fn compression_present(
-        &self,
-        vol: &mut ApfsVolume<AlignedRawReader>,
-        oid: u64,
-    ) -> Result<bool> {
-        // Cheap heuristic: call the crate's `compression()` which does
-        // the xattr lookup. If it returns Some, this is compressed.
-        Ok(vol.compression_header(oid).map(|h| h.is_some()).unwrap_or(false))
-    }
 }
 
 impl Source for RawApfsSource {

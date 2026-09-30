@@ -172,7 +172,7 @@ fn archive_name(base_name: &str, rel: &Path) -> String {
     }
 }
 
-fn is_excluded(name: &str, globs: &[String]) -> bool {
+pub(crate) fn is_excluded(name: &str, globs: &[String]) -> bool {
     // Simple glob: only `*` supported for now. Full glob crate can slot in later.
     globs.iter().any(|g| glob_match(g, name))
 }

@@ -34,6 +34,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Performance](#performance)
 - [External-drive tuning](#external-drive-tuning)
 - [macOS-specific fast paths](#macos-specific-fast-paths)
+- [Linux-specific fast paths](#linux-specific-fast-paths)
 - [APFS-on-USB](#apfs-on-usb)
 - [Known limitations](#known-limitations)
 - [Architecture](#architecture)
@@ -60,10 +61,25 @@ The release profile uses `-C target-cpu=native` (see `.cargo/config.toml`),
 so hardware AES/SHA/CRC32 dispatch is baked into the build. Rebuild when
 moving between machine generations.
 
+Optional Cargo features:
+
+```
+# Linux: io_uring deep-queue reader (--io-uring), kernel >= 5.6
+cargo build --release --features io-uring
+
+# macOS: raw APFS block reader (--raw-block)
+cargo build --release --features raw-apfs
+```
+
+The Linux FIEMAP extent-order reader (`--raw-block`) needs no feature flag —
+it's always compiled in on Linux.
+
 ### System requirements at runtime
 
 - macOS 11+ (universal support for ARMv8 crypto + libdispatch + `getattrlistbulk`)
-- Linux with kernel 4.14+ (SHA-NI/AES-NI at runtime via `cpufeatures`)
+- Linux with kernel 4.14+ (SHA-NI/AES-NI at runtime via `cpufeatures`). The
+  FIEMAP extent-order reader (`--raw-block`) works on ext4/xfs/btrfs/f2fs; the
+  optional `--io-uring` reader needs kernel ≥ 5.6
 - Windows 10+ (build with `cargo build --release` from a POSIX-emulated shell
   such as MSYS2 — the bulk_walker and dispatch_io modules are compiled out
   automatically)
@@ -136,6 +152,14 @@ tzip [OPTIONS] <ARCHIVE> <PATHS>...
 | `--dispatch-io` | off | Route small-file reads (<1 MiB) through GCD `dispatch_io_read` instead of blocking `read()` |
 | `--keep-cache` | off | Skip `F_NOCACHE` — keep read blocks in the OS page cache. Useful on APFS-USB where page-cache bypass hurts more than helps |
 | `--raw-block[=true\|false]` | auto (root+APFS-on-USB) | Read files by parsing APFS on-disk format directly from `/dev/rdiskN` (bypasses VFS + AV hooks). Requires root. Auto-enabled when eligible. See [`docs/RAW_BLOCK.md`](docs/RAW_BLOCK.md). Requires the `raw-apfs` Cargo feature. |
+
+**Linux fast paths**
+
+| flag | default | meaning |
+|---|---|---|
+| `--raw-block[=true\|false]` | auto (rotational/removable media) | Extent-order reader: use the `FS_IOC_FIEMAP` ioctl to sort files by physical block offset and read them in disk order, turning a seek storm into a forward sweep. Works on ext4/xfs/btrfs/f2fs. Big win on spinning / USB media, neutral on NVMe (so auto-enabled only on seeking media). See [`docs/LINUX.md`](docs/LINUX.md). |
+| `--io-uring` | off | Read file bodies via io_uring at queue depth 128 instead of one blocking `read` per reader thread — keeps NVMe busy from a single thread. Pairs with `--raw-block` (files submitted in disk order). Requires the `io-uring` Cargo feature and kernel ≥ 5.6. |
+| `--apfs-device <DEV>` | off | Archive an **APFS** volume by parsing it directly off a raw device (e.g. `/dev/sda1`) — no mount, no APFS driver needed. Positional args become in-volume paths; omit them for the whole volume. Requires the `raw-apfs` Cargo feature + read access to the device. See [`docs/LINUX.md`](docs/LINUX.md). |
 
 **Output selection & ordering**
 
@@ -364,10 +388,22 @@ available combo:
 If any path lives on **NTFS-on-macOS** it enables `keep_cache=on`. Any
 flag you set explicitly on the command line is left alone.
 
+On **Linux**, tzip checks the block device backing the source (via
+`/sys/dev/block/<maj>:<min>`). If it's **rotational or removable** and the
+filesystem supports FIEMAP, it enables the extent-order reader
+(`raw_block=on`) and drops to `read_jobs=1` for a single clean forward
+sweep. On NVMe the reorder is neutral, so it's left off (pass
+`--raw-block` to force it). See [`docs/LINUX.md`](docs/LINUX.md).
+
 ```
 $ sudo tzip out.zip /Volumes/BadDrive/src/
 tzip: auto-tuned defaults for APFS-on-USB source (
     keep_cache=on, raw_block=on (root+APFS-on-USB), read_jobs=8).
+[...]
+
+$ tzip out.zip /mnt/usb-hdd/src/         # Linux, USB spinning disk
+tzip: auto-tuned defaults for Linux source (
+    raw_block=on (removable media), read_jobs=1).
 [...]
 ```
 
@@ -509,6 +545,89 @@ reader with a one-line message.
 Auto-enabled when: `raw-apfs` feature compiled + macOS + APFS-on-USB
 source + running as root + user didn't explicitly pass
 `--raw-block=false`.
+
+---
+
+## Linux-specific fast paths
+
+The compression, AES-256, SHA-1 and CRC paths already accelerate on Linux
+through the same runtime CPU-feature dispatch as macOS (AES-NI + SSE4.2 on
+x86_64, ARMv8 crypto on aarch64). The `posix_fadvise` /
+`FALLOC_FL_KEEP_SIZE` hints in `platform.rs` are the Linux analogs of the
+macOS `F_NOCACHE` / `F_PREALLOCATE` calls. On top of that Linux gets two
+I/O fast paths.
+
+### `--raw-block` — FIEMAP extent-order reader (`linux_raw.rs`)
+
+The Linux analog to the macOS raw-APFS reader, but no filesystem parser is
+needed: the kernel already exposes each file's physical block layout via the
+`FS_IOC_FIEMAP` ioctl (`fiemap.rs`). Works on ext4, xfs, btrfs and f2fs.
+
+1. **Probe.** For each file in a window (256 files) tzip issues one FIEMAP
+   ioctl to learn its first physical block offset.
+2. **Sort.** The window is sorted into ascending disk order.
+3. **Sweep.** Files are read in that order through the normal VFS, with
+   kernel readahead issued a few files ahead so the drive stays busy.
+
+The result is a monotonic forward sweep of the platters / flash instead of
+the seek storm you get from directory-enumeration order. The payoff is on
+media where seeks cost — spinning disks and USB-attached drives — exactly
+where the macOS `--raw-block` path pays off. On NVMe it's roughly neutral,
+so auto-tune only engages it on rotational/removable media.
+
+Unlike the macOS raw-device path, this still reads through the VFS, so it
+does **not** bypass `fanotify`-based on-access AV. Defeating enterprise AV
+on Linux is a separate problem — get a per-process exclusion. See
+[`docs/LINUX.md`](docs/LINUX.md).
+
+### `--io-uring` — deep-queue async reader (`io_uring_src.rs`, feature `io-uring`)
+
+Orthogonal to FIEMAP. The default reader issues one blocking `read()` per
+reader thread, so each thread has at most one read outstanding — fine for
+spinning media (the extent sweep already serializes it) but it leaves fast
+NVMe idle waiting on completions. With `--io-uring` a single reader thread
+submits up to 128 reads at once and reaps completions as they land, keeping
+the device queue full and saturating NVMe (7 GB/s+).
+
+It composes with `--raw-block`: the window is still sorted into physical
+disk order, then submitted to the ring in that order. Requires the
+`io-uring` Cargo feature and kernel ≥ 5.6.
+
+```
+cargo build --release --features io-uring
+tzip out.zip /data/nvme/src --raw-block --io-uring
+```
+
+### `--apfs-device` — read an APFS volume with no mount (`raw_apfs.rs`, feature `raw-apfs`)
+
+The same raw-APFS parser that powers macOS `--raw-block` also runs on Linux.
+Because the parser reads the on-disk format itself, it needs **no mount and no
+Linux APFS driver** — just read access to the device. This is the way to
+archive an APFS drive (e.g. a Mac-formatted USB disk) on a Linux box that
+can't mount APFS at all.
+
+```
+cargo build --release --features raw-apfs
+# whole volume:
+sudo tzip mac-backup.zip --apfs-device /dev/sda1
+# a subtree (in-volume paths):
+sudo tzip subset.zip --apfs-device /dev/sda1 /Users/me/Documents
+```
+
+- **Whole-volume walk + read come from the parser** (catalog B-tree +
+  extents), so directory enumeration works without a mount.
+- **FIEMAP does not apply here** — FIEMAP needs a mounted filesystem whose
+  kernel driver services the ioctl; an unmounted device (or one mounted via
+  read-only apfs-fuse, which doesn't implement fiemap) has nothing to answer
+  it. The raw parser is the right tool, and it's also faster (one sequential
+  catalog scan up front, then hashmap lookups per file).
+- **Access:** the device node is `root:disk 0660`. Run under `sudo`, join the
+  `disk` group (`sudo usermod -aG disk $USER`, persistent), or grant a
+  temporary ACL (`sudo setfacl -m u:$USER:r /dev/sda1` — note udev can reset
+  this when the node is re-created).
+- **Not supported:** FileVault / block-layer-encrypted volumes — catalog pages
+  are ciphertext at the block layer, so parsing fails up front with a clear
+  message.
 
 ---
 

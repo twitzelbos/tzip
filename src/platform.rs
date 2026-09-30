@@ -274,14 +274,39 @@ pub fn fs_info(path: &Path) -> io::Result<FsInfo> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    // Best-effort fs_type on Linux — libc gives us f_type as a magic number,
-    // not a name. Just report "unknown" and rely on other signals.
+    // Linux gives us `f_type` as a magic number, not a name. Map the common
+    // ones so `--verbose` diagnostics are legible; fall back to the hex magic
+    // for anything unrecognized. These are the filesystems the extent-order
+    // reader cares about (FIEMAP support) plus the ones where it's a no-op.
+    let fs_type = linux_fs_name(sfs.f_type as i64);
     Ok(FsInfo {
-        fs_type: "unknown".into(),
+        fs_type,
         iosize: sfs.f_bsize as u32,
         bsize: sfs.f_bsize as u32,
         mount_point: std::path::PathBuf::from("/"),
     })
+}
+
+/// Map a Linux `statfs.f_type` magic to a human-readable name. Magics from
+/// `<linux/magic.h>`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_fs_name(magic: i64) -> String {
+    let name = match magic {
+        0xEF53 => "ext4",       // shared by ext2/3/4
+        0x58465342 => "xfs",
+        0x9123683E => "btrfs",
+        0xF2F52010 => "f2fs",
+        0x6969 => "nfs",
+        0x01021994 => "tmpfs",
+        0x794C7630 => "overlayfs",
+        0x2FC12FC1 => "zfs",
+        0x4D44 => "vfat",       // msdos/FAT
+        0x5346544E => "ntfs",
+        0x9FA0 => "proc",
+        0x62656572 => "sysfs",
+        _ => return format!("0x{:x}", magic),
+    };
+    name.to_string()
 }
 
 #[cfg(not(unix))]

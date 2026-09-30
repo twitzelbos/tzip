@@ -31,14 +31,16 @@
 //! kernel driver, above the block layer. Raw reads return ciphertext
 //! → `invalid checksum`.
 
-#![cfg(all(feature = "raw-apfs", target_os = "macos"))]
+#![cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -444,6 +446,7 @@ impl Drop for RawApfsSource {
 impl RawApfsSource {
     /// Open `pool_size` independent readers against the APFS container
     /// backing `mount_point`. Requires root or `operator` group.
+    #[cfg(target_os = "macos")]
     pub fn open_for_mount(
         mount_point: &Path,
         pool_size: usize,
@@ -453,7 +456,29 @@ impl RawApfsSource {
             format!("resolve /dev/... for mount {}", mount_point.display())
         })?;
         let whole = whole_disk_raw(&bsd)?;
+        Self::open_impl(mount_point.to_path_buf(), whole, pool_size, verbose)
+    }
 
+    /// Open an APFS container directly from a device path (block device on
+    /// Linux, char device on macOS) — no mount needed. CLI roots are treated
+    /// as absolute volume-relative paths; `mount_point` is set to `/` so the
+    /// path translation in `walk_root` is the identity.
+    pub fn open_for_device(
+        device: &Path,
+        pool_size: usize,
+        verbose: bool,
+    ) -> Result<Self> {
+        Self::open_impl(PathBuf::from("/"), device.to_path_buf(), pool_size, verbose)
+    }
+
+    /// Shared open path: build the reader pool against `whole`, verify the
+    /// volume is parseable (not block-layer encrypted), and prefetch metadata.
+    fn open_impl(
+        mount_point: PathBuf,
+        whole: PathBuf,
+        pool_size: usize,
+        verbose: bool,
+    ) -> Result<Self> {
         let (pool_send, pool_recv) = crossbeam_channel::bounded(pool_size.max(1));
 
         // Shared block cache: 64 MiB total (16 K blocks × 4 KiB). Big
@@ -531,7 +556,7 @@ impl RawApfsSource {
         };
 
         Ok(Self {
-            mount_point: mount_point.to_path_buf(),
+            mount_point,
             device: whole,
             pool_send,
             pool_recv,
@@ -697,7 +722,7 @@ impl RawApfsSource {
             };
             let _ = oid;
             let name = crate::walker::archive_prefix_for_root(cli_root, basename_only);
-            if crate::bulk_walker::is_excluded(&name, exclude) {
+            if crate::walker::is_excluded(&name, exclude) {
                 return Ok(());
             }
             let _ = tx.send(WorkItem {
@@ -800,8 +825,8 @@ impl RawApfsSource {
             } else {
                 format!("{}/{}", archive_prefix, name)
             };
-            if crate::bulk_walker::is_excluded(&archive_name, exclude)
-                || crate::bulk_walker::is_excluded(name, exclude)
+            if crate::walker::is_excluded(&archive_name, exclude)
+                || crate::walker::is_excluded(name, exclude)
             {
                 continue;
             }
@@ -1327,6 +1352,14 @@ impl RawApfsSource {
 }
 
 impl Source for RawApfsSource {
+    fn read_bulk(
+        &self,
+        items: Vec<(u64, WorkItem)>,
+        raw_tx: Sender<crate::pipeline::RawItem>,
+    ) -> Result<()> {
+        self.bulk_read_all(items, raw_tx)
+    }
+
     fn read(&self, item: &WorkItem) -> Result<ReadBuf> {
         let rel = item
             .path
@@ -1397,10 +1430,14 @@ fn open_volume(
         .read(true)
         .open(device)
         .with_context(|| {
-            format!(
-                "open {} — raw device is root:operator 0640; run as sudo or join operator",
-                device.display()
-            )
+            // macOS: /dev/rdiskN is root:operator 0640. Linux: /dev/sdXN is
+            // root:disk 0660. Either way, need sudo or a read-grant on the node.
+            let hint = if cfg!(target_os = "macos") {
+                "root:operator 0640 — run as sudo or join the operator group"
+            } else {
+                "root:disk 0660 — run as sudo, join the disk group, or grant read access"
+            };
+            format!("open {} — raw device is {hint}", device.display())
         })?;
     let reader = AlignedRawReader::new(f, 4096, cache);
     ApfsVolume::open(reader).map_err(|e| {
@@ -1413,6 +1450,7 @@ fn open_volume(
 }
 
 /// statfs the given path and return `/dev/diskNsM`.
+#[cfg(target_os = "macos")]
 fn bsd_device_for_mount(mount: &Path) -> Result<PathBuf> {
     let c = std::ffi::CString::new(mount.as_os_str().as_bytes())
         .map_err(|_| anyhow!("path contains NUL"))?;
@@ -1426,6 +1464,7 @@ fn bsd_device_for_mount(mount: &Path) -> Result<PathBuf> {
 }
 
 /// `/dev/disk5s1` → `/dev/rdisk5` (whole disk, character device).
+#[cfg(target_os = "macos")]
 fn whole_disk_raw(bsd: &Path) -> Result<PathBuf> {
     let s = bsd.to_string_lossy();
     let base = s

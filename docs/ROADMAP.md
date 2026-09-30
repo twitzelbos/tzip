@@ -24,6 +24,23 @@ Byte-verified interop with 7-zip.
 
 ## Phase A — Linux platform port
 
+**Status (2026-09-30): largely landed.** The FIEMAP extent-order reader
+(`--raw-block` on Linux), the io_uring deep-queue reader (`--io-uring`,
+feature `io-uring`), Linux auto-tune (rotational/removable detection via
+`/sys/dev/block`), and `statfs`-magic filesystem naming are implemented and
+byte-verified against the default reader. See [`LINUX.md`](LINUX.md).
+
+The raw-APFS parser is also now **ported to Linux** (`--apfs-device
+/dev/sdXN`, feature `raw-apfs`): archive an APFS volume by parsing it off a
+raw block device with no mount and no APFS driver. Verified against a 931 GB
+Mac USB disk (whole-catalog walk, 11,499/11,499 DICOM files byte-valid on
+round-trip). This is the Linux answer for APFS media — FIEMAP can't help an
+unmounted volume. All reader backends now share one `Source::read_bulk`
+bulk path.
+
+Still open: a `getdents64`/`statx` bulk walker and `O_DIRECT` cross-file
+extent coalescing.
+
 **Goal.** Give Linux users the same architecture wins we've built for
 macOS. Same tzip binary, same CLI, same TUI.
 
@@ -65,13 +82,15 @@ macOS. Same tzip binary, same CLI, same TUI.
 - Best answer stays "get a per-process exclusion."
 
 **Suggested order:**
-1. Baseline the current binary on the target Linux machine — probably
+1. ✅ Baseline the current binary on the target Linux machine — probably
    already fine on plain NVMe. Establish numbers to beat.
-2. `posix_fadvise` / `readahead` hints — small `platform.rs` port.
-3. FIEMAP-based extent-order reader — new source implementation,
-   similar shape to `RawApfsSource` but no filesystem parser. Works
-   across ext4/xfs/btrfs. **~1-2 weeks.**
-4. `io_uring` reader — optional per-source. **~1 week + testing.**
+2. ✅ `posix_fadvise` / `readahead` hints — already in `platform.rs`;
+   the extent reader adds forward-looking `readahead(2)`.
+3. ✅ FIEMAP-based extent-order reader — `src/linux_raw.rs` +
+   `src/fiemap.rs`. Same shape as `RawApfsSource` but no filesystem
+   parser; works across ext4/xfs/btrfs/f2fs.
+4. ✅ `io_uring` reader — `src/io_uring_src.rs`, feature `io-uring`.
+   Composes with the extent reader.
 
 **Estimated effort:** 2-4 weeks total. Payoff: on par with
 `--raw-block` speedups where AV pressure exists; substantial

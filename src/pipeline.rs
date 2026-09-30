@@ -237,14 +237,37 @@ pub fn run(opts: Options) -> Result<()> {
     // list up front to reorder). Streaming is the default, and the
     // streaming feeder below will use `RawApfsSource::walk_stream` when
     // `--raw-block` is on and skip `bulk_walker` entirely.
+    #[allow(unused_mut)]
     let batch_items: Option<Vec<WorkItem>> = if opts.sort {
-        let items = walker::walk(WalkOpts {
-            roots: &opts.paths,
-            exclude: &opts.exclude,
-            sort: opts.sort,
-            walk_threads: opts.walk_jobs.max(1),
-            basename_only: opts.basename_only,
-        })?;
+        // Raw-APFS mode (esp. an unmounted `--apfs-device`): the VFS walker
+        // can't `stat` in-volume paths, so gather items from the parser's own
+        // walker and sort them here by archive path (matching `walker::walk`).
+        let mut collected: Option<Vec<WorkItem>> = None;
+        #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+        {
+            if let Some(src) = raw_apfs_source.clone() {
+                let (wtx, wrx) = crossbeam_channel::unbounded::<WorkItem>();
+                let roots = opts.paths.clone();
+                let exclude = opts.exclude.clone();
+                let basename_only = opts.basename_only;
+                let h = thread::spawn(move || src.walk_stream(&roots, &exclude, basename_only, wtx));
+                let mut items: Vec<WorkItem> = wrx.iter().collect();
+                h.join()
+                    .map_err(|_| anyhow::anyhow!("apfs walk thread panicked"))??;
+                items.sort_by(|a, b| a.name_in_archive.cmp(&b.name_in_archive));
+                collected = Some(items);
+            }
+        }
+        let items = match collected {
+            Some(v) => v,
+            None => walker::walk(WalkOpts {
+                roots: &opts.paths,
+                exclude: &opts.exclude,
+                sort: opts.sort,
+                walk_threads: opts.walk_jobs.max(1),
+                basename_only: opts.basename_only,
+            })?,
+        };
         if items.is_empty() {
             anyhow::bail!("no files to archive");
         }

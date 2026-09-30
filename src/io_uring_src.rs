@@ -26,6 +26,15 @@ use io_uring::{opcode, types, IoUring};
 /// an unreasonable pinned-buffer footprint.
 pub const QUEUE_DEPTH: u32 = 128;
 
+/// Whether io_uring is actually usable on this kernel/environment. Some
+/// setups (kernel < 5.6, or `io_uring` disabled via
+/// `/proc/sys/kernel/io_uring_disabled`, or restrictive container seccomp)
+/// don't allow it — probe once so the caller can fall back to blocking reads
+/// instead of failing the whole archive.
+pub fn available() -> bool {
+    IoUring::new(8).is_ok()
+}
+
 struct JobState {
     buf: Vec<u8>,
     filled: usize,

@@ -1076,7 +1076,14 @@ impl RawApfsSource {
         // `vol.compression_header` only when the flag is ambiguous or
         // missing (rare).
         const UF_COMPRESSED: u32 = 0x0000_0020;
-        for (idx, item, _oid, inode) in per_item {
+        for (idx, mut item, _oid, inode) in per_item {
+            // Stamp the real mtime from the inode. The walk deliberately skips
+            // per-file inode lookups (leaving the DOS epoch) for speed, but the
+            // reader already has the inode in hand here, so preserving the real
+            // modification time is free. APFS times are nanoseconds since the
+            // Unix epoch.
+            item.mtime = crate::walker::unix_to_dos(inode.modify_time / 1_000_000_000);
+
             // Special-case: symlink or transparently compressed file.
             // Both live outside the extent tree so route through the
             // per-file fallback in Phase 3.
@@ -1095,6 +1102,8 @@ impl RawApfsSource {
             }
 
             let file_size = inode.size();
+            // Real size too (walk left it 0) — accurate progress + preallocation.
+            item.size = file_size;
             if file_size == 0 {
                 slots.push(Slot {
                     index: idx,

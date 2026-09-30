@@ -682,6 +682,13 @@ Map. Then rsync your data back.
   attribute-alignment parser doesn't currently decode `ATTR_CMN_MODTIME`
   correctly; the field is skipped and mtime is set to 1980-01-01. Use
   `--classic-walk` if real mtimes matter. TODO.
+- **Symlinks are not preserved as links** — the ZIP writer has no
+  symlink-entry support, so a symbolic link is archived as a *regular
+  file whose contents are the link target path* rather than a symlink.
+  On extraction you get a small regular file, not a link. This is most
+  visible on Unix source trees (and APFS volumes via `--apfs-device`),
+  where symlinks are common. Storing proper symlink entries (unix mode
+  `S_IFLNK` in the external-attributes field) is a planned follow-up.
 - **Cancel is cooperative** — TUI `q` sets a flag; the pipeline
   finishes in-flight work before exiting.
 - **`--sort` + AES is not byte-identical** across runs — the random

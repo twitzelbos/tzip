@@ -442,13 +442,26 @@ pub fn run(opts: Options) -> Result<()> {
             }
         }
     };
+    // Probe io_uring once: if the kernel/environment doesn't support it, fall
+    // back to blocking reads (still extent-ordered) rather than failing the run.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    let use_io_uring = if opts.io_uring && !crate::io_uring_src::available() {
+        if !opts.quiet {
+            eprintln!(
+                "tzip: io_uring unavailable on this kernel — falling back to blocking reads"
+            );
+        }
+        false
+    } else {
+        opts.io_uring
+    };
     #[cfg(target_os = "linux")]
     let linux_raw_source: Option<Arc<crate::linux_raw::LinuxExtentSource>> = if want_linux_bulk {
         Some(Arc::new(crate::linux_raw::LinuxExtentSource {
             keep_cache: opts.keep_cache,
             verbose: opts.verbose,
             #[cfg(feature = "io-uring")]
-            io_uring: opts.io_uring,
+            io_uring: use_io_uring,
         }))
     } else {
         None

@@ -867,7 +867,11 @@ fn auto_tune(mut opts: Options) -> Options {
             // serializes beyond ~8 concurrent commands, so extra fds
             // add coordination cost without throughput. Sharded cache
             // is kept so a faster drive would scale further.
-            if opts.raw_block {
+            #[cfg(feature = "raw-apfs")]
+            let raw_block_active = opts.raw_block;
+            #[cfg(not(feature = "raw-apfs"))]
+            let raw_block_active = false;
+            if raw_block_active {
                 if !opts.user_flags.read_jobs {
                     let target = 8;
                     if opts.read_jobs != target {

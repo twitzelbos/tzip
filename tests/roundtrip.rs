@@ -29,8 +29,13 @@ fn make_corpus(root: &Path) {
     fs::write(root.join("nested/c.txt"), b"nested content\n").unwrap();
 }
 
-fn run_tzip(args: &[&str]) {
+/// Runs tzip with `cwd` as the working directory so paths passed in `args`
+/// can be relative. The default `zip -r` convention preserves whatever path
+/// the CLI was given, so passing an absolute `src` would store entries under
+/// `var/folders/…/corpus/…` and break the diff against the source tree.
+fn run_tzip(cwd: &Path, args: &[&str]) {
     let out = Command::new(tzip_bin())
+        .current_dir(cwd)
         .args(args)
         .output()
         .expect("run tzip");
@@ -104,13 +109,7 @@ fn roundtrip_store() {
     make_corpus(&src);
     let archive = tmp.path().join("out.zip");
 
-    run_tzip(&[
-        archive.to_str().unwrap(),
-        src.to_str().unwrap(),
-        "-m",
-        "store",
-        "-q",
-    ]);
+    run_tzip(tmp.path(), &["out.zip", "corpus", "-m", "store", "-q"]);
 
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
@@ -125,15 +124,10 @@ fn roundtrip_deflate_level0() {
     make_corpus(&src);
     let archive = tmp.path().join("out.zip");
 
-    run_tzip(&[
-        archive.to_str().unwrap(),
-        src.to_str().unwrap(),
-        "-m",
-        "deflate",
-        "-x",
-        "0",
-        "-q",
-    ]);
+    run_tzip(
+        tmp.path(),
+        &["out.zip", "corpus", "-m", "deflate", "-x", "0", "-q"],
+    );
 
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
@@ -148,15 +142,10 @@ fn roundtrip_deflate_max() {
     make_corpus(&src);
     let archive = tmp.path().join("out.zip");
 
-    run_tzip(&[
-        archive.to_str().unwrap(),
-        src.to_str().unwrap(),
-        "-m",
-        "deflate",
-        "-x",
-        "12",
-        "-q",
-    ]);
+    run_tzip(
+        tmp.path(),
+        &["out.zip", "corpus", "-m", "deflate", "-x", "12", "-q"],
+    );
 
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
@@ -171,15 +160,10 @@ fn aes_archive_structural_check() {
     make_corpus(&src);
     let archive = tmp.path().join("out.zip");
 
-    run_tzip(&[
-        archive.to_str().unwrap(),
-        src.to_str().unwrap(),
-        "-m",
-        "deflate",
-        "-p",
-        "hunter2",
-        "-q",
-    ]);
+    run_tzip(
+        tmp.path(),
+        &["out.zip", "corpus", "-m", "deflate", "-p", "hunter2", "-q"],
+    );
 
     // Structural: parse with the `zip` crate. It can enumerate encrypted
     // entries even without a password (extraction would fail).
@@ -207,14 +191,12 @@ fn roundtrip_via_7z(method: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("corpus");
     make_corpus(&src);
-    let archive = tmp.path().join(format!("out-{}.zip", method));
-    run_tzip(&[
-        archive.to_str().unwrap(),
-        src.to_str().unwrap(),
-        "-m",
-        method,
-        "-q",
-    ]);
+    let archive_name = format!("out-{}.zip", method);
+    let archive = tmp.path().join(&archive_name);
+    run_tzip(
+        tmp.path(),
+        &[&archive_name, "corpus", "-m", method, "-q"],
+    );
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
     if !extract_with_7z(&archive, &out, None) {
@@ -250,7 +232,7 @@ fn roundtrip_seven_zip_solid() {
     let src = tmp.path().join("corpus");
     make_corpus(&src);
     let archive = tmp.path().join("out.7z");
-    run_tzip(&[archive.to_str().unwrap(), src.to_str().unwrap(), "--solid", "-x", "6", "-q"]);
+    run_tzip(tmp.path(), &["out.7z", "corpus", "--solid", "-x", "6", "-q"]);
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
     if !extract_with_7z(&archive, &out, None) {
@@ -266,16 +248,10 @@ fn roundtrip_seven_zip_solid_aes() {
     let src = tmp.path().join("corpus");
     make_corpus(&src);
     let archive = tmp.path().join("out.7z");
-    run_tzip(&[
-        archive.to_str().unwrap(),
-        src.to_str().unwrap(),
-        "--solid",
-        "-x",
-        "6",
-        "-p",
-        "hunter2",
-        "-q",
-    ]);
+    run_tzip(
+        tmp.path(),
+        &["out.7z", "corpus", "--solid", "-x", "6", "-p", "hunter2", "-q"],
+    );
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
     if !extract_with_7z(&archive, &out, Some("hunter2")) {
@@ -292,8 +268,8 @@ fn sort_flag_is_deterministic() {
     make_corpus(&src);
     let a = tmp.path().join("a.zip");
     let b = tmp.path().join("b.zip");
-    run_tzip(&[a.to_str().unwrap(), src.to_str().unwrap(), "--sort", "-m", "store", "-q"]);
-    run_tzip(&[b.to_str().unwrap(), src.to_str().unwrap(), "--sort", "-m", "store", "-q"]);
+    run_tzip(tmp.path(), &["a.zip", "corpus", "--sort", "-m", "store", "-q"]);
+    run_tzip(tmp.path(), &["b.zip", "corpus", "--sort", "-m", "store", "-q"]);
     // With --sort and STORE (no random salt), archives should be
     // byte-identical modulo timestamps. Since mtimes are the same on the
     // source files, they match.

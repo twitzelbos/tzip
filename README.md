@@ -555,7 +555,8 @@ through the same runtime CPU-feature dispatch as macOS (AES-NI + SSE4.2 on
 x86_64, ARMv8 crypto on aarch64). The `posix_fadvise` /
 `FALLOC_FL_KEEP_SIZE` hints in `platform.rs` are the Linux analogs of the
 macOS `F_NOCACHE` / `F_PREALLOCATE` calls. On top of that Linux gets two
-I/O fast paths.
+I/O fast paths. For picking a filesystem for an external USB drive, see
+[`docs/USB_FILESYSTEMS.md`](docs/USB_FILESYSTEMS.md).
 
 ### `--raw-block` — FIEMAP extent-order reader (`linux_raw.rs`)
 

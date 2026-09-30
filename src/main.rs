@@ -24,8 +24,17 @@ mod usb_info;
 #[cfg(target_os = "macos")]
 mod contention;
 
-#[cfg(all(feature = "raw-apfs", target_os = "macos"))]
+#[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
 mod raw_apfs;
+
+#[cfg(target_os = "linux")]
+mod fiemap;
+
+#[cfg(target_os = "linux")]
+mod linux_raw;
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+mod io_uring_src;
 
 fn main() -> Result<()> {
     // Parse via ArgMatches so we can inspect which flags came from the

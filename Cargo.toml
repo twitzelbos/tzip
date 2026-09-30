@@ -12,6 +12,11 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Enable the io_uring-backed file-body reader on Linux (`--io-uring`).
+# Async submission-queue reads at high queue depth let a single reader
+# thread saturate NVMe. Pairs with the FIEMAP extent-order reader
+# (`--raw-block`): files are submitted in physical-disk order. Kernel ≥ 5.6.
+io-uring = ["dep:io-uring"]
 # Enable the raw-APFS-block reader (`--raw-block`, macOS-only source that
 # reads files directly from `/dev/rdiskN` by parsing APFS on-disk format).
 # Bypasses the VFS layer and any AV that hooks it. Adds the vendored
@@ -70,6 +75,10 @@ rpassword = "7"
 byteorder = "1.5"
 libc = "0.2"
 parking_lot = "0.12"
+
+# Linux io_uring reader (optional, behind the `io-uring` feature).
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -172,7 +172,7 @@ fn archive_name(base_name: &str, rel: &Path) -> String {
     }
 }
 
-fn is_excluded(name: &str, globs: &[String]) -> bool {
+pub(crate) fn is_excluded(name: &str, globs: &[String]) -> bool {
     // Simple glob: only `*` supported for now. Full glob crate can slot in later.
     globs.iter().any(|g| glob_match(g, name))
 }
@@ -212,7 +212,7 @@ fn dos_time_from_meta(meta: &std::fs::Metadata) -> (u16, u16) {
     unix_to_dos(mtime)
 }
 
-fn unix_to_dos(unix: i64) -> (u16, u16) {
+pub(crate) fn unix_to_dos(unix: i64) -> (u16, u16) {
     // Convert Unix time to DOS (localtime not required for correctness; use UTC).
     // MS-DOS epoch is 1980-01-01. If we're before that, clamp.
     // Days since 1970-01-01

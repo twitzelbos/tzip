@@ -11,16 +11,24 @@ pub struct UserSetFlags {
     pub read_jobs: bool,
     pub dispatch_io: bool,
     pub raw_block: bool,
+    #[allow(dead_code)]
+    pub io_uring: bool,
 }
 
 impl UserSetFlags {
     pub fn from_matches(m: &ArgMatches) -> Self {
-        let is_cli = |name: &str| m.value_source(name) == Some(ValueSource::CommandLine);
+        // `value_source` panics on an unknown id, and the `raw_block` /
+        // `io_uring` args are only defined under certain cfgs, so guard each
+        // by whether clap actually knows the id on this build.
+        let known = |name: &str| m.try_contains_id(name).unwrap_or(false);
+        let is_cli =
+            |name: &str| known(name) && m.value_source(name) == Some(ValueSource::CommandLine);
         Self {
             keep_cache: is_cli("keep_cache"),
             read_jobs: is_cli("read_jobs"),
             dispatch_io: is_cli("dispatch_io"),
             raw_block: is_cli("raw_block"),
+            io_uring: is_cli("io_uring"),
         }
     }
 }
@@ -46,8 +54,10 @@ pub struct Args {
     /// Output archive path (.zip)
     pub archive: PathBuf,
 
-    /// One or more input files or directories
-    #[arg(required = true)]
+    /// One or more input files or directories. With `--apfs-device`, these are
+    /// interpreted as absolute in-volume paths (e.g. `/Users/me/data`); omit
+    /// them to archive the whole volume.
+    #[arg(required = false)]
     pub paths: Vec<PathBuf>,
 
     /// Compression method
@@ -103,15 +113,19 @@ pub struct Args {
     #[arg(long)]
     pub usb_info: bool,
 
-    /// EXPERIMENTAL: read files by parsing APFS directly off `/dev/rdiskN`
-    /// instead of the mounted filesystem. Bypasses the VFS + on-access AV
-    /// hooks. Requires root or membership in the `operator` group and the
-    /// `raw-apfs` Cargo feature. macOS only.
-    /// Read files by parsing APFS on-disk format directly from
-    /// `/dev/rdiskN` (bypasses the VFS + on-access AV hooks). Auto-
-    /// enabled when running as root on an APFS-on-USB source. Pass
-    /// `--raw-block=false` to force the default VFS path.
-    #[cfg(all(feature = "raw-apfs", target_os = "macos"))]
+    /// Read files in physical-disk order for a forward sweep instead of a
+    /// seek storm.
+    ///
+    /// On macOS (with the `raw-apfs` feature) this parses APFS directly off
+    /// `/dev/rdiskN`, bypassing the VFS + on-access AV hooks. On Linux it uses
+    /// the `FS_IOC_FIEMAP` ioctl to sort files by their physical block offset
+    /// and read them in disk order through the VFS (ext4/xfs/btrfs/f2fs). The
+    /// big win is on spinning / USB media; roughly neutral on NVMe. Pass
+    /// `--raw-block=false` to force the default reader.
+    #[cfg(any(
+        all(feature = "raw-apfs", target_os = "macos"),
+        target_os = "linux"
+    ))]
     #[arg(
         long,
         action = clap::ArgAction::Set,
@@ -120,6 +134,24 @@ pub struct Args {
         default_value_t = false,
     )]
     pub raw_block: bool,
+
+    /// Archive an APFS volume by parsing it directly off a raw device
+    /// (`--apfs-device /dev/sda1`), with no mount and no APFS driver needed.
+    /// Positional paths become in-volume paths; omit them for the whole volume.
+    /// Requires the `raw-apfs` Cargo feature and read access to the device
+    /// (run with sudo or grant read on the device node). Not supported for
+    /// FileVault / block-layer-encrypted volumes.
+    #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+    #[arg(long, value_name = "DEVICE")]
+    pub apfs_device: Option<PathBuf>,
+
+    /// EXPERIMENTAL (Linux, `io-uring` feature): read file bodies via io_uring
+    /// with a deep submission queue instead of one blocking `read` per reader
+    /// thread. Lets a single thread keep NVMe busy at high queue depth. Pairs
+    /// with `--raw-block` (files are still submitted in physical-disk order).
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[arg(long)]
+    pub io_uring: bool,
 
     /// Legacy tzip behavior: store archive paths as just the basename
     /// of each CLI root (e.g. `foo/bar/baz` → `baz/…` in the archive).
@@ -195,8 +227,15 @@ pub struct Options {
     pub dispatch_io: bool,
     pub usb_info: bool,
     pub warn_contention: bool,
-    #[cfg(all(feature = "raw-apfs", target_os = "macos"))]
+    #[cfg(any(
+        all(feature = "raw-apfs", target_os = "macos"),
+        target_os = "linux"
+    ))]
     pub raw_block: bool,
+    #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+    pub apfs_device: Option<PathBuf>,
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub io_uring: bool,
     pub basename_only: bool,
     pub user_flags: UserSetFlags,
 }
@@ -232,9 +271,26 @@ impl Args {
                 .map(|s| s.eq_ignore_ascii_case("7z"))
                 .unwrap_or(false);
 
+        // Resolve input paths. With --apfs-device, an empty path list means
+        // "whole volume" (in-volume root `/`); otherwise at least one path is
+        // required.
+        let mut paths = self.paths;
+        #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+        {
+            if self.apfs_device.is_some() && paths.is_empty() {
+                paths.push(PathBuf::from("/"));
+            }
+        }
+        if paths.is_empty() {
+            bail!(
+                "need at least one input path \
+                 (or use --apfs-device to archive a whole APFS volume)"
+            );
+        }
+
         Ok(Options {
             archive: self.archive,
-            paths: self.paths,
+            paths,
             method: self.method,
             level: self.level,
             cpu_jobs,
@@ -253,8 +309,15 @@ impl Args {
             dispatch_io: self.dispatch_io,
             usb_info: self.usb_info,
             warn_contention: self.warn_contention,
-            #[cfg(all(feature = "raw-apfs", target_os = "macos"))]
+            #[cfg(any(
+                all(feature = "raw-apfs", target_os = "macos"),
+                target_os = "linux"
+            ))]
             raw_block: self.raw_block,
+            #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+            apfs_device: self.apfs_device,
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            io_uring: self.io_uring,
             basename_only: self.basename_only,
             user_flags,
         })

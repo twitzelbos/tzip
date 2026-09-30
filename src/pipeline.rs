@@ -28,6 +28,25 @@ use crate::zipwriter::{EncodedEntry, ZipWriter, METHOD_AES};
 /// reader threads can share one instance without cloning per-item state.
 pub trait Source: Send + Sync {
     fn read(&self, item: &WorkItem) -> Result<platform::ReadBuf>;
+
+    /// Read a whole chunk of items, sending each downstream as a `RawItem`.
+    /// The default just loops `read()` in order; sources that benefit from
+    /// reordering (extent-order / raw-APFS bulk readers) override this to sort
+    /// by physical disk offset first. `index` is carried through untouched so
+    /// the writer's ordering is unaffected.
+    fn read_bulk(
+        &self,
+        items: Vec<(u64, WorkItem)>,
+        raw_tx: crossbeam_channel::Sender<RawItem>,
+    ) -> Result<()> {
+        for (index, item) in items {
+            let bytes = self.read(&item)?;
+            if raw_tx.send(RawItem { index, item, bytes }).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct LocalFsSource {
@@ -135,55 +154,120 @@ pub fn run(opts: Options) -> Result<()> {
     // bypasses `bulk_walker`'s VFS syscalls entirely, so the walk stage
     // stops competing with the read stage for macOS Endpoint Security
     // auth hooks. Failure falls back to the normal reader + walker.
-    #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
-    let raw_apfs_source: Option<Arc<crate::raw_apfs::RawApfsSource>> = if opts.raw_block {
-        let first = opts.paths.first().cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+    #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+    let raw_apfs_source: Option<Arc<crate::raw_apfs::RawApfsSource>> = {
         // Pool = reader-thread count so `pool_recv.recv()` is contention-free.
         // Cap at 32 to keep ~50 ms/volume open costs bounded.
         let pool_size = opts.read_jobs.max(4).min(32);
-        match crate::platform::fs_info(&first) {
-            Ok(info) => match crate::raw_apfs::RawApfsSource::open_for_mount(
-                &info.mount_point,
-                pool_size,
-                opts.verbose,
-            ) {
+
+        // Device mode (both OSes): --apfs-device points straight at the raw
+        // block/char device — no mount needed. This is the only way to read an
+        // *unmounted* APFS volume (the common Linux case). A failure here is
+        // fatal: there's no VFS fallback for an unmounted device.
+        if let Some(dev) = opts.apfs_device.clone() {
+            match crate::raw_apfs::RawApfsSource::open_for_device(&dev, pool_size, opts.verbose) {
                 Ok(s) => {
                     if opts.verbose {
                         eprintln!(
-                            "tzip: --raw-block active for {} (pool size {})",
-                            info.mount_point.display(),
+                            "tzip: --apfs-device active for {} (pool size {})",
+                            dev.display(),
                             pool_size
                         );
                     }
                     Some(Arc::new(s))
                 }
                 Err(e) => {
-                    eprintln!("tzip: --raw-block unavailable ({e:#}) — falling back");
+                    return Err(e.context(format!(
+                        "open APFS device {} (raw device is root-only; run with sudo \
+                         or grant read access)",
+                        dev.display()
+                    )));
+                }
+            }
+        } else {
+            // macOS mount mode: resolve the raw device backing a mounted APFS
+            // volume from the first source path. Failure falls back to the
+            // normal VFS reader.
+            #[cfg(target_os = "macos")]
+            {
+                if opts.raw_block {
+                    let first = opts
+                        .paths
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    match crate::platform::fs_info(&first) {
+                        Ok(info) => match crate::raw_apfs::RawApfsSource::open_for_mount(
+                            &info.mount_point,
+                            pool_size,
+                            opts.verbose,
+                        ) {
+                            Ok(s) => {
+                                if opts.verbose {
+                                    eprintln!(
+                                        "tzip: --raw-block active for {} (pool size {})",
+                                        info.mount_point.display(),
+                                        pool_size
+                                    );
+                                }
+                                Some(Arc::new(s))
+                            }
+                            Err(e) => {
+                                eprintln!("tzip: --raw-block unavailable ({e:#}) — falling back");
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("tzip: --raw-block fs_info failed ({e:#}) — falling back");
+                            None
+                        }
+                    }
+                } else {
                     None
                 }
-            },
-            Err(e) => {
-                eprintln!("tzip: --raw-block fs_info failed ({e:#}) — falling back");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
                 None
             }
         }
-    } else {
-        None
     };
 
     // Batch-mode item list. Set only for `--sort` (which needs the full
     // list up front to reorder). Streaming is the default, and the
     // streaming feeder below will use `RawApfsSource::walk_stream` when
     // `--raw-block` is on and skip `bulk_walker` entirely.
+    #[allow(unused_mut)]
     let batch_items: Option<Vec<WorkItem>> = if opts.sort {
-        let items = walker::walk(WalkOpts {
-            roots: &opts.paths,
-            exclude: &opts.exclude,
-            sort: opts.sort,
-            walk_threads: opts.walk_jobs.max(1),
-            basename_only: opts.basename_only,
-        })?;
+        // Raw-APFS mode (esp. an unmounted `--apfs-device`): the VFS walker
+        // can't `stat` in-volume paths, so gather items from the parser's own
+        // walker and sort them here by archive path (matching `walker::walk`).
+        let mut collected: Option<Vec<WorkItem>> = None;
+        #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+        {
+            if let Some(src) = raw_apfs_source.clone() {
+                let (wtx, wrx) = crossbeam_channel::unbounded::<WorkItem>();
+                let roots = opts.paths.clone();
+                let exclude = opts.exclude.clone();
+                let basename_only = opts.basename_only;
+                let h = thread::spawn(move || src.walk_stream(&roots, &exclude, basename_only, wtx));
+                let mut items: Vec<WorkItem> = wrx.iter().collect();
+                h.join()
+                    .map_err(|_| anyhow::anyhow!("apfs walk thread panicked"))??;
+                items.sort_by(|a, b| a.name_in_archive.cmp(&b.name_in_archive));
+                collected = Some(items);
+            }
+        }
+        let items = match collected {
+            Some(v) => v,
+            None => walker::walk(WalkOpts {
+                roots: &opts.paths,
+                exclude: &opts.exclude,
+                sort: opts.sort,
+                walk_threads: opts.walk_jobs.max(1),
+                basename_only: opts.basename_only,
+            })?,
+        };
         if items.is_empty() {
             anyhow::bail!("no files to archive");
         }
@@ -281,10 +365,10 @@ pub fn run(opts: Options) -> Result<()> {
             let walk_jobs = opts.walk_jobs;
             let use_bulk = cfg!(target_os = "macos") && !opts.classic_walk;
             let basename_only = opts.basename_only;
-            #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
+            #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
             let raw_src_for_walk = raw_apfs_source.clone();
             let walker_thread = thread::spawn(move || -> Result<()> {
-                #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
+                #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
                 {
                     if let Some(src) = raw_src_for_walk {
                         return src.walk_stream(&roots, &exclude, basename_only, wtx);
@@ -322,25 +406,75 @@ pub fn run(opts: Options) -> Result<()> {
     };
     drop(feed_tx);
 
-    // 5. Reader pool
+    // 5. Reader pool.
+    //
+    // Source precedence:
+    //   * raw-APFS source — macOS mount `--raw-block`, or `--apfs-device` on
+    //     either OS (reads by parsing APFS off the raw device);
+    //   * Linux FIEMAP extent-order / io_uring source (`--raw-block` /
+    //     `--io-uring`);
+    //   * otherwise the default VFS reader (dispatch_io on macOS if asked).
+
+    // Linux extent-order / io_uring source. Not built when a raw-APFS device
+    // source is already taking over the reads.
+    #[cfg(target_os = "linux")]
+    let want_linux_bulk = {
+        let apfs_active = {
+            #[cfg(feature = "raw-apfs")]
+            {
+                raw_apfs_source.is_some()
+            }
+            #[cfg(not(feature = "raw-apfs"))]
+            {
+                false
+            }
+        };
+        if apfs_active {
+            false
+        } else {
+            #[cfg(feature = "io-uring")]
+            {
+                opts.raw_block || opts.io_uring
+            }
+            #[cfg(not(feature = "io-uring"))]
+            {
+                opts.raw_block
+            }
+        }
+    };
+    // Probe io_uring once: if the kernel/environment doesn't support it, fall
+    // back to blocking reads (still extent-ordered) rather than failing the run.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    let use_io_uring = if opts.io_uring && !crate::io_uring_src::available() {
+        if !opts.quiet {
+            eprintln!(
+                "tzip: io_uring unavailable on this kernel — falling back to blocking reads"
+            );
+        }
+        false
+    } else {
+        opts.io_uring
+    };
+    #[cfg(target_os = "linux")]
+    let linux_raw_source: Option<Arc<crate::linux_raw::LinuxExtentSource>> = if want_linux_bulk {
+        Some(Arc::new(crate::linux_raw::LinuxExtentSource {
+            keep_cache: opts.keep_cache,
+            verbose: opts.verbose,
+            #[cfg(feature = "io-uring")]
+            io_uring: use_io_uring,
+        }))
+    } else {
+        None
+    };
+
+    // --- source selection ---
     #[cfg(target_os = "macos")]
     let source: Arc<dyn Source> = {
-        // --raw-block wins if enabled (feature-gated).
         #[cfg(feature = "raw-apfs")]
         {
             if let Some(src) = raw_apfs_source.clone() {
-                // OID cache was populated by walk_to_items above, so the
-                // reader hot path is pure hashmap lookup + extent read.
                 let s: Arc<dyn Source> = src;
                 s
-            } else if opts.raw_block {
-                // Raw-block was requested but source open failed earlier;
-                // fall through to the default reader.
-                if opts.dispatch_io {
-                    Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
-                } else {
-                    Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
-                }
             } else if opts.dispatch_io {
                 Arc::new(crate::dispatch_io::DispatchIoSource { keep_cache: opts.keep_cache })
             } else {
@@ -356,72 +490,91 @@ pub fn run(opts: Options) -> Result<()> {
             }
         }
     };
-    #[cfg(not(target_os = "macos"))]
-    let source: Arc<dyn Source> = Arc::new(LocalFsSource { keep_cache: opts.keep_cache });
-    // Reader stage. Two shapes:
-    //   * DEFAULT: pool of `opts.read_jobs` threads, each pulling one
-    //     item at a time from feed_rx, calling `source.read(item)`.
-    //   * --raw-block BULK: single "bulk reader" thread that consumes
-    //     the feed as batches, sorts each batch's extents by disk
-    //     offset, and issues coalesced sequential preads. Turns
-    //     ~2 lookups + small random reads per file into
-    //     sequential-throughput I/O.
-    let mut reader_handles = Vec::new();
-    #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
-    let bulk_reader_raw_src = raw_apfs_source.clone();
-    #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
-    let use_bulk = bulk_reader_raw_src.is_some();
-    #[cfg(not(all(target_os = "macos", feature = "raw-apfs")))]
-    let use_bulk = false;
-
-    if use_bulk {
-        #[cfg(all(target_os = "macos", feature = "raw-apfs"))]
+    #[cfg(target_os = "linux")]
+    let source: Arc<dyn Source> = {
+        #[cfg(feature = "raw-apfs")]
         {
-            // Bulk reader: drain the whole feed, split into N contiguous
-            // walker-order chunks, run bulk_read_all in parallel across
-            // N reader threads.
-            //
-            // Now that `scan_all_metadata` runs once up front and
-            // populates inode + extent caches globally, per-file
-            // lookups are pure hashmap hits — no B-tree contention, no
-            // per-thread cache thrash. Parallel bulk now scales linearly
-            // with device I/O concurrency instead of losing to it.
-            let feed_rx = feed_rx.clone();
-            let n = opts.read_jobs.max(1);
-            let src = bulk_reader_raw_src.unwrap();
-            let (chunk_tx, chunk_rx) = bounded::<Vec<(u64, WorkItem)>>(n.max(1));
+            if let Some(src) = raw_apfs_source.clone() {
+                let s: Arc<dyn Source> = src;
+                s
+            } else if let Some(s) = &linux_raw_source {
+                let s: Arc<dyn Source> = s.clone();
+                s
+            } else {
+                Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
+            }
+        }
+        #[cfg(not(feature = "raw-apfs"))]
+        {
+            if let Some(s) = &linux_raw_source {
+                let s: Arc<dyn Source> = s.clone();
+                s
+            } else {
+                Arc::new(LocalFsSource { keep_cache: opts.keep_cache })
+            }
+        }
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+    let source: Arc<dyn Source> = Arc::new(LocalFsSource { keep_cache: opts.keep_cache });
+
+    // --- bulk vs per-item ---
+    // Bulk mode drains the feed, splits it into N contiguous walker-order
+    // chunks, and lets each reader thread reorder its chunk into physical-disk
+    // order via the source's `read_bulk`. Engaged whenever a reordering-capable
+    // source is active (raw-APFS or the Linux extent/io_uring reader).
+    #[allow(unused_mut)]
+    let use_bulk = {
+        let mut b = false;
+        #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+        {
+            b = b || raw_apfs_source.is_some();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            b = b || linux_raw_source.is_some();
+        }
+        b
+    };
+
+    let mut reader_handles = Vec::new();
+    if use_bulk {
+        // One splitter thread drains the feed into N contiguous chunks; N
+        // reader threads each reorder + read their chunk. --read-jobs 1 gives
+        // a single forward sweep (spinning / USB); higher overlaps sweeps.
+        let feed_rx = feed_rx.clone();
+        let n = opts.read_jobs.max(1);
+        let (chunk_tx, chunk_rx) = bounded::<Vec<(u64, WorkItem)>>(n.max(1));
+        reader_handles.push(thread::spawn(move || -> Result<()> {
+            let mut items: Vec<(u64, WorkItem)> = Vec::new();
+            while let Ok((index, item)) = feed_rx.recv() {
+                items.push((index, item));
+            }
+            let total = items.len();
+            let per = (total + n - 1) / n;
+            for i in 0..n {
+                let start = i * per;
+                if start >= total {
+                    break;
+                }
+                let end = ((i + 1) * per).min(total);
+                let chunk: Vec<(u64, WorkItem)> = items[start..end].to_vec();
+                if chunk_tx.send(chunk).is_err() {
+                    break;
+                }
+            }
+            drop(chunk_tx);
+            Ok(())
+        }));
+        for _ in 0..n {
+            let chunk_rx = chunk_rx.clone();
+            let raw_tx = raw_tx.clone();
+            let source = Arc::clone(&source);
             reader_handles.push(thread::spawn(move || -> Result<()> {
-                let mut items: Vec<(u64, WorkItem)> = Vec::new();
-                while let Ok((index, item)) = feed_rx.recv() {
-                    items.push((index, item));
+                while let Ok(chunk) = chunk_rx.recv() {
+                    source.read_bulk(chunk, raw_tx.clone())?;
                 }
-                let total = items.len();
-                let per = (total + n - 1) / n;
-                for i in 0..n {
-                    let start = i * per;
-                    if start >= total {
-                        break;
-                    }
-                    let end = ((i + 1) * per).min(total);
-                    let chunk: Vec<(u64, WorkItem)> = items[start..end].to_vec();
-                    if chunk_tx.send(chunk).is_err() {
-                        break;
-                    }
-                }
-                drop(chunk_tx);
                 Ok(())
             }));
-            for _ in 0..n {
-                let chunk_rx = chunk_rx.clone();
-                let raw_tx = raw_tx.clone();
-                let src = Arc::clone(&src);
-                reader_handles.push(thread::spawn(move || -> Result<()> {
-                    while let Ok(chunk) = chunk_rx.recv() {
-                        src.bulk_read_all(chunk, raw_tx.clone())?;
-                    }
-                    Ok(())
-                }));
-            }
         }
     } else {
         for _ in 0..opts.read_jobs {
@@ -596,7 +749,61 @@ fn choose_writer_capacity(info: Option<&platform::FsInfo>) -> usize {
 ///   * source or output on NTFS-on-macOS → keep_cache=true. Apple's stock
 ///     NTFS driver is heavily page-cache-oriented; F_NOCACHE hurts reads.
 fn auto_tune(mut opts: Options) -> Options {
-    #[cfg(not(target_os = "macos"))]
+    // --apfs-device drives its own reader; the FIEMAP auto-tune below (which
+    // stats real filesystem paths) doesn't apply to in-volume paths.
+    #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+    {
+        if opts.apfs_device.is_some() {
+            return opts;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use crate::linux_raw::{device_traits, LinuxExtentSource};
+
+        let first = opts
+            .paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        let mut changes: Vec<String> = Vec::new();
+
+        // Engage the extent-order reader automatically when the source lives
+        // on seeking or removable media (rotational disk or USB stick) and the
+        // filesystem actually supports FIEMAP. On NVMe the reorder is neutral,
+        // so we leave it opt-in there to avoid surprising anyone.
+        if !opts.user_flags.raw_block && !opts.raw_block {
+            let (rotational, removable) = device_traits(&first);
+            let seeky = rotational == Some(true) || removable == Some(true);
+            if seeky && LinuxExtentSource::fiemap_supported(&first) {
+                opts.raw_block = true;
+                let why = if rotational == Some(true) {
+                    "rotational"
+                } else {
+                    "removable"
+                };
+                changes.push(format!("raw_block=on ({why} media)"));
+                // One forward sweep beats several competing ones on seeking
+                // media — mirror the external-drive default.
+                if !opts.user_flags.read_jobs && opts.read_jobs > 1 {
+                    opts.read_jobs = 1;
+                    changes.push("read_jobs=1".into());
+                }
+            }
+        }
+
+        if !changes.is_empty() && !opts.quiet {
+            eprintln!(
+                "tzip: auto-tuned defaults for Linux source ({}). Override with the same flag.",
+                changes.join(", ")
+            );
+        }
+        return opts;
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
     {
         return opts;
     }

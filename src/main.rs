@@ -9,7 +9,9 @@ mod platform;
 mod progress;
 mod sevenz;
 mod tui;
+mod update;
 mod walker;
+mod zipreader;
 mod zipwriter;
 
 #[cfg(target_os = "macos")]

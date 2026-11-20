@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-progress runs for the same PR when a new commit lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The roundtrip tests shell out to `7z` to verify bzip2 / lzma / xz /
+      # zstd / .7z extraction. They skip gracefully if it isn't installed,
+      # but we want to actually exercise those paths in CI.
+      - name: Install p7zip (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+      - name: Install p7zip (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install p7zip
+
+      - name: cargo check (default features)
+        run: cargo check --verbose --all-targets
+
+      - name: cargo check (raw-apfs)
+        run: cargo check --verbose --features raw-apfs --all-targets
+
+      - name: cargo check (raw-apfs + io-uring, Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check --verbose --features raw-apfs,io-uring --all-targets
+
+      - name: cargo test
+        run: cargo test --verbose

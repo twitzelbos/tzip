@@ -31,6 +31,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [AES-256 encryption](#aes-256-encryption)
 - [`.7z` solid archives](#7z-solid-archives)
 - [Update mode](#update-mode)
+- [Reading archives](#reading-archives)
 - [TUI mode](#tui-mode)
 - [Performance](#performance)
 - [External-drive tuning](#external-drive-tuning)
@@ -89,49 +90,69 @@ it's always compiled in on Linux.
 
 ## Quick start
 
+tzip 0.2 uses subcommands (`create`, `u`, `ls`, `cat`, `x`). This is a
+breaking change from 0.1; the old flat `tzip <archive> <paths>...` form
+is gone.
+
 ```
 # Create a plain .zip archive
-tzip out.zip path/to/source_tree
+tzip create out.zip path/to/source_tree
 
 # With max DEFLATE and AES-256
-tzip out.zip src/ -m deflate -x 12 -p 'hunter2'
+tzip create out.zip src/ -m deflate -x 12 -p 'hunter2'
 
-# Read the password from a file
-tzip out.zip src/ --password-file ~/.archive.pw
-
-# Zstd for high ratio + speed (recipient needs a zstd-aware unzipper)
-tzip out.zip src/ -m zstd -x 19
+# Zstd for high ratio + speed
+tzip create out.zip src/ -m zstd -x 19
 
 # .7z solid LZMA2 with header encryption
-tzip out.7z src/ --solid -p 'hunter2'
-
-# Bigger files → auto-triggers parallel-block DEFLATE
-tzip out.zip huge_log_file.txt
+tzip create out.7z src/ --solid -p 'hunter2'
 
 # Deterministic byte-identical builds
-tzip out.zip src/ --sort
+tzip create out.zip src/ --sort
 
 # Add a file to an existing archive without re-compressing anything else
-tzip -u out.zip extra_file.txt
+tzip u out.zip extra_file.txt
 
 # Remove entries by glob (triggers a byte-copy rebuild, atomic rename)
-tzip -u --delete '*.log' out.zip
+tzip u --delete '*.log' out.zip
+
+# Reading side: list, stream one file, extract
+tzip ls out.zip
+tzip cat out.zip src/main.rs > main.rs
+tzip x out.zip --to ./extracted
+tzip cat out.zip secret.txt -p 'hunter2'
 ```
 
 ---
 
 ## CLI reference
 
+tzip 0.2 uses subcommands:
+
 ```
-tzip [OPTIONS] <ARCHIVE> <PATHS>...
+tzip create <ARCHIVE> <PATHS>...   # create a new archive
+tzip u      <ARCHIVE> [PATHS]...   # update: add / replace / delete entries
+tzip ls     <ARCHIVE>              # list entries
+tzip cat    <ARCHIVE> <NAME>       # stream one entry to stdout
+tzip x      <ARCHIVE> [NAMES]...   # extract (whole archive or selected names)
 ```
 
-**Positional**
+Aliases: `a` for `create`, `l` for `ls`, `extract` for `x`.
+
+The flags below are for `create` unless the row says otherwise. `u`
+takes the same subset relevant to its work (jobs, read-jobs, walk-jobs,
+method/level for new entries, password, sort, exclude, quiet, verbose,
+keep-cache, basename-only) plus `--delete GLOB` and `--atomic`.
+The reader subcommands (`ls`, `cat`, `x`) take only password-related
+flags (`-p`, `--password-file`), `-q`, `-v`, plus `cat`'s `<NAME>`
+positional and `x`'s optional `[NAMES]...` + `--to DIR`.
+
+**Positional (create / u)**
 
 | arg | meaning |
 |---|---|
-| `<ARCHIVE>` | Output archive path. `.7z` extension auto-enables `--solid`. |
-| `<PATHS>...` | One or more files or directories to archive. |
+| `<ARCHIVE>` | Archive path. `.7z` extension auto-enables `--solid` for `create`. |
+| `<PATHS>...` | Files or directories to archive. For `u`, may be empty when `--delete` is given. |
 
 **Compression & encryption**
 
@@ -175,13 +196,14 @@ tzip [OPTIONS] <ARCHIVE> <PATHS>...
 | `--sort` | off | Deterministic order — same inputs produce byte-identical archives (STORE mode; AES randomizes salt so byte-identical AES output requires additional work) |
 | `--exclude <GLOB>` | none | Repeatable simple glob (`*` `?`) matched against the archive path |
 
-**Update mode (ZIP only)**
+**Update subcommand (ZIP only; `tzip u`)**
 
 | flag | default | meaning |
 |---|---|---|
-| `-u, --update` | off | Modify an existing archive: add new files, replace entries whose archive name matches an input, remove entries matched by `--delete`. If the archive doesn't exist, falls back to create mode. Kept entries are passed through byte-for-byte — no re-compression, no re-decryption of AES-256 bodies. See [Update mode](#update-mode). |
-| `--delete <GLOB>` | | Repeatable. Delete archive entries matching this glob. Only valid with `--update`. |
+| `--delete <GLOB>` | | Repeatable. Delete archive entries matching this glob. |
 | `--atomic` | off | Force rebuild-to-temp + atomic rename. Without it, pure-add updates are applied in place via truncate-append + an on-disk undo file. |
+
+See [Update mode](#update-mode) for the two-mode design (append vs rebuild) and the crash-recovery story.
 
 **Progress**
 
@@ -342,6 +364,38 @@ Rebuild mode is inherently atomic — the temp file either lands via
   error).
 - Case-sensitive name collision detection. Two entries differing only in
   case will both exist.
+
+## Reading archives
+
+Three read subcommands land in 0.2, with the long-range plan of
+extending them to remote sources (HTTP Range, S3) and to a mount point
+in later releases. Today they work on local `.zip` files.
+
+```
+# List entries. `*` marks AES-encrypted entries.
+tzip ls out.zip
+
+# Stream one entry to stdout. Works with any method tzip can write
+# (store / deflate / bzip2 / lzma / xz / zstd), plus AES-256 AE-2.
+tzip cat out.zip src/main.rs > main.rs
+tzip cat out.zip secret.txt -p 'hunter2'
+
+# Extract. Default destination is the current directory.
+tzip x out.zip --to ./extracted
+tzip x out.zip a.txt nested/c.txt --to ./extracted     # selected entries only
+tzip x aes.zip --to ./extracted -p 'hunter2'
+```
+
+Extraction rejects *zip-slip* entries (any archive entry whose name
+contains `..`, is absolute, or looks like a Windows drive/UNC path)
+before touching the filesystem. Partial writes on error are deleted.
+
+Wrong password on a `cat` fails *before* any plaintext hits stdout —
+the AES-256 verifier mismatch is checked before the CTR stream starts.
+Corrupted/tampered ciphertext passes through the stream (CTR is
+malleable at the byte level) and fails at the end with
+`AES-256 HMAC mismatch — archive is tampered or corrupted`; downstream
+should treat whatever bytes made it to disk/stdout as untrusted.
 
 ## TUI mode
 
@@ -900,16 +954,23 @@ cargo test                    # debug build tests
 cargo test --release          # release build tests (recommended pre-commit)
 ```
 
-The suite in `tests/roundtrip.rs` covers:
+Three integration suites:
 
-- STORE round-trip via `zip` crate extraction
-- DEFLATE at levels 0 and 12
-- BZIP2, LZMA, XZ, Zstd round-trip via system `7z`
-- AES-256 archive structural validation
-- `.7z` solid round-trip (plain + AES)
-- `--sort` byte-identical determinism on STORE archives
+- `tests/roundtrip.rs` — create-and-extract round-trips for STORE,
+  DEFLATE (levels 0 and 12), BZIP2, LZMA, XZ, Zstd (via system `7z`),
+  AES-256 structural check, `.7z` solid (plain + AES), `--sort`
+  byte-identical determinism.
+- `tests/update.rs` — `tzip u` in both append and rebuild modes: add,
+  replace, delete, mixed, AES preservation across kept entries,
+  `--sort`, create-if-missing, `.7z` rejection, stale-undo cleanup,
+  crash recovery from a fabricated truncated archive.
+- `tests/reader.rs` — `tzip ls`, `tzip cat` per compression method
+  (store / deflate / bzip2 / lzma / xz / zstd), AES cat with correct /
+  missing / wrong password, whole-archive and selective `tzip x`,
+  zip-slip rejection, create-then-extract identity.
 
-11 tests total. All pass in ~0.5s.
+43 integration tests total. CI runs them on ubuntu-latest and
+macos-latest (see `.github/workflows/ci.yml`).
 
 ---
 

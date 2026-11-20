@@ -84,8 +84,8 @@ fn update_add_append_mode() {
     fs::write(tmp.path().join("a.txt"), b"hello a\n").unwrap();
     fs::write(tmp.path().join("b.txt"), b"hello b\n").unwrap();
 
-    run_tzip(tmp.path(), &["out.zip", "a.txt", "b.txt", "-q"]);
-    let stderr = run_tzip_capture(tmp.path(), &["-u", "out.zip", "b.txt"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "a.txt", "b.txt", "-q"]);
+    let stderr = run_tzip_capture(tmp.path(), &["u", "out.zip", "b.txt"]);
     // b.txt is already in the archive — would force rebuild. Use a new file.
     assert!(
         !stderr.contains("update mode = append"),
@@ -94,7 +94,7 @@ fn update_add_append_mode() {
     );
 
     fs::write(tmp.path().join("c.txt"), b"hello c\n").unwrap();
-    let stderr = run_tzip_capture(tmp.path(), &["-u", "out.zip", "c.txt"]);
+    let stderr = run_tzip_capture(tmp.path(), &["u", "out.zip", "c.txt"]);
     assert!(
         stderr.contains("update mode = append"),
         "pure add should use append mode; stderr={}",
@@ -118,10 +118,10 @@ fn update_add_append_mode() {
 fn update_add_rebuild_mode_explicit_atomic() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("a.txt"), b"hello a\n").unwrap();
-    run_tzip(tmp.path(), &["out.zip", "a.txt", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "a.txt", "-q"]);
 
     fs::write(tmp.path().join("b.txt"), b"hello b\n").unwrap();
-    let stderr = run_tzip_capture(tmp.path(), &["-u", "--atomic", "out.zip", "b.txt"]);
+    let stderr = run_tzip_capture(tmp.path(), &["u", "--atomic", "out.zip", "b.txt"]);
     assert!(
         stderr.contains("update mode = rebuild"),
         "--atomic should force rebuild; stderr={}",
@@ -146,10 +146,10 @@ fn update_add_rebuild_mode_explicit_atomic() {
 fn update_replace_forces_rebuild() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("a.txt"), b"version 1\n").unwrap();
-    run_tzip(tmp.path(), &["out.zip", "a.txt", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "a.txt", "-q"]);
 
     fs::write(tmp.path().join("a.txt"), b"version 2 is longer\n").unwrap();
-    let stderr = run_tzip_capture(tmp.path(), &["-u", "out.zip", "a.txt"]);
+    let stderr = run_tzip_capture(tmp.path(), &["u", "out.zip", "a.txt"]);
     assert!(stderr.contains("update mode = rebuild"));
 
     assert_eq!(
@@ -164,9 +164,9 @@ fn update_delete_forces_rebuild() {
     fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
     fs::write(tmp.path().join("b.txt"), b"b\n").unwrap();
     fs::write(tmp.path().join("c.txt"), b"c\n").unwrap();
-    run_tzip(tmp.path(), &["out.zip", "a.txt", "b.txt", "c.txt", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "a.txt", "b.txt", "c.txt", "-q"]);
 
-    let stderr = run_tzip_capture(tmp.path(), &["-u", "--delete", "b.txt", "out.zip"]);
+    let stderr = run_tzip_capture(tmp.path(), &["u", "--delete", "b.txt", "out.zip"]);
     assert!(stderr.contains("update mode = rebuild"));
 
     let names = entry_names(&tmp.path().join("out.zip"));
@@ -181,12 +181,12 @@ fn update_mixed_delete_and_add() {
     for n in ["a.txt", "b.txt", "c.txt"] {
         fs::write(tmp.path().join(n), format!("{}\n", n).as_bytes()).unwrap();
     }
-    run_tzip(tmp.path(), &["out.zip", "a.txt", "b.txt", "c.txt", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "a.txt", "b.txt", "c.txt", "-q"]);
 
     fs::write(tmp.path().join("d.txt"), b"d\n").unwrap();
     run_tzip(
         tmp.path(),
-        &["-u", "--delete", "b.txt", "out.zip", "d.txt"],
+        &["u", "--delete", "b.txt", "out.zip", "d.txt"],
     );
 
     let mut names = entry_names(&tmp.path().join("out.zip"));
@@ -203,9 +203,9 @@ fn update_delete_only_is_valid() {
     for n in ["a.txt", "b.txt"] {
         fs::write(tmp.path().join(n), format!("{}\n", n).as_bytes()).unwrap();
     }
-    run_tzip(tmp.path(), &["out.zip", "a.txt", "b.txt", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "a.txt", "b.txt", "-q"]);
 
-    run_tzip(tmp.path(), &["-u", "--delete", "b.txt", "out.zip"]);
+    run_tzip(tmp.path(), &["u", "--delete", "b.txt", "out.zip"]);
 
     let names = entry_names(&tmp.path().join("out.zip"));
     assert_eq!(names, vec!["a.txt".to_string()]);
@@ -219,7 +219,7 @@ fn update_preserves_aes_on_kept_entries() {
     fs::write(tmp.path().join("a.txt"), b"secret a\n").unwrap();
     run_tzip(
         tmp.path(),
-        &["out.zip", "a.txt", "-p", "hunter2", "-q"],
+        &["create", "out.zip", "a.txt", "-p", "hunter2", "-q"],
     );
 
     // Snapshot the AES body of 'a' BEFORE the update.
@@ -228,7 +228,7 @@ fn update_preserves_aes_on_kept_entries() {
     fs::write(tmp.path().join("b.txt"), b"secret b\n").unwrap();
     run_tzip(
         tmp.path(),
-        &["-u", "out.zip", "b.txt", "-p", "hunter2"],
+        &["u", "out.zip", "b.txt", "-p", "hunter2"],
     );
 
     // Append mode truncates at `before`'s cd_offset and appends new LFHs.
@@ -253,12 +253,12 @@ fn update_preserves_aes_on_kept_entries() {
 fn update_mixes_plain_and_aes() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("plain.txt"), b"plain content\n").unwrap();
-    run_tzip(tmp.path(), &["out.zip", "plain.txt", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "plain.txt", "-q"]);
 
     fs::write(tmp.path().join("secret.txt"), b"secret content\n").unwrap();
     run_tzip(
         tmp.path(),
-        &["-u", "out.zip", "secret.txt", "-p", "pw"],
+        &["u", "out.zip", "secret.txt", "-p", "pw"],
     );
 
     // Verify via 7z (`zip` crate can enumerate both). Just check names.
@@ -274,10 +274,10 @@ fn update_sort_produces_sorted_cdr() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("b.txt"), b"b\n").unwrap();
     fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
-    run_tzip(tmp.path(), &["out.zip", "b.txt", "a.txt", "--sort", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "b.txt", "a.txt", "--sort", "-q"]);
 
     fs::write(tmp.path().join("c.txt"), b"c\n").unwrap();
-    run_tzip(tmp.path(), &["-u", "--sort", "out.zip", "c.txt"]);
+    run_tzip(tmp.path(), &["u", "--sort", "out.zip", "c.txt"]);
 
     let names = entry_names(&tmp.path().join("out.zip"));
     assert_eq!(
@@ -290,7 +290,7 @@ fn update_sort_produces_sorted_cdr() {
 fn update_creates_if_archive_missing() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
-    run_tzip(tmp.path(), &["-u", "fresh.zip", "a.txt", "-q"]);
+    run_tzip(tmp.path(), &["u", "fresh.zip", "a.txt", "-q"]);
     assert!(tmp.path().join("fresh.zip").exists());
     let names = entry_names(&tmp.path().join("fresh.zip"));
     assert_eq!(names, vec!["a.txt".to_string()]);
@@ -300,7 +300,7 @@ fn update_creates_if_archive_missing() {
 fn update_rejects_7z() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
-    let stderr = run_tzip_expect_failure(tmp.path(), &["-u", "out.7z", "a.txt"]);
+    let stderr = run_tzip_expect_failure(tmp.path(), &["u", "out.7z", "a.txt"]);
     assert!(
         stderr.to_lowercase().contains(".7z"),
         "expected a .7z error, got: {}",
@@ -312,8 +312,8 @@ fn update_rejects_7z() {
 fn update_rejects_empty_op() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
-    run_tzip(tmp.path(), &["out.zip", "a.txt", "-q"]);
-    let stderr = run_tzip_expect_failure(tmp.path(), &["-u", "out.zip"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "a.txt", "-q"]);
+    let stderr = run_tzip_expect_failure(tmp.path(), &["u", "out.zip"]);
     assert!(
         stderr.to_lowercase().contains("delete") || stderr.to_lowercase().contains("input"),
         "expected a validation error, got: {}",
@@ -330,14 +330,14 @@ fn update_removes_stale_undo_file() {
     // -u invocation should silently delete it before doing its work.
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
-    run_tzip(tmp.path(), &["out.zip", "a.txt", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "a.txt", "-q"]);
 
     let archive = tmp.path().join("out.zip");
     let undo = tmp.path().join("out.zip.tzip-undo");
     write_fake_undo_matching_archive(&archive, &undo);
 
     fs::write(tmp.path().join("b.txt"), b"b\n").unwrap();
-    run_tzip(tmp.path(), &["-u", "out.zip", "b.txt"]);
+    run_tzip(tmp.path(), &["u", "out.zip", "b.txt"]);
 
     assert!(!undo.exists(), "stale undo should have been removed");
     let names = entry_names(&archive);
@@ -353,7 +353,7 @@ fn update_recovers_from_crashed_append() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
     fs::write(tmp.path().join("b.txt"), b"b\n").unwrap();
-    run_tzip(tmp.path(), &["out.zip", "a.txt", "b.txt", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "a.txt", "b.txt", "-q"]);
 
     let archive = tmp.path().join("out.zip");
     let undo = tmp.path().join("out.zip.tzip-undo");
@@ -378,7 +378,7 @@ fn update_recovers_from_crashed_append() {
 
     // 4. Run tzip -u. It should restore, then append our new entry.
     fs::write(tmp.path().join("c.txt"), b"c\n").unwrap();
-    let stderr = run_tzip_capture(tmp.path(), &["-u", "out.zip", "c.txt"]);
+    let stderr = run_tzip_capture(tmp.path(), &["u", "out.zip", "c.txt"]);
     assert!(
         stderr.to_lowercase().contains("recovered"),
         "expected recovery message, got: {}",

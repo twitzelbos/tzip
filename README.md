@@ -30,6 +30,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Compression methods](#compression-methods)
 - [AES-256 encryption](#aes-256-encryption)
 - [`.7z` solid archives](#7z-solid-archives)
+- [Update mode](#update-mode)
 - [TUI mode](#tui-mode)
 - [Performance](#performance)
 - [External-drive tuning](#external-drive-tuning)
@@ -109,6 +110,12 @@ tzip out.zip huge_log_file.txt
 
 # Deterministic byte-identical builds
 tzip out.zip src/ --sort
+
+# Add a file to an existing archive without re-compressing anything else
+tzip -u out.zip extra_file.txt
+
+# Remove entries by glob (triggers a byte-copy rebuild, atomic rename)
+tzip -u --delete '*.log' out.zip
 ```
 
 ---
@@ -167,6 +174,14 @@ tzip [OPTIONS] <ARCHIVE> <PATHS>...
 |---|---|---|
 | `--sort` | off | Deterministic order — same inputs produce byte-identical archives (STORE mode; AES randomizes salt so byte-identical AES output requires additional work) |
 | `--exclude <GLOB>` | none | Repeatable simple glob (`*` `?`) matched against the archive path |
+
+**Update mode (ZIP only)**
+
+| flag | default | meaning |
+|---|---|---|
+| `-u, --update` | off | Modify an existing archive: add new files, replace entries whose archive name matches an input, remove entries matched by `--delete`. If the archive doesn't exist, falls back to create mode. Kept entries are passed through byte-for-byte — no re-compression, no re-decryption of AES-256 bodies. See [Update mode](#update-mode). |
+| `--delete <GLOB>` | | Repeatable. Delete archive entries matching this glob. Only valid with `--update`. |
+| `--atomic` | off | Force rebuild-to-temp + atomic rename. Without it, pure-add updates are applied in place via truncate-append + an on-disk undo file. |
 
 **Progress**
 
@@ -249,6 +264,84 @@ Workarounds if speed matters more than ratio on `.7z`:
 - Shell out to system `p7zip` with `7z a -mmt=on -m0=lzma2`
 
 ---
+
+## Update mode
+
+`-u` / `--update` modifies an existing `.zip` in place without re-reading or
+re-compressing the entries that are being kept. It's the analog of
+`7z u archive.zip files...`. ZIP only — `.7z` solid archives can't be
+edited in place and tzip rejects `-u` on them up front.
+
+```
+# Add c.txt to an existing archive
+tzip -u out.zip c.txt
+
+# Replace an entry by providing a matching input
+tzip -u out.zip a.txt             # if a.txt is already in the archive, it is replaced
+
+# Remove entries by glob
+tzip -u --delete '*.log' out.zip
+
+# Mixed: delete some, add some
+tzip -u --delete b.txt out.zip d.txt
+
+# Force the safer path (see below) even for pure adds
+tzip -u --atomic out.zip c.txt
+```
+
+### Two paths, chosen automatically
+
+tzip picks between two paths for every update, based on what the operation
+actually needs to do. `-v` prints the chosen mode (`append` / `rebuild`)
+and a `(add N, replace N, delete N, keep N)` breakdown.
+
+| path | when | what happens |
+|---|---|---|
+| **append** | pure add with no name collisions, no `--delete`, no `--sort`, no `--atomic` | The old central directory is truncated off the end of the archive. New LFHs + bodies are written starting at the old CDR's offset. A fresh CDR covering (old entries + new entries) is written at the end. **Zero bytes of existing data are rewritten.** |
+| **rebuild** | `--delete`, replace, `--sort`, or `--atomic` | Write the full new archive to `<archive>.tzip-tmp-<pid>`; kept entries are byte-copied LFH + body (no decrypt, no decompress); new entries flow through the normal parallel pipeline; `sync_all`; atomic `rename()` over the original. |
+
+Both paths skip re-compression and re-encryption of kept entries. The
+difference is append-mode avoids rewriting the kept bytes at all.
+
+### Crash safety
+
+Append mode writes `<archive>.tzip-undo` before touching the archive. The
+undo file holds the original central-directory + EOCD bytes and a header
+recording the archive's original size. On success the undo file is
+deleted; on crash, the next `tzip -u` invocation detects the undo file,
+compares the archive's size to the recorded "original" size, and either:
+
+- silently removes the undo (archive is intact; a successful prior run
+  failed to clean up), or
+- truncates the archive back to the pre-append offset, writes the saved
+  CDR + EOCD bytes, syncs, and prints `tzip: recovered ... from
+  interrupted update` before proceeding.
+
+Rebuild mode is inherently atomic — the temp file either lands via
+`rename()` or is removed on error; the original archive is never modified.
+
+### What is preserved
+
+- WinZIP AES-256 envelopes on kept entries: salt, PBKDF2-derived verifier,
+  ciphertext, and HMAC tag are copied byte-for-byte. No password is
+  required to update an AES archive when only adding or carrying entries.
+- ZIP64 entries (including `lfh_offset ≥ 4 GiB` and files `≥ 4 GiB`).
+- UTF-8 filenames (GP bit 11) and the raw name bytes.
+- LFH extra fields — extended timestamps (`0x5455`), Unix uid/gid
+  (`0x7875`), and any other extras — because the entire LFH is copied
+  verbatim. (Unknown central-directory extras are not preserved; the CDR
+  is reconstructed from parsed fields.)
+
+### Known limits
+
+- `.7z` is rejected; rebuild it from source if you need to change its
+  contents.
+- Concurrent writers are not supported — two `tzip -u` runs on the same
+  archive will race. The undo file's exclusive-create catches the simple
+  overlap case (the second run fails with a clear "undo already exists"
+  error).
+- Case-sensitive name collision detection. Two entries differing only in
+  case will both exist.
 
 ## TUI mode
 

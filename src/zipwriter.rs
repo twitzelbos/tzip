@@ -14,7 +14,9 @@
 
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
-use std::io::{Seek, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+
+use crate::zipreader::ReadEntry;
 
 pub const SIG_LFH: u32 = 0x0403_4b50;
 pub const SIG_CDR: u32 = 0x0201_4b50;
@@ -72,6 +74,76 @@ struct CentralEntry {
 impl<W: Write + Seek> ZipWriter<W> {
     pub fn new(inner: W) -> Self {
         Self { inner, entries: Vec::new(), pos: 0 }
+    }
+
+    /// Fresh writer positioned at `start_pos`. Used by update:
+    /// - rebuild mode: `start_pos = 0` for a fresh temp file.
+    /// - append mode: `start_pos = old cd_offset` after truncating the
+    ///   existing archive; the writer then appends new LFHs + bodies
+    ///   starting where the old CDR used to be.
+    /// The caller is responsible for seeking `inner` to `start_pos` before
+    /// writing. `finish()` will treat `start_pos` + accumulated writes as
+    /// `cd_offset`.
+    pub fn new_at(inner: W, start_pos: u64) -> Self {
+        Self { inner, entries: Vec::new(), pos: start_pos }
+    }
+
+    /// Record a central-directory entry for a body that is already on disk
+    /// at `lfh_offset`. Writes nothing; just pushes the entry so that
+    /// `finish()` emits a CDR record covering it. Used by:
+    /// - append mode: `lfh_offset` is the old entry's original offset;
+    ///   the LFH + body are untouched on disk.
+    /// - `carry_existing_entry`: internally, after writing the LFH+body
+    ///   at `self.pos`, pass the pre-write offset.
+    pub fn record_existing(&mut self, re: &ReadEntry, lfh_offset: u64) {
+        self.entries.push(CentralEntry {
+            name: re.name_bytes.clone(),
+            method_on_wire: re.method_on_wire,
+            inner_method: re.inner_method,
+            encrypted: re.encrypted,
+            gp_bit1: re.gp_flags & (1 << 1) != 0,
+            version_needed: re.version_needed.max(20),
+            crc32: re.crc32,
+            comp_size: re.comp_size,
+            uncomp_size: re.uncomp_size,
+            lfh_offset,
+            mtime: re.mtime,
+        });
+    }
+
+    /// Stream-copy an old entry's LFH + body into the writer at the
+    /// current `pos`, then record its central entry at the new offset.
+    /// Used by rebuild mode. `src` must be seekable and `re.lfh_total_size`
+    /// must be populated (via `Archive::lfh_total_size_of`).
+    pub fn carry_existing_entry<R: Read + Seek>(
+        &mut self,
+        src: &mut R,
+        re: &ReadEntry,
+    ) -> Result<()> {
+        if re.lfh_total_size == 0 {
+            anyhow::bail!(
+                "carry_existing_entry: lfh_total_size not populated for {}",
+                re.name
+            );
+        }
+        let new_offset = self.pos;
+        src.seek(SeekFrom::Start(re.lfh_offset))
+            .with_context(|| format!("seek to LFH of {}", re.name))?;
+        let total = re.lfh_total_size as u64 + re.comp_size;
+        let mut remaining = total;
+        let mut buf = [0u8; 256 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            src.read_exact(&mut buf[..want])
+                .with_context(|| format!("read body of {}", re.name))?;
+            self.inner
+                .write_all(&buf[..want])
+                .with_context(|| format!("copy body of {}", re.name))?;
+            remaining -= want as u64;
+        }
+        self.pos += total;
+        self.record_existing(re, new_offset);
+        Ok(())
     }
 
     pub fn write_entry(&mut self, e: &EncodedEntry) -> Result<()> {

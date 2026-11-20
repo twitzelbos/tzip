@@ -54,6 +54,12 @@ pub struct LocalFsSource {
     pub keep_cache: bool,
 }
 
+/// Choose BufWriter capacity for the output based on filesystem info.
+/// Shared with the update module.
+pub(crate) fn writer_capacity_for(info: Option<&platform::FsInfo>) -> usize {
+    choose_writer_capacity(info)
+}
+
 impl Source for LocalFsSource {
     fn read(&self, item: &WorkItem) -> Result<platform::ReadBuf> {
         // Fast path: openat(dirfd, basename) when the walker gave us a dirfd.
@@ -91,7 +97,27 @@ pub(crate) struct RawItem {
     pub(crate) bytes: platform::ReadBuf,
 }
 
+/// Shared single-file encoder used by both the main pipeline and update mode.
+pub(crate) fn encode_item(
+    raw: &RawItem,
+    method: Method,
+    level: u32,
+    password: Option<&str>,
+    scratch: &mut Scratch,
+    single_file_parallel: bool,
+) -> Result<EncodedEntry> {
+    encode_one(raw, method, level, password, scratch, single_file_parallel)
+}
+
 pub fn run(opts: Options) -> Result<()> {
+    // --update dispatches to the update-mode entry point when the target
+    // archive already exists. On a non-existent archive, `-u` falls back
+    // to create mode (matches `7z u`). `.7z` is rejected upfront at CLI
+    // validation, so we don't check `opts.solid` again here.
+    if opts.update && opts.archive.exists() {
+        return crate::update::run_update(opts);
+    }
+
     // Optional USB / drive diagnostic — only prints if the workload actually
     // touches a USB-backed filesystem. Cheap when everything is internal.
     #[cfg(target_os = "macos")]

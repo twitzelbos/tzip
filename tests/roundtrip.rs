@@ -109,7 +109,7 @@ fn roundtrip_store() {
     make_corpus(&src);
     let archive = tmp.path().join("out.zip");
 
-    run_tzip(tmp.path(), &["out.zip", "corpus", "-m", "store", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.zip", "corpus", "-m", "store", "-q"]);
 
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
@@ -126,7 +126,7 @@ fn roundtrip_deflate_level0() {
 
     run_tzip(
         tmp.path(),
-        &["out.zip", "corpus", "-m", "deflate", "-x", "0", "-q"],
+        &["create", "out.zip", "corpus", "-m", "deflate", "-x", "0", "-q"],
     );
 
     let out = tmp.path().join("extracted");
@@ -144,7 +144,7 @@ fn roundtrip_deflate_max() {
 
     run_tzip(
         tmp.path(),
-        &["out.zip", "corpus", "-m", "deflate", "-x", "12", "-q"],
+        &["create", "out.zip", "corpus", "-m", "deflate", "-x", "12", "-q"],
     );
 
     let out = tmp.path().join("extracted");
@@ -162,7 +162,7 @@ fn aes_archive_structural_check() {
 
     run_tzip(
         tmp.path(),
-        &["out.zip", "corpus", "-m", "deflate", "-p", "hunter2", "-q"],
+        &["create", "out.zip", "corpus", "-m", "deflate", "-p", "hunter2", "-q"],
     );
 
     // Structural: parse with the `zip` crate. It can enumerate encrypted
@@ -195,7 +195,7 @@ fn roundtrip_via_7z(method: &str) {
     let archive = tmp.path().join(&archive_name);
     run_tzip(
         tmp.path(),
-        &[&archive_name, "corpus", "-m", method, "-q"],
+        &["create", &archive_name, "corpus", "-m", method, "-q"],
     );
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
@@ -232,7 +232,7 @@ fn roundtrip_seven_zip_solid() {
     let src = tmp.path().join("corpus");
     make_corpus(&src);
     let archive = tmp.path().join("out.7z");
-    run_tzip(tmp.path(), &["out.7z", "corpus", "--solid", "-x", "6", "-q"]);
+    run_tzip(tmp.path(), &["create", "out.7z", "corpus", "--solid", "-x", "6", "-q"]);
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
     if !extract_with_7z(&archive, &out, None) {
@@ -250,7 +250,7 @@ fn roundtrip_seven_zip_solid_aes() {
     let archive = tmp.path().join("out.7z");
     run_tzip(
         tmp.path(),
-        &["out.7z", "corpus", "--solid", "-x", "6", "-p", "hunter2", "-q"],
+        &["create", "out.7z", "corpus", "--solid", "-x", "6", "-p", "hunter2", "-q"],
     );
     let out = tmp.path().join("extracted");
     fs::create_dir(&out).unwrap();
@@ -268,8 +268,8 @@ fn sort_flag_is_deterministic() {
     make_corpus(&src);
     let a = tmp.path().join("a.zip");
     let b = tmp.path().join("b.zip");
-    run_tzip(tmp.path(), &["a.zip", "corpus", "--sort", "-m", "store", "-q"]);
-    run_tzip(tmp.path(), &["b.zip", "corpus", "--sort", "-m", "store", "-q"]);
+    run_tzip(tmp.path(), &["create", "a.zip", "corpus", "--sort", "-m", "store", "-q"]);
+    run_tzip(tmp.path(), &["create", "b.zip", "corpus", "--sort", "-m", "store", "-q"]);
     // With --sort and STORE (no random salt), archives should be
     // byte-identical modulo timestamps. Since mtimes are the same on the
     // source files, they match.

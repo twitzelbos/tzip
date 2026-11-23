@@ -22,6 +22,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::sources::ReadSeek;
 use crate::zipwriter::{AES_EXTRA_ID, METHOD_AES, SIG_CDR, SIG_EOCD, SIG_EOCD64, SIG_EOCD64_LOC, SIG_LFH};
 
 const EOCD_SCAN_WINDOW: u64 = 64 * 1024;
@@ -58,7 +59,7 @@ pub struct ReadEntry {
 }
 
 pub struct Archive {
-    file: File,
+    source: Box<dyn ReadSeek>,
     entries: Vec<ReadEntry>,
     file_size: u64,
     cd_offset: u64,
@@ -70,21 +71,28 @@ pub struct Archive {
 }
 
 impl Archive {
+    /// Open a local-file archive. Thin wrapper around `open_source`.
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path)
+        let file = File::open(path)
             .with_context(|| format!("open {}", path.display()))?;
-        let file_size = file
+        Self::open_source(Box::new(file))
+            .with_context(|| format!("parse {}", path.display()))
+    }
+
+    /// Open an archive against any `Read + Seek + Send` source. HTTP, S3,
+    /// in-memory cursors — anything implementing `ReadSeek`.
+    pub fn open_source(mut source: Box<dyn ReadSeek>) -> Result<Self> {
+        let file_size = source
             .seek(SeekFrom::End(0))
-            .with_context(|| format!("seek-end {}", path.display()))?;
+            .context("seek to end of archive source")?;
         if file_size < EOCD_MIN_SIZE {
-            bail!("{} is too small to be a ZIP ({} bytes)", path.display(), file_size);
+            bail!("archive is too small to be a ZIP ({} bytes)", file_size);
         }
 
-        let (eocd_pos, eocd) = find_eocd(&mut file, file_size)
-            .with_context(|| format!("find EOCD in {}", path.display()))?;
+        let (eocd_pos, eocd) = find_eocd(&mut *source, file_size).context("find EOCD")?;
 
         let (entry_count, cd_size, cd_offset) = if eocd.needs_zip64() {
-            let z64 = find_eocd64(&mut file, eocd_pos)
+            let z64 = find_eocd64(&mut *source, eocd_pos)
                 .context("archive looks like ZIP64 but no EOCD64 could be found")?;
             (z64.entry_count, z64.cd_size, z64.cd_offset)
         } else {
@@ -98,23 +106,26 @@ impl Archive {
             );
         }
 
-        file.seek(SeekFrom::Start(cd_offset))
+        source
+            .seek(SeekFrom::Start(cd_offset))
             .with_context(|| format!("seek to central directory at {}", cd_offset))?;
         let mut cdr_bytes = vec![0u8; cd_size as usize];
-        file.read_exact(&mut cdr_bytes).context("read central directory")?;
+        source.read_exact(&mut cdr_bytes).context("read central directory")?;
 
         let entries = parse_central_directory(&cdr_bytes, entry_count)?;
 
         let tail_size = file_size - cd_offset;
-        Ok(Self { file, entries, file_size, cd_offset, cd_size, tail_size })
+        Ok(Self { source, entries, file_size, cd_offset, cd_size, tail_size })
     }
 
     pub fn entries(&self) -> &[ReadEntry] {
         &self.entries
     }
 
-    pub fn file_mut(&mut self) -> &mut File {
-        &mut self.file
+    /// Mutable access to the underlying source so callers can seek + read
+    /// specific byte ranges (e.g. to stream an entry's LFH + body).
+    pub fn source_mut(&mut self) -> &mut (dyn ReadSeek) {
+        &mut *self.source
     }
 
     pub fn cd_offset(&self) -> u64 {
@@ -139,11 +150,11 @@ impl Archive {
     /// any ZIP64 trailer records. Used to populate the append-mode undo
     /// file so a crashed update can be rolled back.
     pub fn tail_bytes(&mut self) -> Result<Vec<u8>> {
-        self.file
+        self.source
             .seek(SeekFrom::Start(self.cd_offset))
             .context("seek to cd_offset for tail copy")?;
         let mut buf = vec![0u8; self.tail_size as usize];
-        self.file.read_exact(&mut buf).context("read tail bytes")?;
+        self.source.read_exact(&mut buf).context("read tail bytes")?;
         Ok(buf)
     }
 
@@ -155,9 +166,11 @@ impl Archive {
             return Ok(cached);
         }
         let off = self.entries[idx].lfh_offset;
-        self.file.seek(SeekFrom::Start(off)).context("seek to LFH")?;
+        self.source
+            .seek(SeekFrom::Start(off))
+            .context("seek to LFH")?;
         let mut hdr = [0u8; 30];
-        self.file.read_exact(&mut hdr).context("read LFH header")?;
+        self.source.read_exact(&mut hdr).context("read LFH header")?;
         let sig = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
         if sig != SIG_LFH {
             bail!("bad LFH signature at offset {}: {:#x}", off, sig);
@@ -184,7 +197,7 @@ impl Eocd {
     }
 }
 
-fn find_eocd(file: &mut File, file_size: u64) -> Result<(u64, Eocd)> {
+fn find_eocd<S: Read + Seek + ?Sized>(file: &mut S, file_size: u64) -> Result<(u64, Eocd)> {
     // Scan the last 64 KiB for the EOCD signature. The EOCD is a 22-byte
     // fixed-size record *followed* by a variable-length comment (0..65535
     // bytes). Scanning from the end lets us find it without knowing the
@@ -228,7 +241,7 @@ struct Eocd64 {
     cd_offset: u64,
 }
 
-fn find_eocd64(file: &mut File, eocd_pos: u64) -> Result<Eocd64> {
+fn find_eocd64<S: Read + Seek + ?Sized>(file: &mut S, eocd_pos: u64) -> Result<Eocd64> {
     // The EOCD64 locator is exactly 20 bytes immediately before the EOCD.
     if eocd_pos < 20 {
         bail!("no room for EOCD64 locator before EOCD at offset {}", eocd_pos);

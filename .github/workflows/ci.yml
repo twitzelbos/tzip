@@ -25,6 +25,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Override `.cargo/config.toml`'s `target-cpu=native -C target-feature=+aes,+sha`
+      # on Linux runners. GitHub's ubuntu-latest hardware rotates across CPUs;
+      # some lack SHA-NI, and compiling dependency build scripts (notably
+      # `ring`) with `+sha` produces instructions that SIGILL on those
+      # runners. `x86-64-v3` guarantees AVX2 (Haswell+, 2013) and leaves
+      # AES-NI available via `cpufeatures` runtime dispatch — which is what
+      # the tzip binary actually needs. macOS (aarch64) runners keep the
+      # ARMv8 crypto path from config.toml unchanged; M-series silicon
+      # always has the required extensions.
+      - name: Set safe RUSTFLAGS (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        # `RUSTFLAGS` (not `CARGO_BUILD_RUSTFLAGS`) is required: cargo's
+        # precedence is RUSTFLAGS > [target.<triple>.rustflags] >
+        # [build.rustflags] > CARGO_BUILD_RUSTFLAGS, so CARGO_BUILD_RUSTFLAGS
+        # alone is still overridden by our .cargo/config.toml's
+        # `[target.'cfg(target_arch = "x86_64")'].rustflags`.
+        run: echo "RUSTFLAGS=-C target-cpu=x86-64-v3" >> "$GITHUB_ENV"
+
       # The roundtrip tests shell out to `7z` to verify bzip2 / lzma / xz /
       # zstd / .7z extraction. They skip gracefully if it isn't installed,
       # but we want to actually exercise those paths in CI.

@@ -32,6 +32,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [`.7z` solid archives](#7z-solid-archives)
 - [Update mode](#update-mode)
 - [Reading archives](#reading-archives)
+- [Reading remote archives (HTTP / S3)](#reading-remote-archives-http--s3)
 - [TUI mode](#tui-mode)
 - [Performance](#performance)
 - [External-drive tuning](#external-drive-tuning)
@@ -396,6 +397,66 @@ Corrupted/tampered ciphertext passes through the stream (CTR is
 malleable at the byte level) and fails at the end with
 `AES-256 HMAC mismatch — archive is tampered or corrupted`; downstream
 should treat whatever bytes made it to disk/stdout as untrusted.
+
+## Reading remote archives (HTTP / S3)
+
+`tzip ls`, `tzip cat`, and `tzip x` accept URLs in place of the local
+path. The HTTP(S) and S3 code paths use `Range` requests to pull just the
+bytes they need — one GET for the EOCD (~65 KiB at the tail), one for
+the central directory, one more per entry you actually `cat` or extract.
+
+```
+# List the entries in a ZIP sitting at a URL.
+tzip ls https://example.com/releases/archive.zip
+
+# Stream one file out of it — only the bytes for that entry transit.
+tzip cat https://example.com/releases/archive.zip LICENSE
+
+# Same against an S3 object. Virtual-hosted-style URL under the hood.
+tzip ls s3://my-bucket/path/to/archive.zip
+tzip cat s3://my-bucket/path/to/archive.zip README.md
+
+# AES-encrypted entries work exactly the same — decrypt happens locally.
+tzip cat s3://my-bucket/vault.zip secrets/api-key.txt -p 'hunter2'
+```
+
+Why this matters: `tzip cat s3://bucket/huge.zip one-file.txt` pulls
+~200 KiB over the wire regardless of whether `huge.zip` is 100 MB or
+100 GB. No staging, no full download.
+
+Write operations (`create`, `u`) are **local-only** by design — passing
+a URL target fails fast with a clear error.
+
+### HTTP(S) requirements
+
+The server must support `Accept-Ranges: bytes` and return `206 Partial
+Content` on Range requests. `python3 -m http.server` doesn't (it
+ignores Range); any production static-file server (nginx, S3, GCS,
+Cloudflare R2, GitHub raw, etc.) does.
+
+### S3 credentials
+
+tzip reads credentials in this order:
+
+1. `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` env vars (+ optional
+   `AWS_SESSION_TOKEN` for STS / role-chain temporary creds).
+2. `~/.aws/credentials` — INI file with `[default]` (or `[<profile>]`
+   selected via `AWS_PROFILE`) containing `aws_access_key_id` /
+   `aws_secret_access_key` / optional `aws_session_token`.
+
+Region: `AWS_REGION` → `AWS_DEFAULT_REGION` → `~/.aws/config` for the
+chosen profile → fallback `us-east-1`.
+
+**MinIO / LocalStack / S3-compatible endpoints**: set `AWS_ENDPOINT_URL`
+to override the default `https://<bucket>.s3.<region>.amazonaws.com`
+host. Path-style URLs (`http://host:port/<bucket>/<key>`) are used
+automatically when the endpoint override is in effect.
+
+Not supported in this release: SSO, IAM instance metadata (IMDSv2),
+AssumeRole chains. If you need these, drop temporary creds into
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` via
+whatever tool you already use (`aws sso login`, `aws-vault exec`, etc.)
+and tzip will pick them up.
 
 ## TUI mode
 

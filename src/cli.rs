@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
-use clap::{ArgMatches, Parser, ValueEnum};
+use clap::{ArgMatches, Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 /// Tracks which auto-tunable flags came from the command line (vs took the
@@ -16,10 +16,8 @@ pub struct UserSetFlags {
 }
 
 impl UserSetFlags {
+    /// Call with the matches of the `create` or `u` subcommand.
     pub fn from_matches(m: &ArgMatches) -> Self {
-        // `value_source` panics on an unknown id, and the `raw_block` /
-        // `io_uring` args are only defined under certain cfgs, so guard each
-        // by whether clap actually knows the id on this build.
         let known = |name: &str| m.try_contains_id(name).unwrap_or(false);
         let is_cli =
             |name: &str| known(name) && m.value_source(name) == Some(ValueSource::CommandLine);
@@ -43,85 +41,84 @@ pub enum Method {
     Zstd,
 }
 
+// ── Top-level CLI ──────────────────────────────────────────────────────────
+
 #[derive(Parser, Debug)]
 #[command(
     name = "tzip",
     version,
-    about = "The fastest ZIP packer this side of the M1 — parallel, hardware-AES-256, external-drive-friendly",
-    long_about = None,
+    about = "Parallel ZIP packer with hardware AES-256, external-drive-friendly I/O, and a cloud-ready reader stack."
 )]
-pub struct Args {
-    /// Output archive path (.zip)
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Cmd {
+    /// Create a new archive from input paths.
+    #[command(alias = "a")]
+    Create(CreateArgs),
+
+    /// Modify an existing ZIP: add / replace entries, delete entries via `--delete`.
+    U(UpdateArgs),
+
+    /// List entries in an archive.
+    #[command(alias = "l")]
+    Ls(LsArgs),
+
+    /// Stream a single entry's decrypted + decompressed bytes to stdout.
+    Cat(CatArgs),
+
+    /// Extract one or more entries (or the whole archive).
+    #[command(alias = "extract")]
+    X(ExtractArgs),
+}
+
+// ── Create ─────────────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+pub struct CreateArgs {
+    /// Output archive path (.zip, or .7z for solid LZMA2).
     pub archive: PathBuf,
 
-    /// One or more input files or directories. With `--apfs-device`, these are
-    /// interpreted as absolute in-volume paths (e.g. `/Users/me/data`); omit
-    /// them to archive the whole volume.
+    /// One or more input files or directories. With `--apfs-device`, these
+    /// are interpreted as absolute in-volume paths; omit them to archive
+    /// the whole volume.
     #[arg(required = false)]
     pub paths: Vec<PathBuf>,
 
-    /// Compression method
     #[arg(short = 'm', long, value_enum, default_value_t = Method::Deflate)]
     pub method: Method,
 
-    /// Compression level. Range varies by method:
     /// deflate 0-12 (libdeflater), bzip2 1-9, lzma/xz 0-9, zstd 1-22.
-    /// Auto-clamped to each method's supported range.
     #[arg(short = 'x', long, default_value_t = 6)]
     pub level: u32,
 
-    /// Emit a `.7z` solid archive (LZMA2 solid block, header encryption when password given).
-    /// Also enabled automatically when the archive path ends in `.7z`.
     #[arg(long)]
     pub solid: bool,
 
-    /// Enable ratatui dashboard when stdout is a TTY.
     #[arg(long)]
     pub tui: bool,
 
-    /// Number of CPU workers for compression+encryption (default: physical cores)
     #[arg(short = 'j', long)]
     pub jobs: Option<usize>,
 
-    /// Number of reader threads that touch the filesystem.
-    /// Keep this low (1 or 2) for external / spinning drives — high values
-    /// stampede the disk. Pass `auto` to scale to `min(cpu_jobs, 8)` for
-    /// internal NVMe. Default is `2` (safe on external drives).
     #[arg(long, default_value = "2")]
     pub read_jobs: String,
 
-    /// Number of directory-scan threads. `readdir` doesn't seek-storm the
-    /// way file *content* reads do, so this can be higher than `--read-jobs`.
-    /// Default is `4` (or `cpu_jobs` if smaller).
     #[arg(long)]
     pub walk_jobs: Option<usize>,
 
-    /// Disable the macOS-only bulk walker (`getattrlistbulk`) and use the
-    /// portable jwalk-based walker. Only useful for debugging.
     #[arg(long)]
     pub classic_walk: bool,
 
-    /// Use Grand Central Dispatch's `dispatch_io_read` for file body reads
-    /// (macOS only, small files only — large files still mmap). Experimental
-    /// alternative to the default POSIX read path; may help on USB-MSC.
     #[arg(long)]
     pub dispatch_io: bool,
 
-    /// Print a USB/drive diagnostic for any inputs or output on a USB bus
-    /// before archiving. macOS only; a no-op elsewhere. Shows negotiated link
-    /// speed, filesystem, media name, and tuning advisories.
     #[arg(long)]
     pub usb_info: bool,
 
-    /// Read files in physical-disk order for a forward sweep instead of a
-    /// seek storm.
-    ///
-    /// On macOS (with the `raw-apfs` feature) this parses APFS directly off
-    /// `/dev/rdiskN`, bypassing the VFS + on-access AV hooks. On Linux it uses
-    /// the `FS_IOC_FIEMAP` ioctl to sort files by their physical block offset
-    /// and read them in disk order through the VFS (ext4/xfs/btrfs/f2fs). The
-    /// big win is on spinning / USB media; roughly neutral on NVMe. Pass
-    /// `--raw-block=false` to force the default reader.
     #[cfg(any(
         all(feature = "raw-apfs", target_os = "macos"),
         target_os = "linux"
@@ -135,96 +132,177 @@ pub struct Args {
     )]
     pub raw_block: bool,
 
-    /// Archive an APFS volume by parsing it directly off a raw device
-    /// (`--apfs-device /dev/sda1`), with no mount and no APFS driver needed.
-    /// Positional paths become in-volume paths; omit them for the whole volume.
-    /// Requires the `raw-apfs` Cargo feature and read access to the device
-    /// (run with sudo or grant read on the device node). Not supported for
-    /// FileVault / block-layer-encrypted volumes.
     #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
     #[arg(long, value_name = "DEVICE")]
     pub apfs_device: Option<PathBuf>,
 
-    /// EXPERIMENTAL (Linux, `io-uring` feature): read file bodies via io_uring
-    /// with a deep submission queue instead of one blocking `read` per reader
-    /// thread. Lets a single thread keep NVMe busy at high queue depth. Pairs
-    /// with `--raw-block` (files are still submitted in physical-disk order).
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     #[arg(long)]
     pub io_uring: bool,
 
-    /// Legacy tzip behavior: store archive paths as just the basename
-    /// of each CLI root (e.g. `foo/bar/baz` → `baz/…` in the archive).
-    /// Default is the `zip -r` convention: preserve the CLI-given path
-    /// (with leading `/` stripped for absolute paths).
     #[arg(long)]
     pub basename_only: bool,
 
-    /// Warn about running processes that will contend for the source drive:
-    /// Spotlight indexing, on-access AV scanners (Sophos, CrowdStrike,
-    /// SentinelOne, McAfee, Symantec, ESET, Malwarebytes, Carbon Black,
-    /// Trend Micro, Elastic, Bitdefender), and Apple's own indexers.
-    /// Print-only — never blocks the run. macOS only.
     #[arg(long)]
     pub warn_contention: bool,
 
-    /// Encryption password. Use `-` to read from stdin (tty prompt if interactive).
     #[arg(short = 'p', long)]
     pub password: Option<String>,
 
-    /// Read password from a file (first line)
     #[arg(long, conflicts_with = "password")]
     pub password_file: Option<PathBuf>,
 
-    /// Sort entries by path — produces reproducible byte-identical archives
     #[arg(long)]
     pub sort: bool,
 
-    /// Exclude paths matching this glob (repeatable)
     #[arg(long)]
     pub exclude: Vec<String>,
 
-    /// Silence progress bar
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
-    /// Per-file logging to stderr
     #[arg(short = 'v', long)]
     pub verbose: bool,
 
-    /// Skip macOS F_NOCACHE — keep read blocks in the page cache
-    /// (default: bypass page cache so the archive pass doesn't evict your working set)
     #[arg(long)]
     pub keep_cache: bool,
 
-    /// Write a data descriptor after each entry instead of seeking back to patch the LFH.
-    /// Enabled automatically when the output is not a regular seekable file.
     #[arg(long)]
     pub streaming: bool,
-
-    /// Modify an existing ZIP archive in place: add new files, replace
-    /// entries whose archive name matches an input, remove entries listed
-    /// via `--delete`. When safe (pure-add with no name collisions) the
-    /// archive is updated by truncating the old central directory and
-    /// appending — crash-safe via an on-disk undo file. Otherwise tzip
-    /// writes a new archive to a temp file and atomic-renames it over the
-    /// original. If the archive doesn't exist, falls back to create mode.
-    /// Not supported for `.7z`.
-    #[arg(short = 'u', long)]
-    pub update: bool,
-
-    /// Delete archive entries matching this glob. Only valid with `--update`.
-    /// Repeatable. Uses the same `*` / `?` matcher as `--exclude`, applied
-    /// to the archive-internal path.
-    #[arg(long, requires = "update")]
-    pub delete: Vec<String>,
-
-    /// Force rebuild-to-temp + atomic rename for `--update`. Without it,
-    /// pure-add updates are applied in place.
-    #[arg(long, requires = "update")]
-    pub atomic: bool,
 }
 
+// ── Update ─────────────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+pub struct UpdateArgs {
+    /// Target archive. Must exist (if missing, falls back to create).
+    pub archive: PathBuf,
+
+    /// Files or directories to add or replace in the archive.
+    #[arg(required = false)]
+    pub paths: Vec<PathBuf>,
+
+    #[arg(short = 'm', long, value_enum, default_value_t = Method::Deflate)]
+    pub method: Method,
+
+    #[arg(short = 'x', long, default_value_t = 6)]
+    pub level: u32,
+
+    #[arg(short = 'j', long)]
+    pub jobs: Option<usize>,
+
+    #[arg(long, default_value = "2")]
+    pub read_jobs: String,
+
+    #[arg(long)]
+    pub walk_jobs: Option<usize>,
+
+    /// Delete archive entries matching this glob. Repeatable.
+    #[arg(long)]
+    pub delete: Vec<String>,
+
+    /// Force rebuild-to-temp + atomic rename (default: in-place append when safe).
+    #[arg(long)]
+    pub atomic: bool,
+
+    #[arg(long)]
+    pub basename_only: bool,
+
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+
+    #[arg(long, conflicts_with = "password")]
+    pub password_file: Option<PathBuf>,
+
+    #[arg(long)]
+    pub sort: bool,
+
+    #[arg(long)]
+    pub exclude: Vec<String>,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+
+    #[arg(long)]
+    pub keep_cache: bool,
+
+    #[arg(long)]
+    pub tui: bool,
+}
+
+// ── Reader (ls / cat / x) ──────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+pub struct LsArgs {
+    /// Archive to list.
+    pub archive: PathBuf,
+
+    /// Password for AES-encrypted archives. Not needed for `ls` output
+    /// itself; accepted for parity with `cat` / `x`.
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+
+    #[arg(long, conflicts_with = "password")]
+    pub password_file: Option<PathBuf>,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CatArgs {
+    pub archive: PathBuf,
+    /// Archive-internal name of the entry to stream.
+    pub name: String,
+
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+
+    #[arg(long, conflicts_with = "password")]
+    pub password_file: Option<PathBuf>,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ExtractArgs {
+    pub archive: PathBuf,
+    /// Specific entries to extract. Empty = extract the whole archive.
+    #[arg(required = false)]
+    pub names: Vec<String>,
+
+    /// Extraction destination directory. Default: current directory.
+    #[arg(long, value_name = "DIR")]
+    pub to: Option<PathBuf>,
+
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+
+    #[arg(long, conflicts_with = "password")]
+    pub password_file: Option<PathBuf>,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+// ── Options structs consumed by the backends ──────────────────────────────
+
+/// Shared options for both `create` and `u`. `update`/`delete`/`atomic` are
+/// set by `UpdateArgs::into_options`; `CreateArgs::into_options` leaves them
+/// at their defaults (update=false, delete empty, atomic=false).
 #[derive(Clone, Debug)]
 pub struct Options {
     pub archive: PathBuf,
@@ -240,7 +318,6 @@ pub struct Options {
     pub quiet: bool,
     pub verbose: bool,
     pub keep_cache: bool,
-    // Reserved for a future streaming (non-seekable) writer path.
     #[allow(dead_code)]
     pub streaming: bool,
     pub solid: bool,
@@ -265,27 +342,32 @@ pub struct Options {
     pub atomic: bool,
 }
 
-impl Args {
+/// Which reader op is running and what it needs.
+#[derive(Clone, Debug)]
+pub enum ReaderOp {
+    Ls,
+    Cat { name: String },
+    Extract { to: PathBuf, names: Vec<String> },
+}
+
+#[derive(Clone, Debug)]
+pub struct ReaderOptions {
+    pub archive: PathBuf,
+    pub password: Option<String>,
+    pub quiet: bool,
+    pub verbose: bool,
+    pub op: ReaderOp,
+}
+
+// ── CreateArgs / UpdateArgs → Options ─────────────────────────────────────
+
+impl CreateArgs {
     pub fn into_options(self, user_flags: UserSetFlags) -> Result<Options> {
         let cpu_jobs = self
             .jobs
             .unwrap_or_else(|| num_cpus::get_physical().max(1));
 
-        let read_jobs = if self.read_jobs.eq_ignore_ascii_case("auto") {
-            cpu_jobs.min(8).max(1)
-        } else {
-            let n: usize = self
-                .read_jobs
-                .parse()
-                .with_context(|| format!("invalid --read-jobs {:?}", self.read_jobs))?;
-            if n == 0 {
-                bail!("--read-jobs must be at least 1");
-            }
-            n
-        };
-
-        let password = resolve_password(&self)?;
-
+        let read_jobs = parse_read_jobs(&self.read_jobs, cpu_jobs)?;
         let walk_jobs = self.walk_jobs.unwrap_or_else(|| cpu_jobs.min(4).max(1));
 
         let solid = self.solid
@@ -296,18 +378,8 @@ impl Args {
                 .map(|s| s.eq_ignore_ascii_case("7z"))
                 .unwrap_or(false);
 
-        if self.update && solid {
-            bail!(
-                ".7z archives do not support --update — rebuild the .7z from source"
-            );
-        }
-        if self.update && self.streaming {
-            bail!("--update is incompatible with --streaming");
-        }
+        let password = resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
 
-        // Resolve input paths. With --apfs-device, an empty path list means
-        // "whole volume" (in-volume root `/`); otherwise at least one path is
-        // required. In update mode, a delete-only invocation is also valid.
         let mut paths = self.paths;
         #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
         {
@@ -316,16 +388,10 @@ impl Args {
             }
         }
         if paths.is_empty() {
-            if self.update && !self.delete.is_empty() {
-                // delete-only update is fine
-            } else if self.update {
-                bail!("--update needs at least one input path or --delete GLOB");
-            } else {
-                bail!(
-                    "need at least one input path \
-                     (or use --apfs-device to archive a whole APFS volume)"
-                );
-            }
+            bail!(
+                "need at least one input path \
+                 (or use --apfs-device to archive a whole APFS volume)"
+            );
         }
 
         Ok(Options {
@@ -360,15 +426,135 @@ impl Args {
             io_uring: self.io_uring,
             basename_only: self.basename_only,
             user_flags,
-            update: self.update,
+            update: false,
+            delete: Vec::new(),
+            atomic: false,
+        })
+    }
+}
+
+impl UpdateArgs {
+    pub fn into_options(self, user_flags: UserSetFlags) -> Result<Options> {
+        let cpu_jobs = self
+            .jobs
+            .unwrap_or_else(|| num_cpus::get_physical().max(1));
+        let read_jobs = parse_read_jobs(&self.read_jobs, cpu_jobs)?;
+        let walk_jobs = self.walk_jobs.unwrap_or_else(|| cpu_jobs.min(4).max(1));
+
+        let solid = self
+            .archive
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.eq_ignore_ascii_case("7z"))
+            .unwrap_or(false);
+        if solid {
+            bail!(".7z archives do not support `u` — rebuild the .7z from source");
+        }
+
+        let password = resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
+
+        if self.paths.is_empty() && self.delete.is_empty() {
+            bail!("`tzip u` needs at least one input path or --delete GLOB");
+        }
+
+        Ok(Options {
+            archive: self.archive,
+            paths: self.paths,
+            method: self.method,
+            level: self.level,
+            cpu_jobs,
+            read_jobs,
+            walk_jobs,
+            password,
+            sort: self.sort,
+            exclude: self.exclude,
+            quiet: self.quiet,
+            verbose: self.verbose,
+            keep_cache: self.keep_cache,
+            streaming: false,
+            solid: false,
+            tui: self.tui,
+            classic_walk: false,
+            dispatch_io: false,
+            usb_info: false,
+            warn_contention: false,
+            #[cfg(any(
+                all(feature = "raw-apfs", target_os = "macos"),
+                target_os = "linux"
+            ))]
+            raw_block: false,
+            #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
+            apfs_device: None,
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            io_uring: false,
+            basename_only: self.basename_only,
+            user_flags,
+            update: true,
             delete: self.delete,
             atomic: self.atomic,
         })
     }
 }
 
-fn resolve_password(args: &Args) -> Result<Option<String>> {
-    if let Some(pf) = &args.password_file {
+// ── Reader args → ReaderOptions ───────────────────────────────────────────
+
+impl LsArgs {
+    pub fn into_options(self) -> Result<ReaderOptions> {
+        let password = resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
+        Ok(ReaderOptions {
+            archive: self.archive,
+            password,
+            quiet: self.quiet,
+            verbose: self.verbose,
+            op: ReaderOp::Ls,
+        })
+    }
+}
+
+impl CatArgs {
+    pub fn into_options(self) -> Result<ReaderOptions> {
+        let password = resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
+        Ok(ReaderOptions {
+            archive: self.archive,
+            password,
+            quiet: self.quiet,
+            verbose: self.verbose,
+            op: ReaderOp::Cat { name: self.name },
+        })
+    }
+}
+
+impl ExtractArgs {
+    pub fn into_options(self) -> Result<ReaderOptions> {
+        let password = resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
+        let to = self.to.unwrap_or_else(|| PathBuf::from("."));
+        Ok(ReaderOptions {
+            archive: self.archive,
+            password,
+            quiet: self.quiet,
+            verbose: self.verbose,
+            op: ReaderOp::Extract { to, names: self.names },
+        })
+    }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────
+
+fn parse_read_jobs(raw: &str, cpu_jobs: usize) -> Result<usize> {
+    if raw.eq_ignore_ascii_case("auto") {
+        return Ok(cpu_jobs.min(8).max(1));
+    }
+    let n: usize = raw
+        .parse()
+        .with_context(|| format!("invalid --read-jobs {:?}", raw))?;
+    if n == 0 {
+        bail!("--read-jobs must be at least 1");
+    }
+    Ok(n)
+}
+
+fn resolve_password(password: Option<&str>, password_file: Option<&std::path::Path>) -> Result<Option<String>> {
+    if let Some(pf) = password_file {
         let text = std::fs::read_to_string(pf)
             .with_context(|| format!("read password file {}", pf.display()))?;
         let first = text.lines().next().unwrap_or("").to_string();
@@ -377,7 +563,7 @@ fn resolve_password(args: &Args) -> Result<Option<String>> {
         }
         return Ok(Some(first));
     }
-    match &args.password {
+    match password {
         None => Ok(None),
         Some(s) if s == "-" => {
             let pw = rpassword::prompt_password("Password: ").context("read password")?;
@@ -386,6 +572,6 @@ fn resolve_password(args: &Args) -> Result<Option<String>> {
             }
             Ok(Some(pw))
         }
-        Some(s) => Ok(Some(s.clone())),
+        Some(s) => Ok(Some(s.to_string())),
     }
 }

@@ -15,11 +15,12 @@
 //! anyway for internal verification but zero it when serializing.
 
 use aes::cipher::{KeyIvInit, StreamCipher};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use sha1::Sha1;
+use std::io::{Read, Write};
 
 type HmacSha1 = Hmac<Sha1>;
 type Aes256Ctr = ctr::Ctr128LE<aes::Aes256>;
@@ -82,35 +83,118 @@ pub fn encrypt_ae2_in_place_with_salt(
         bail!("buffer size mismatch");
     }
 
-    let mut derived = [0u8; KEY_LEN + MAC_KEY_LEN + VERIFY_LEN];
-    pbkdf2_hmac::<Sha1>(password.as_bytes(), salt, 1000, &mut derived);
-
-    let enc_key: [u8; KEY_LEN] = derived[..KEY_LEN].try_into().unwrap();
-    let mac_key_bytes: [u8; MAC_KEY_LEN] =
-        derived[KEY_LEN..KEY_LEN + MAC_KEY_LEN].try_into().unwrap();
-    let verify: [u8; VERIFY_LEN] = derived[KEY_LEN + MAC_KEY_LEN..].try_into().unwrap();
+    let keys = derive_keys(password, salt);
 
     // Fill the salt + verifier prefix in place.
     buf[..SALT_LEN].copy_from_slice(salt);
-    buf[SALT_LEN..SALT_LEN + VERIFY_LEN].copy_from_slice(&verify);
+    buf[SALT_LEN..SALT_LEN + VERIFY_LEN].copy_from_slice(&keys.verify);
 
-    // WinZIP AES: 128-bit LE counter starting at 1. We initialize the IV to
-    // [1, 0, 0, ...] so the first plaintext block is encrypted with counter=1
-    // directly — no wasted keystream block, no dummy-encrypt hack.
-    let mut iv = [0u8; 16];
-    iv[0] = 1;
-    let mut cipher = Aes256Ctr::new((&enc_key).into(), (&iv).into());
+    let mut cipher = ctr_cipher(&keys.enc);
 
     let pt_start = SALT_LEN + VERIFY_LEN;
     let pt_end = pt_start + plaintext_len;
     cipher.apply_keystream(&mut buf[pt_start..pt_end]);
 
-    let mut mac = HmacSha1::new_from_slice(&mac_key_bytes).expect("hmac key size");
+    let mut mac = HmacSha1::new_from_slice(&keys.mac).expect("hmac key size");
     mac.update(&buf[pt_start..pt_end]);
     let tag = mac.finalize().into_bytes();
     buf[pt_end..pt_end + MAC_LEN].copy_from_slice(&tag[..MAC_LEN]);
 
     Ok(())
+}
+
+/// PBKDF2-derived material for a given (password, salt) pair.
+struct AesKeys {
+    enc: [u8; KEY_LEN],
+    mac: [u8; MAC_KEY_LEN],
+    verify: [u8; VERIFY_LEN],
+}
+
+fn derive_keys(password: &str, salt: &[u8; SALT_LEN]) -> AesKeys {
+    let mut derived = [0u8; KEY_LEN + MAC_KEY_LEN + VERIFY_LEN];
+    pbkdf2_hmac::<Sha1>(password.as_bytes(), salt, 1000, &mut derived);
+    AesKeys {
+        enc: derived[..KEY_LEN].try_into().unwrap(),
+        mac: derived[KEY_LEN..KEY_LEN + MAC_KEY_LEN].try_into().unwrap(),
+        verify: derived[KEY_LEN + MAC_KEY_LEN..].try_into().unwrap(),
+    }
+}
+
+fn ctr_cipher(enc_key: &[u8; KEY_LEN]) -> Aes256Ctr {
+    // WinZIP AES: 128-bit LE counter starting at 1. IV = [1, 0, 0, ...]
+    // so the first plaintext block is encrypted with counter=1 directly.
+    let mut iv = [0u8; 16];
+    iv[0] = 1;
+    Aes256Ctr::new(enc_key.into(), (&iv).into())
+}
+
+/// Constant-time byte-slice equality.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Streaming AES-256 AE-2 decrypt.
+///
+/// Reads from `src` in order:
+///   1. `SALT_LEN` bytes of salt,
+///   2. `VERIFY_LEN` bytes of password verifier,
+///   3. `ciphertext_len` bytes of ciphertext,
+///   4. `MAC_LEN` bytes of HMAC-SHA1 tag.
+///
+/// On a wrong password the verifier mismatches and we fail *before* any
+/// plaintext is written to `dst`. On MAC mismatch we fail *after* the
+/// stream is through — the caller must treat any bytes already written to
+/// `dst` as untrusted and discard them.
+pub fn decrypt_ae2<R: Read, W: Write>(
+    password: &str,
+    src: &mut R,
+    ciphertext_len: u64,
+    dst: &mut W,
+) -> Result<u64> {
+    if password.is_empty() {
+        bail!("empty password");
+    }
+    let mut salt = [0u8; SALT_LEN];
+    src.read_exact(&mut salt).context("read AES salt")?;
+    let mut got_verify = [0u8; VERIFY_LEN];
+    src.read_exact(&mut got_verify).context("read AES verifier")?;
+
+    let keys = derive_keys(password, &salt);
+    if !ct_eq(&got_verify, &keys.verify) {
+        bail!("wrong password (AES-256 verifier mismatch)");
+    }
+
+    let mut cipher = ctr_cipher(&keys.enc);
+    let mut mac = HmacSha1::new_from_slice(&keys.mac).expect("hmac key size");
+
+    let mut remaining = ciphertext_len;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut written = 0u64;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        src.read_exact(&mut buf[..want])
+            .context("read AES ciphertext")?;
+        mac.update(&buf[..want]);
+        cipher.apply_keystream(&mut buf[..want]);
+        dst.write_all(&buf[..want]).context("write plaintext")?;
+        written += want as u64;
+        remaining -= want as u64;
+    }
+
+    let mut got_mac = [0u8; MAC_LEN];
+    src.read_exact(&mut got_mac).context("read AES MAC")?;
+    let want_mac = mac.finalize().into_bytes();
+    if !ct_eq(&got_mac, &want_mac[..MAC_LEN]) {
+        bail!("AES-256 HMAC mismatch — archive is tampered or corrupted");
+    }
+    Ok(written)
 }
 
 /// Legacy wrapper for tests that operate on standalone `Vec` inputs.

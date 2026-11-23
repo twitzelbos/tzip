@@ -63,8 +63,8 @@ fn raw_block_sorted_is_byte_identical() {
     let def = d.join("default.zip");
     let raw = d.join("raw.zip");
     let src_s = src.to_str().unwrap();
-    run(&["--sort", "-q", def.to_str().unwrap(), src_s]);
-    run(&["--sort", "-q", "--raw-block=true", raw.to_str().unwrap(), src_s]);
+    run(&["create", "--sort", "-q", def.to_str().unwrap(), src_s]);
+    run(&["create", "--sort", "-q", "--raw-block=true", raw.to_str().unwrap(), src_s]);
 
     let a = fs::read(&def).unwrap();
     let b = fs::read(&raw).unwrap();
@@ -84,8 +84,8 @@ fn raw_block_default_order_same_contents() {
     let def = d.join("default.zip");
     let raw = d.join("raw.zip");
     let src_s = src.to_str().unwrap();
-    run(&["-q", def.to_str().unwrap(), src_s]);
-    run(&["-q", "--raw-block=true", raw.to_str().unwrap(), src_s]);
+    run(&["create", "-q", def.to_str().unwrap(), src_s]);
+    run(&["create", "-q", "--raw-block=true", raw.to_str().unwrap(), src_s]);
 
     // Same total archive size is a cheap, strong signal that the same bytes
     // were compressed (deflate is deterministic per input).
@@ -106,8 +106,9 @@ fn io_uring_sorted_is_byte_identical() {
     let def = d.join("default.zip");
     let uring = d.join("uring.zip");
     let src_s = src.to_str().unwrap();
-    run(&["--sort", "-q", def.to_str().unwrap(), src_s]);
+    run(&["create", "--sort", "-q", def.to_str().unwrap(), src_s]);
     run(&[
+        "create",
         "--sort",
         "-q",
         "--raw-block=true",

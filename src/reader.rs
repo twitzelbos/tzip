@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::cli::{ReaderOp, ReaderOptions};
 use crate::crypto::{self, AE2_OVERHEAD};
 use crate::decompress::{self, ReadMethod};
+use crate::zipcrypto::{ZipCryptoReader, ZIPCRYPTO_HEADER_LEN};
+use crate::zipwriter::METHOD_AES;
 use crate::sources::{http::HttpSource, s3::S3Source};
 use crate::zipreader::{Archive, ReadEntry};
 
@@ -67,25 +69,56 @@ pub(crate) fn stream_entry_to<W: Write>(
     if re.encrypted {
         let password = password.ok_or_else(|| {
             anyhow!(
-                "entry {} is AES-encrypted — pass --password / -p (or - to prompt)",
+                "entry {} is encrypted — pass --password / -p (or - to prompt)",
                 re.name
             )
         })?;
-        let ciphertext_len = re
-            .comp_size
-            .checked_sub(AE2_OVERHEAD as u64)
-            .ok_or_else(|| anyhow!("entry {} too small to be AE-2", re.name))?;
-        let mut plaintext: Vec<u8> = Vec::with_capacity(re.uncomp_size.min(64 * 1024 * 1024) as usize);
-        crypto::decrypt_ae2(password, source, ciphertext_len, &mut plaintext)?;
-        decompress::decompress(
-            inner_method,
-            std::io::Cursor::new(&plaintext),
-            re.uncomp_size,
-            dst,
-        )
+        if re.method_on_wire == METHOD_AES {
+            // WinZip AES-256 AE-2.
+            let ciphertext_len = re
+                .comp_size
+                .checked_sub(AE2_OVERHEAD as u64)
+                .ok_or_else(|| anyhow!("entry {} too small to be AE-2", re.name))?;
+            let mut plaintext: Vec<u8> =
+                Vec::with_capacity(re.uncomp_size.min(64 * 1024 * 1024) as usize);
+            crypto::decrypt_ae2(password, source, ciphertext_len, &mut plaintext)?;
+            decompress::decompress(
+                inner_method,
+                std::io::Cursor::new(&plaintext),
+                re.uncomp_size,
+                dst,
+            )
+        } else {
+            // Traditional PKZIP encryption (ZipCrypto). The 12-byte
+            // encryption header is baked into the comp_size, so after
+            // ZipCryptoReader consumes it the decompressor sees
+            // comp_size - 12 bytes of plaintext.
+            let verify_byte = zipcrypto_verify_byte(re);
+            let bounded = source.take(re.comp_size);
+            let decrypted = ZipCryptoReader::new(bounded, password.as_bytes(), verify_byte)
+                .with_context(|| format!("decrypt ZipCrypto entry {}", re.name))?;
+            // Hand decompress the ciphertext_len bytes of plaintext —
+            // bounded reader already enforces the limit.
+            let _ = ZIPCRYPTO_HEADER_LEN; // kept for documentation; not needed at the call site
+            decompress::decompress(inner_method, decrypted, re.uncomp_size, dst)
+        }
     } else {
         let bounded = source.take(re.comp_size);
         decompress::decompress(inner_method, bounded, re.uncomp_size, dst)
+    }
+}
+
+/// The verify byte ZipCrypto compares against the last plaintext byte
+/// of the 12-byte encryption header. When the entry uses a streaming
+/// data descriptor (GP bit 3) the CRC isn't known at header time, so
+/// the spec substitutes the high byte of the DOS time field.
+fn zipcrypto_verify_byte(re: &ReadEntry) -> u8 {
+    const GP_BIT_STREAMING_DATA_DESCRIPTOR: u16 = 1 << 3;
+    if re.gp_flags & GP_BIT_STREAMING_DATA_DESCRIPTOR != 0 {
+        // (date, time) tuple: time is the second field.
+        ((re.mtime.1 >> 8) & 0xff) as u8
+    } else {
+        ((re.crc32 >> 24) & 0xff) as u8
     }
 }
 

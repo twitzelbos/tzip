@@ -63,13 +63,27 @@ mkdir -p "$BUNDLE_DIR/Contents/Frameworks"
 
 cp "$SWIFT_DYLIB" "$BUNDLE_DIR/Contents/MacOS/TzipFSExtension"
 
-# TODO (future PR): emit the Rust-side cdylib (`libtzip_fskit_abi.dylib`)
-# alongside and add it to the bundle's Frameworks directory. Right now
-# the tzip binary doesn't expose a cdylib target — refactoring to a
-# workspace with a dedicated `tzip-fskit-abi` crate is the follow-up.
-# Without this dylib, the Swift extension can't actually load (undefined
-# `tzip_*` symbols at runtime). The scaffolding compiles; the mount
-# runtime does not yet work end-to-end.
+# Ship the Rust cdylib exporting the `tzip_*` ABI symbols alongside the
+# Swift binary. The Swift dylib was linked with `-undefined dynamic_lookup`
+# (see `macos-fskit/Package.swift`); at bundle-load time the loader
+# finds these symbols in the dylib dropped next to it here.
+RUST_DYLIB="target/$PROFILE/libtzip.dylib"
+if [[ ! -f "$RUST_DYLIB" ]]; then
+  echo "error: expected Rust cdylib at $RUST_DYLIB; did `cargo build --features fskit` run?" >&2
+  exit 1
+fi
+cp "$RUST_DYLIB" "$BUNDLE_DIR/Contents/Frameworks/libtzip.dylib"
+
+# Point the Swift binary at the dylib via its rpath so dyld finds the
+# `tzip_*` symbols. `@loader_path/../Frameworks` is the standard macOS
+# bundle layout convention.
+install_name_tool -add_rpath "@loader_path/../Frameworks" \
+    "$BUNDLE_DIR/Contents/MacOS/TzipFSExtension" 2>/dev/null || true
+
+# And fix the dylib's own install name so it's referenced as a bundle-
+# relative path (not an absolute target/release/... path from build time).
+install_name_tool -id "@rpath/libtzip.dylib" \
+    "$BUNDLE_DIR/Contents/Frameworks/libtzip.dylib"
 
 cp macos-fskit/Sources/Resources/Info.plist "$BUNDLE_DIR/Contents/Info.plist"
 
@@ -80,9 +94,7 @@ codesign --force --sign - "$BUNDLE_DIR"
 echo ""
 echo "Bundle: $BUNDLE_DIR"
 echo ""
-echo "Status: SCAFFOLDING. The Swift extension dylib links with"
-echo "dynamic_lookup for its tzip_* symbols; the Rust-side cdylib that"
-echo "resolves them is NOT bundled yet (pending workspace refactor)."
-echo "Mount runtime will fail with \"symbol not found\" until that PR"
-echo "lands. The Swift module + Keychain wrapper + ABI are proven to"
-echo "compile against the real FSKit SDK."
+echo "Status: Swift extension dylib + Rust cdylib are both in the bundle;"
+echo "tzip_* symbol resolution should work at load time. Install the"
+echo "bundle with \`tzip mount --install\` (PR #12) then mount via"
+echo "\`tzip mount <archive> <mountpoint>\` (PR #13)."

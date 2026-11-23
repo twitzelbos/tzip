@@ -6,6 +6,19 @@ authors = ["Thomas Witzel <thomas@q.bio>"]
 description = "The best zip tool ever — parallel, hardware-AES-256, DEFLATE via libdeflater"
 license = "BSD-3-Clause"
 
+[lib]
+name = "tzip"
+path = "src/lib.rs"
+# `cdylib` so `libtzip.dylib` ships with the macOS FSKit extension bundle
+# (its Swift module links against the tzip_* ABI symbols at load time).
+# `rlib` so the binary target can keep using it as a normal Rust library.
+crate-type = ["rlib", "cdylib"]
+# Doc tests are off: the crate has no real doctests, and several modules
+# have `///` comments with ASCII diagrams / pseudo-code that cargo
+# otherwise tries to compile as Rust (ZIP wire-format diagrams in
+# zipwriter.rs, LZMA layout in decompress.rs, state transitions, ...).
+doctest = false
+
 [[bin]]
 name = "tzip"
 path = "src/main.rs"

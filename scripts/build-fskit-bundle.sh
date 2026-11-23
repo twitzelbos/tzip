@@ -91,6 +91,22 @@ echo "==> Ad-hoc code signing"
 codesign --force --sign - "$BUNDLE_DIR/Contents/MacOS/TzipFSExtension"
 codesign --force --sign - "$BUNDLE_DIR"
 
+# The tzip binary itself must be signed with the
+# `com.apple.developer.system-extension.install` entitlement so
+# `OSSystemExtensionManager` accepts `tzip mount --install` requests
+# at all. Ad-hoc signing with an entitlements plist is sufficient on a
+# machine that has either (a) `systemextensionsctl developer on` set,
+# or (b) a Developer ID; without either, macOS refuses the activation
+# with "operation not permitted."
+TZIP_BIN="target/$PROFILE/tzip"
+if [[ -f "$TZIP_BIN" ]]; then
+  echo "==> Signing tzip binary with SystemExtensions entitlement"
+  codesign --force --sign - \
+    --entitlements scripts/tzip.entitlements \
+    --options runtime \
+    "$TZIP_BIN"
+fi
+
 echo ""
 echo "Bundle: $BUNDLE_DIR"
 echo ""

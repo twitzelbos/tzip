@@ -43,10 +43,10 @@ pub struct S3Source {
     cache: Vec<u8>,
 }
 
-struct Credentials {
-    access_key: String,
-    secret_key: String,
-    session_token: Option<String>,
+pub(crate) struct Credentials {
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+    pub(crate) session_token: Option<String>,
 }
 
 impl S3Source {
@@ -236,7 +236,7 @@ fn split_bucket_key(spec: &str) -> Result<(String, String)> {
     Ok((bucket.to_string(), key.to_string()))
 }
 
-fn resolve_credentials() -> Result<Credentials> {
+pub(crate) fn resolve_credentials() -> Result<Credentials> {
     if let (Ok(ak), Ok(sk)) = (
         std::env::var("AWS_ACCESS_KEY_ID"),
         std::env::var("AWS_SECRET_ACCESS_KEY"),
@@ -269,7 +269,7 @@ fn resolve_credentials() -> Result<Credentials> {
     );
 }
 
-fn resolve_region() -> String {
+pub(crate) fn resolve_region() -> String {
     if let Ok(r) = std::env::var("AWS_REGION") {
         return r;
     }
@@ -298,7 +298,7 @@ fn resolve_region() -> String {
 /// `Some("/<bucket>")` when the endpoint uses path-style addressing
 /// (MinIO / LocalStack via `AWS_ENDPOINT_URL`), and `None` for the
 /// virtual-hosted-style default that real AWS uses.
-fn resolve_endpoint(bucket: &str, region: &str) -> Result<(String, String, Option<String>)> {
+pub(crate) fn resolve_endpoint(bucket: &str, region: &str) -> Result<(String, String, Option<String>)> {
     if let Ok(ep) = std::env::var("AWS_ENDPOINT_URL") {
         let (scheme, rest) = if let Some(rest) = ep.strip_prefix("http://") {
             ("http".to_string(), rest.to_string())
@@ -341,6 +341,11 @@ fn load_aws_ini(name: &str) -> Option<HashMap<String, HashMap<String, String>>> 
         }
     }
     Some(out)
+}
+
+/// Pub wrapper so sibling modules (s3_list) can share one notion of "now".
+pub(crate) fn utc_now_pub() -> (u16, u8, u8, u8, u8, u8) {
+    utc_now()
 }
 
 fn utc_now() -> (u16, u8, u8, u8, u8, u8) {

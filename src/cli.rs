@@ -73,6 +73,14 @@ pub enum Cmd {
     /// Extract one or more entries (or the whole archive).
     #[command(alias = "extract")]
     X(ExtractArgs),
+
+    /// Search for a regex pattern across many archives in parallel.
+    /// Works against local paths, http(s):// URLs, or s3://bucket/key
+    /// URLs. S3 bucket-globbing (`s3://bucket/prefix/*.zip`) is
+    /// expanded via ListObjectsV2. See `tzip grep --help` for all
+    /// fan-out, filter, and checkpoint flags.
+    #[command(alias = "g")]
+    Grep(GrepArgs),
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -279,6 +287,101 @@ pub struct CatArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct GrepArgs {
+    /// Regex pattern. Syntax is the `regex` crate's — same engine
+    /// ripgrep uses. For advanced features (PCRE2, context lines,
+    /// colored output), pipe through `--exec rg` instead.
+    pub pattern: String,
+
+    /// One or more archives. Local paths, `http(s)://` URLs, or
+    /// `s3://bucket/key.zip` URLs. S3 URLs may contain `*` / `?`
+    /// wildcards in the key portion (expanded via ListObjectsV2).
+    /// Local file globs are handled by your shell.
+    #[arg(required = true)]
+    pub archives: Vec<String>,
+
+    /// Concurrent archives in flight.
+    #[arg(short = 'P', long, default_value_t = 32)]
+    pub parallel: usize,
+
+    /// Concurrent entries scanned within one archive.
+    #[arg(long, default_value_t = 8)]
+    pub inner_jobs: usize,
+
+    /// Cap on the shared HTTP(S) / S3 connection pool. Default =
+    /// parallel × inner_jobs, capped at 256.
+    #[arg(long)]
+    pub connections: Option<usize>,
+
+    /// Only scan entries matching this glob (repeatable). Applied at
+    /// the CDR so skipped entries never trigger a body fetch.
+    #[arg(long)]
+    pub include: Vec<String>,
+
+    /// Skip entries matching this glob (repeatable). Also applied at
+    /// the CDR.
+    #[arg(long)]
+    pub exclude: Vec<String>,
+
+    /// Skip entries smaller than this (bytes).
+    #[arg(long)]
+    pub min_size: Option<u64>,
+
+    /// Skip entries larger than this (bytes).
+    #[arg(long)]
+    pub max_size: Option<u64>,
+
+    /// Skip entries modified before this ISO date (YYYY-MM-DD).
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub since: Option<String>,
+
+    /// Skip entries modified after this ISO date (YYYY-MM-DD).
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub until: Option<String>,
+
+    /// Case-insensitive match.
+    #[arg(short = 'i', long)]
+    pub ignore_case: bool,
+
+    /// Only emit `archive:entry` for entries with any match.
+    #[arg(long)]
+    pub files_only: bool,
+
+    /// Emit matches as JSON lines instead of grep-style output.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Instead of matching in-process, write each candidate entry to
+    /// a tempfile and run CMD with `{}` replaced by the path.
+    /// Example: `--exec 'rg -C 3 --json {}'`.
+    #[arg(long, value_name = "CMD")]
+    pub exec: Option<String>,
+
+    /// Append per-entry completion records to this JSONL file.
+    #[arg(long, value_name = "FILE")]
+    pub checkpoint: Option<PathBuf>,
+
+    /// Resume a previous run: skip (archive, entry) pairs already in
+    /// the checkpoint. Refuses to resume if the invocation's
+    /// pattern or archive set differs from the checkpoint's header.
+    #[arg(long, requires = "checkpoint")]
+    pub resume: bool,
+
+    /// Password for AES-encrypted entries.
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+
+    #[arg(long, conflicts_with = "password")]
+    pub password_file: Option<PathBuf>,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct ExtractArgs {
     /// Archive. Accepts a local file path, an `http(s)://` URL, or an
     /// `s3://bucket/key` URL.
@@ -354,6 +457,33 @@ pub enum ReaderOp {
     Ls,
     Cat { name: String },
     Extract { to: PathBuf, names: Vec<String> },
+}
+
+#[derive(Clone, Debug)]
+pub struct GrepOptions {
+    pub pattern: String,
+    pub archives: Vec<String>,
+    pub parallel: usize,
+    pub inner_jobs: usize,
+    pub connections: Option<usize>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    /// DOS-converted (date, time) values parsed from `--since` / `--until`.
+    /// Unix timestamps (seconds) are the user-facing semantic; we store
+    /// them for the per-entry mtime filter.
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub ignore_case: bool,
+    pub files_only: bool,
+    pub json: bool,
+    pub exec: Option<String>,
+    pub checkpoint: Option<PathBuf>,
+    pub resume: bool,
+    pub password: Option<String>,
+    pub quiet: bool,
+    pub verbose: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -529,6 +659,66 @@ impl CatArgs {
             op: ReaderOp::Cat { name: self.name },
         })
     }
+}
+
+impl GrepArgs {
+    pub fn into_options(self) -> Result<GrepOptions> {
+        let password = resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
+        let since = parse_iso_date(self.since.as_deref(), "--since")?;
+        let until = parse_iso_date(self.until.as_deref(), "--until")?;
+        Ok(GrepOptions {
+            pattern: self.pattern,
+            archives: self.archives,
+            parallel: self.parallel.max(1),
+            inner_jobs: self.inner_jobs.max(1),
+            connections: self.connections,
+            include: self.include,
+            exclude: self.exclude,
+            min_size: self.min_size,
+            max_size: self.max_size,
+            since,
+            until,
+            ignore_case: self.ignore_case,
+            files_only: self.files_only,
+            json: self.json,
+            exec: self.exec,
+            checkpoint: self.checkpoint,
+            resume: self.resume,
+            password,
+            quiet: self.quiet,
+            verbose: self.verbose,
+        })
+    }
+}
+
+/// Parse `YYYY-MM-DD` to a Unix timestamp at UTC midnight.
+fn parse_iso_date(raw: Option<&str>, flag: &str) -> Result<Option<i64>> {
+    let Some(s) = raw else { return Ok(None) };
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        bail!("{} expects YYYY-MM-DD, got {:?}", flag, s);
+    }
+    let y: i64 = parts[0].parse().with_context(|| format!("{}: bad year", flag))?;
+    let m: u32 = parts[1].parse().with_context(|| format!("{}: bad month", flag))?;
+    let d: u32 = parts[2].parse().with_context(|| format!("{}: bad day", flag))?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || y < 1970 {
+        bail!("{}: out-of-range date {:?}", flag, s);
+    }
+    Ok(Some(civil_to_unix(y, m, d)))
+}
+
+/// Howard Hinnant's days_from_civil, returning a Unix timestamp at
+/// UTC midnight on (y, m, d).
+fn civil_to_unix(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m = m as u64;
+    let d = d as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe as i64 - 719_468;
+    days * 86_400
 }
 
 impl ExtractArgs {

@@ -19,17 +19,71 @@ use crate::zipreader::{Archive, ReadEntry};
 /// Dispatches on scheme: `s3://…` → `S3Source`, `http(s)://…` → `HttpSource`,
 /// anything else → local file path. Called by every reader subcommand so
 /// local and remote behave identically downstream of this seam.
-fn open_archive(spec: &str) -> Result<Archive> {
+pub(crate) fn open_archive(spec: &str) -> Result<Archive> {
+    let src = open_source_for(spec)?;
+    Archive::open_source(src)
+}
+
+/// Open a raw `Read + Seek + Send` backing source for `spec` without
+/// parsing the archive. Used by `tzip grep`'s inner workers so each
+/// worker holds its own independent source (connection) against the
+/// same archive — avoids contention on one shared fd / connection.
+pub(crate) fn open_source_for(spec: &str) -> Result<Box<dyn crate::sources::ReadSeek>> {
     if let Some(rest) = spec.strip_prefix("s3://") {
         let src = S3Source::open(rest)
             .with_context(|| format!("open S3 source s3://{}", rest))?;
-        Archive::open_source(Box::new(src))
+        Ok(Box::new(src))
     } else if spec.starts_with("http://") || spec.starts_with("https://") {
         let src = HttpSource::open(spec)
             .with_context(|| format!("open HTTP source {}", spec))?;
-        Archive::open_source(Box::new(src))
+        Ok(Box::new(src))
     } else {
-        Archive::open(Path::new(spec))
+        let file = std::fs::File::open(Path::new(spec))
+            .with_context(|| format!("open {}", spec))?;
+        Ok(Box::new(file))
+    }
+}
+
+/// Stream one entry's body (decrypted if needed, decompressed) from an
+/// already-open `ReadSeek` source to `dst`. Used by both `tzip cat`/`x`
+/// and `tzip grep`'s inner workers. `re.lfh_total_size` must already be
+/// populated.
+pub(crate) fn stream_entry_to<W: Write>(
+    source: &mut dyn crate::sources::ReadSeek,
+    re: &ReadEntry,
+    password: Option<&str>,
+    dst: &mut W,
+) -> Result<u64> {
+    let body_offset = re.lfh_offset + re.lfh_total_size as u64;
+    source
+        .seek(SeekFrom::Start(body_offset))
+        .with_context(|| format!("seek to body of {}", re.name))?;
+
+    let inner_method = method_from_id(re.inner_method)
+        .ok_or_else(|| anyhow!("unsupported compression method {} on {}", re.inner_method, re.name))?;
+
+    if re.encrypted {
+        let password = password.ok_or_else(|| {
+            anyhow!(
+                "entry {} is AES-encrypted — pass --password / -p (or - to prompt)",
+                re.name
+            )
+        })?;
+        let ciphertext_len = re
+            .comp_size
+            .checked_sub(AE2_OVERHEAD as u64)
+            .ok_or_else(|| anyhow!("entry {} too small to be AE-2", re.name))?;
+        let mut plaintext: Vec<u8> = Vec::with_capacity(re.uncomp_size.min(64 * 1024 * 1024) as usize);
+        crypto::decrypt_ae2(password, source, ciphertext_len, &mut plaintext)?;
+        decompress::decompress(
+            inner_method,
+            std::io::Cursor::new(&plaintext),
+            re.uncomp_size,
+            dst,
+        )
+    } else {
+        let bounded = source.take(re.comp_size);
+        decompress::decompress(inner_method, bounded, re.uncomp_size, dst)
     }
 }
 
@@ -206,52 +260,7 @@ fn stream_entry<W: Write>(
     password: Option<&str>,
     dst: &mut W,
 ) -> Result<u64> {
-    let body_offset = re.lfh_offset + re.lfh_total_size as u64;
-    arch.source_mut()
-        .seek(SeekFrom::Start(body_offset))
-        .with_context(|| format!("seek to body of {}", re.name))?;
-
-    let inner_method = method_from_id(re.inner_method)
-        .ok_or_else(|| anyhow!("unsupported compression method {} on {}", re.inner_method, re.name))?;
-
-    if re.encrypted {
-        let password = password.ok_or_else(|| {
-            anyhow!(
-                "entry {} is AES-encrypted — pass --password / -p (or - to prompt)",
-                re.name
-            )
-        })?;
-        let ciphertext_len = re
-            .comp_size
-            .checked_sub(AE2_OVERHEAD as u64)
-            .ok_or_else(|| anyhow!("entry {} too small to be AE-2", re.name))?;
-
-        // Decrypt into a buffered pipe, then decompress out of that pipe.
-        // We pass the plaintext through an in-memory Vec for simplicity;
-        // for multi-GB entries this is still bounded by the 64 KiB working
-        // buffer inside `decrypt_ae2` + a single whole-plaintext allocation.
-        // A future optimization: wire crypto::decrypt_ae2 as a Read adapter
-        // instead of materializing the plaintext.
-        let mut plaintext: Vec<u8> = Vec::with_capacity(re.uncomp_size.min(64 * 1024 * 1024) as usize);
-        crypto::decrypt_ae2(password, arch.source_mut(), ciphertext_len, &mut plaintext)?;
-
-        let written = decompress::decompress(
-            inner_method,
-            std::io::Cursor::new(&plaintext),
-            re.uncomp_size,
-            dst,
-        )?;
-        Ok(written)
-    } else {
-        // Non-encrypted: feed the archive body directly through decompress,
-        // bounded to `re.comp_size` so a corrupt entry can't drag in bytes
-        // from the next entry. `(&mut *source).take(n)` wraps the source
-        // without needing to clone it — works for Box<dyn ReadSeek> where
-        // `try_clone` isn't available.
-        let bounded = arch.source_mut().take(re.comp_size);
-        let written = decompress::decompress(inner_method, bounded, re.uncomp_size, dst)?;
-        Ok(written)
-    }
+    stream_entry_to(arch.source_mut(), re, password, dst)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────

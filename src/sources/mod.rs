@@ -9,6 +9,7 @@
 
 pub mod http;
 pub mod s3;
+pub mod s3_list;
 pub mod sigv4;
 
 /// The combined `Read + Seek + Send` trait our archive sources expose. All

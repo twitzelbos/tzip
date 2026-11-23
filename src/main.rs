@@ -5,6 +5,7 @@ mod cli;
 mod compress;
 mod crypto;
 mod decompress;
+mod grep;
 mod pipeline;
 mod platform;
 mod progress;
@@ -58,6 +59,7 @@ fn main() -> Result<()> {
         cli::Cmd::Ls(args) => reader::run_ls(args.into_options()?),
         cli::Cmd::Cat(args) => reader::run_cat(args.into_options()?),
         cli::Cmd::X(args) => reader::run_extract(args.into_options()?),
+        cli::Cmd::Grep(args) => grep::run(args.into_options()?),
     }
 }
 

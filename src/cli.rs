@@ -85,6 +85,13 @@ pub enum Cmd {
     /// Mount an archive as a read-only filesystem. Linux FUSE3 ships
     /// in this release; macOS FSKit support is a planned follow-up PR.
     Mount(MountArgs),
+
+    /// List entries across one or more archives matching CDR-side
+    /// filters (name glob, size, mtime). Body-free — never fetches
+    /// entry contents, so it's essentially free on remote archives.
+    /// Same `-P` fan-out + S3 bucket globbing as `tzip grep`.
+    #[command(alias = "f")]
+    Find(FindArgs),
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -286,6 +293,49 @@ pub struct CatArgs {
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct FindArgs {
+    /// One or more archives. Local paths, `http(s)://` URLs, or
+    /// `s3://bucket/key.zip` URLs. S3 URLs may contain `*` / `?`
+    /// wildcards in the key portion (expanded via ListObjectsV2).
+    #[arg(required = true)]
+    pub archives: Vec<String>,
+
+    #[arg(short = 'P', long, default_value_t = 32)]
+    pub parallel: usize,
+
+    /// Only list entries matching this glob (repeatable).
+    #[arg(long)]
+    pub include: Vec<String>,
+
+    /// Skip entries matching this glob (repeatable).
+    #[arg(long)]
+    pub exclude: Vec<String>,
+
+    #[arg(long)]
+    pub min_size: Option<u64>,
+    #[arg(long)]
+    pub max_size: Option<u64>,
+
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub since: Option<String>,
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub until: Option<String>,
+
+    /// Emit one entry name per line, no other fields.
+    #[arg(long)]
+    pub names_only: bool,
+
+    /// Emit entries as JSON lines instead of the default tabular format.
+    #[arg(long, conflicts_with = "names_only")]
+    pub json: bool,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
     #[arg(short = 'v', long)]
     pub verbose: bool,
 }
@@ -538,6 +588,22 @@ pub struct GrepOptions {
 }
 
 #[derive(Clone, Debug)]
+pub struct FindOptions {
+    pub archives: Vec<String>,
+    pub parallel: usize,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub names_only: bool,
+    pub json: bool,
+    pub quiet: bool,
+    pub verbose: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct ReaderOptions {
     /// Local path, `http(s)://` URL, or `s3://bucket/key` URL.
     pub archive: String,
@@ -708,6 +774,27 @@ impl CatArgs {
             quiet: self.quiet,
             verbose: self.verbose,
             op: ReaderOp::Cat { name: self.name },
+        })
+    }
+}
+
+impl FindArgs {
+    pub fn into_options(self) -> Result<FindOptions> {
+        let since = parse_iso_date(self.since.as_deref(), "--since")?;
+        let until = parse_iso_date(self.until.as_deref(), "--until")?;
+        Ok(FindOptions {
+            archives: self.archives,
+            parallel: self.parallel.max(1),
+            include: self.include,
+            exclude: self.exclude,
+            min_size: self.min_size,
+            max_size: self.max_size,
+            since,
+            until,
+            names_only: self.names_only,
+            json: self.json,
+            quiet: self.quiet,
+            verbose: self.verbose,
         })
     }
 }

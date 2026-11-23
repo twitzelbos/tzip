@@ -592,9 +592,18 @@ are still handled by your shell.
 
 ### Known limits
 
-- **Per-entry memory**: each entry is decompressed to a `Vec<u8>` in
-  full for scanning. A 10 GB log inside a ZIP needs 10 GB of RAM.
-  Streaming line-at-a-time is a planned follow-up.
+- **Per-entry memory is bounded by the longest line.** The scanner is
+  streaming: decompressed output is scanned chunk-by-chunk, only the
+  trailing partial line stays in memory. A 10 GB log of normal-length
+  lines costs well under a megabyte in the scanner. `--exec` tees
+  decompress output straight to a tempfile as it comes out, so the
+  external-command path is also bounded now. (AES-encrypted entries
+  still materialise the plaintext at the AES layer before decompress —
+  see the AES comment below.)
+- **AES entries materialise plaintext**: AES-256 AE-2 decryption
+  verifies HMAC over the whole ciphertext, so the plaintext must be
+  held in memory at the AES layer. The scanner is still streaming on
+  top, so you save the uncompressed body but not the compressed one.
 - **`--exec` process spawn overhead** (~1-10 ms per spawn on Linux,
   ~5-20 ms on macOS). Fine for typical workloads; defer to the
   built-in matcher if you have many small matched entries per

@@ -36,7 +36,12 @@ jobs:
       # always has the required extensions.
       - name: Set safe RUSTFLAGS (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: echo "CARGO_BUILD_RUSTFLAGS=-C target-cpu=x86-64-v3" >> "$GITHUB_ENV"
+        # `RUSTFLAGS` (not `CARGO_BUILD_RUSTFLAGS`) is required: cargo's
+        # precedence is RUSTFLAGS > [target.<triple>.rustflags] >
+        # [build.rustflags] > CARGO_BUILD_RUSTFLAGS, so CARGO_BUILD_RUSTFLAGS
+        # alone is still overridden by our .cargo/config.toml's
+        # `[target.'cfg(target_arch = "x86_64")'].rustflags`.
+        run: echo "RUSTFLAGS=-C target-cpu=x86-64-v3" >> "$GITHUB_ENV"
 
       # The roundtrip tests shell out to `7z` to verify bzip2 / lzma / xz /
       # zstd / .7z extraction. They skip gracefully if it isn't installed,

@@ -243,14 +243,17 @@ impl Drop for HttpServerGuard {
 }
 
 fn serve_file(path: PathBuf) -> HttpServerGuard {
+    // See the matching comment in tests/grep.rs::serve_files — bind the
+    // TcpListener once and hand it to tiny_http instead of dropping +
+    // rebinding (racy on macOS and under CI load on Linux).
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap();
-    drop(listener);
     let body = fs::read(&path).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
     let join = thread::spawn(move || {
-        let server = tiny_http::Server::http(addr).expect("tiny_http");
+        let server = tiny_http::Server::from_listener(listener, None)
+            .expect("tiny_http from_listener");
         loop {
             if stop2.load(Ordering::SeqCst) {
                 break;

@@ -40,6 +40,10 @@ pub struct ReadEntry {
     /// Equal to `method_on_wire` otherwise.
     pub inner_method: u16,
     pub gp_flags: u16,
+    /// "Version made by" — low byte is the ZIP version, high byte is the
+    /// originating host OS. Needed so `external_attr` can be interpreted:
+    /// `host_os == 3` (Unix) ⇒ high 16 bits of external_attr are Unix mode.
+    pub made_by: u16,
     pub version_needed: u16,
     pub crc32: u32,
     pub comp_size: u64,
@@ -47,15 +51,39 @@ pub struct ReadEntry {
     pub lfh_offset: u64,
     pub mtime: (u16, u16),
     pub encrypted: bool,
-    /// Parsed from the CDR but currently not threaded into the rewritten
-    /// CDR — the writer emits a fixed Unix mode (0o100644). Preserved here
-    /// for a future round-trip of external attributes.
-    #[allow(dead_code)]
+    /// External file attributes. On Unix-origin archives
+    /// (`host_os(made_by) == 3`), the high 16 bits are the Unix mode
+    /// (including type bits + rwx). On DOS-origin archives the low 8
+    /// bits carry DOS file attributes. See `unix_mode()`.
     pub external_attr: u32,
+    /// Per-entry comment (raw bytes, decoded from CP437 via `decode_name`
+    /// semantics — same encoding path as the entry name).
+    pub comment: String,
+    /// Raw comment bytes, preserved for round-trip into a rewritten CDR.
+    pub comment_bytes: Vec<u8>,
+    /// On a single-disk archive this is 0. On a multi-disk archive this
+    /// is the disk index the LFH + body live on; `lfh_offset` is
+    /// patched by `Archive::open` to be absolute in the concatenated
+    /// address space, so downstream readers don't need to re-apply this.
+    pub disk_number_start: u16,
     /// `30 + name_len + extra_len` for this entry's LFH. Zero until the
     /// first call to `Archive::lfh_total_size_of`, which reads the LFH header
     /// bytes to learn `extra_len` (not derivable from the CDR).
     pub lfh_total_size: u32,
+}
+
+impl ReadEntry {
+    /// Returns the Unix mode bits encoded in `external_attr` when the
+    /// archive was produced on a Unix host (version_made_by byte 1 == 3).
+    /// None for DOS-origin, Windows-origin, Mac-origin archives etc.
+    pub fn unix_mode(&self) -> Option<u32> {
+        let host_os = (self.made_by >> 8) & 0xff;
+        if host_os == 3 {
+            Some(self.external_attr >> 16)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct Archive {
@@ -68,19 +96,51 @@ pub struct Archive {
     /// append-mode crash recovery. Cached length only; bytes are read on
     /// demand via `tail_bytes()`.
     tail_size: u64,
+    /// Archive-level comment lifted from the EOCD trailer. Decoded as
+    /// CP437 (ZIP's default), which passes modern UTF-8 through unchanged.
+    archive_comment: String,
 }
 
 impl Archive {
-    /// Open a local-file archive. Thin wrapper around `open_source`.
+    /// Open a local-file archive. Detects multi-disk (spanned)
+    /// archives via the EOCD's `this_disk` field and transparently
+    /// stitches sibling `.z01`..`.z(N-1)` disks into one concatenated
+    /// source. The caller never needs to know how many disks there are.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)
+        // Peek the probe disk's EOCD once to decide single vs multi.
+        let mut probe = File::open(path)
             .with_context(|| format!("open {}", path.display()))?;
-        Self::open_source(Box::new(file))
-            .with_context(|| format!("parse {}", path.display()))
+        let probe_size = probe
+            .seek(SeekFrom::End(0))
+            .context("seek to end of archive probe")?;
+        if probe_size < EOCD_MIN_SIZE {
+            bail!("archive is too small to be a ZIP ({} bytes)", probe_size);
+        }
+        let (_eocd_pos, eocd) = find_eocd(&mut probe, probe_size)
+            .with_context(|| format!("find EOCD on {}", path.display()))?;
+        drop(probe);
+
+        if eocd.this_disk == 0 && eocd.cd_disk == 0 {
+            // Single-disk — standard path.
+            let file = File::open(path)
+                .with_context(|| format!("re-open {}", path.display()))?;
+            return Self::open_source(Box::new(file))
+                .with_context(|| format!("parse {}", path.display()));
+        }
+
+        // Multi-disk.
+        let total_disks = (eocd.this_disk as usize) + 1;
+        let md = crate::sources::multidisk::MultiDiskSource::open(path, total_disks)
+            .with_context(|| format!("open multi-disk archive {}", path.display()))?;
+        let disk_starts = md.disk_starts().to_vec();
+        Self::open_source_multidisk(Box::new(md), disk_starts)
+            .with_context(|| format!("parse multi-disk archive {}", path.display()))
     }
 
     /// Open an archive against any `Read + Seek + Send` source. HTTP, S3,
-    /// in-memory cursors — anything implementing `ReadSeek`.
+    /// in-memory cursors — anything implementing `ReadSeek`. The source
+    /// must be single-disk; multi-disk archives come through `open`
+    /// above (local-only, since sibling disks live on the filesystem).
     pub fn open_source(mut source: Box<dyn ReadSeek>) -> Result<Self> {
         let file_size = source
             .seek(SeekFrom::End(0))
@@ -90,6 +150,16 @@ impl Archive {
         }
 
         let (eocd_pos, eocd) = find_eocd(&mut *source, file_size).context("find EOCD")?;
+
+        if eocd.this_disk != 0 || eocd.cd_disk != 0 {
+            bail!(
+                "multi-disk archive (this_disk={}, cd_disk={}) opened through a \
+                 single-stream source — use Archive::open(path) with the last disk's \
+                 local file path so sibling disks can be stitched",
+                eocd.this_disk,
+                eocd.cd_disk,
+            );
+        }
 
         let (entry_count, cd_size, cd_offset) = if eocd.needs_zip64() {
             let z64 = find_eocd64(&mut *source, eocd_pos)
@@ -115,11 +185,117 @@ impl Archive {
         let entries = parse_central_directory(&cdr_bytes, entry_count)?;
 
         let tail_size = file_size - cd_offset;
-        Ok(Self { source, entries, file_size, cd_offset, cd_size, tail_size })
+        let archive_comment = decode_name(&eocd.comment_bytes, 0);
+        Ok(Self {
+            source,
+            entries,
+            file_size,
+            cd_offset,
+            cd_size,
+            tail_size,
+            archive_comment,
+        })
+    }
+
+    /// Open a multi-disk archive against the concatenated virtual source
+    /// built by `MultiDiskSource`. `disk_starts[d]` is the absolute
+    /// offset (in the concatenated stream) where disk `d` begins.
+    /// Each CDR entry's `(disk_number_start, lfh_offset)` pair is
+    /// transformed to an absolute `lfh_offset`; the EOCD's own
+    /// `cd_disk`/`cd_offset` pair likewise becomes an absolute CDR
+    /// position.
+    fn open_source_multidisk(
+        mut source: Box<dyn ReadSeek>,
+        disk_starts: Vec<u64>,
+    ) -> Result<Self> {
+        let file_size = source
+            .seek(SeekFrom::End(0))
+            .context("seek to end of concatenated multi-disk source")?;
+        if file_size < EOCD_MIN_SIZE {
+            bail!("archive is too small to be a ZIP ({} bytes)", file_size);
+        }
+        let (_eocd_pos, eocd) =
+            find_eocd(&mut *source, file_size).context("find EOCD across stitched disks")?;
+
+        // Multi-disk ZIP64 is extremely rare and would need its own
+        // EOCD64-locator search across the probe disk. Out of scope.
+        if eocd.needs_zip64() {
+            bail!(
+                "multi-disk ZIP64 archives are not supported (entry_count={} cd_size={} cd_offset={:#x})",
+                eocd.entry_count,
+                eocd.cd_size,
+                eocd.cd_offset
+            );
+        }
+
+        let cd_disk_idx = eocd.cd_disk as usize;
+        if cd_disk_idx >= disk_starts.len() {
+            bail!(
+                "EOCD says CDR starts on disk {} but archive has {} disks",
+                eocd.cd_disk,
+                disk_starts.len()
+            );
+        }
+        let cd_offset = disk_starts[cd_disk_idx]
+            .checked_add(eocd.cd_offset as u64)
+            .ok_or_else(|| anyhow!("CDR absolute offset overflow"))?;
+        let cd_size = eocd.cd_size as u64;
+        if cd_offset + cd_size > file_size {
+            bail!(
+                "central directory extends past end of multi-disk archive: \
+                 abs_offset={} size={} total={}",
+                cd_offset,
+                cd_size,
+                file_size
+            );
+        }
+
+        source
+            .seek(SeekFrom::Start(cd_offset))
+            .with_context(|| format!("seek to multi-disk CDR at absolute offset {}", cd_offset))?;
+        let mut cdr_bytes = vec![0u8; cd_size as usize];
+        source
+            .read_exact(&mut cdr_bytes)
+            .context("read central directory across stitched disks")?;
+        let mut entries = parse_central_directory(&cdr_bytes, eocd.entry_count as u64)?;
+
+        // Transform (disk, offset) pairs → absolute offsets.
+        for entry in &mut entries {
+            let d = entry.disk_number_start as usize;
+            if d >= disk_starts.len() {
+                bail!(
+                    "entry {:?} references disk {} but archive has {} disks",
+                    entry.name,
+                    entry.disk_number_start,
+                    disk_starts.len()
+                );
+            }
+            entry.lfh_offset = disk_starts[d]
+                .checked_add(entry.lfh_offset)
+                .ok_or_else(|| anyhow!("LFH absolute offset overflow for {:?}", entry.name))?;
+        }
+
+        let tail_size = file_size - cd_offset;
+        let archive_comment = decode_name(&eocd.comment_bytes, 0);
+        Ok(Self {
+            source,
+            entries,
+            file_size,
+            cd_offset,
+            cd_size,
+            tail_size,
+            archive_comment,
+        })
     }
 
     pub fn entries(&self) -> &[ReadEntry] {
         &self.entries
+    }
+
+    /// Archive-level comment from the EOCD trailer. Empty string if the
+    /// archive has no comment.
+    pub fn archive_comment(&self) -> &str {
+        &self.archive_comment
     }
 
     /// Mutable access to the underlying source so callers can seek + read
@@ -183,12 +359,28 @@ impl Archive {
     }
 }
 
+/// Cheap EOCD probe: given a seekable source and its total size,
+/// returns how many disks this archive spans (1 for single-disk).
+/// Used by `reader::open_source_for` so parallel-extract workers can
+/// open their own `MultiDiskSource` instances without re-parsing the
+/// whole CDR. Errors on malformed archives.
+pub fn probe_total_disks<S: Read + Seek + ?Sized>(file: &mut S, file_size: u64) -> Result<usize> {
+    if file_size < EOCD_MIN_SIZE {
+        bail!("archive is too small to be a ZIP ({} bytes)", file_size);
+    }
+    let (_, eocd) = find_eocd(file, file_size)?;
+    Ok((eocd.this_disk as usize) + 1)
+}
+
 // ── EOCD ────────────────────────────────────────────────────────────────────
 
 struct Eocd {
+    this_disk: u16,
+    cd_disk: u16,
     entry_count: u16,
     cd_size: u32,
     cd_offset: u32,
+    comment_bytes: Vec<u8>,
 }
 
 impl Eocd {
@@ -227,10 +419,16 @@ fn find_eocd<S: Read + Seek + ?Sized>(file: &mut S, file_size: u64) -> Result<(u
         }
     }
     let i = pos.ok_or_else(|| anyhow!("EOCD signature not found in last {} bytes", window))?;
+    let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+    let comment_start = i + 22;
+    let comment_bytes = buf[comment_start..comment_start + comment_len].to_vec();
     let eocd = Eocd {
+        this_disk: u16::from_le_bytes([buf[i + 4], buf[i + 5]]),
+        cd_disk: u16::from_le_bytes([buf[i + 6], buf[i + 7]]),
         entry_count: u16::from_le_bytes([buf[i + 10], buf[i + 11]]),
         cd_size: u32::from_le_bytes([buf[i + 12], buf[i + 13], buf[i + 14], buf[i + 15]]),
         cd_offset: u32::from_le_bytes([buf[i + 16], buf[i + 17], buf[i + 18], buf[i + 19]]),
+        comment_bytes,
     };
     Ok((start + i as u64, eocd))
 }
@@ -284,7 +482,7 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
             // Treat an unexpected signature as end-of-CDR — some tools pad.
             break;
         }
-        let _ver_made_by = cursor.read_u16::<LittleEndian>()?;
+        let made_by = cursor.read_u16::<LittleEndian>()?;
         let version_needed = cursor.read_u16::<LittleEndian>()?;
         let gp_flags = cursor.read_u16::<LittleEndian>()?;
         let method_on_wire = cursor.read_u16::<LittleEndian>()?;
@@ -296,7 +494,7 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
         let name_len = cursor.read_u16::<LittleEndian>()? as usize;
         let extra_len = cursor.read_u16::<LittleEndian>()? as usize;
         let comment_len = cursor.read_u16::<LittleEndian>()? as usize;
-        let _disk_start = cursor.read_u16::<LittleEndian>()?;
+        let disk_start = cursor.read_u16::<LittleEndian>()?;
         let _internal_attr = cursor.read_u16::<LittleEndian>()?;
         let external_attr = cursor.read_u32::<LittleEndian>()?;
         let lfh_offset_32 = cursor.read_u32::<LittleEndian>()?;
@@ -307,6 +505,8 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
         }
         let name_bytes = bytes[pos..pos + name_len].to_vec();
         let extra = &bytes[pos + name_len..pos + name_len + extra_len];
+        let comment_bytes =
+            bytes[pos + name_len + extra_len..pos + name_len + extra_len + comment_len].to_vec();
         // Skip past name + extra + comment for the next iteration.
         cursor.set_position((pos + name_len + extra_len + comment_len) as u64);
 
@@ -353,6 +553,7 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
 
         let encrypted = method_on_wire == METHOD_AES || (gp_flags & 0x0001 != 0);
         let name = decode_name(&name_bytes, gp_flags);
+        let comment = decode_name(&comment_bytes, gp_flags);
 
         entries.push(ReadEntry {
             name,
@@ -360,6 +561,7 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
             method_on_wire,
             inner_method: if encrypted { inner_method } else { method_on_wire },
             gp_flags,
+            made_by,
             version_needed,
             crc32,
             comp_size,
@@ -368,6 +570,9 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
             mtime: (date, time),
             encrypted,
             external_attr,
+            comment,
+            comment_bytes,
+            disk_number_start: disk_start,
             lfh_total_size: 0,
         });
     }

@@ -8,6 +8,7 @@
 //! - `sigv4` — AWS SigV4 request signer (shared with any future AWS backend).
 
 pub mod http;
+pub mod multidisk;
 pub mod s3;
 pub mod s3_list;
 pub mod sigv4;

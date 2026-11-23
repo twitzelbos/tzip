@@ -39,6 +39,17 @@ fn run_tzip_capture(cwd: &Path, args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// `true` if the system `zip` command is on PATH. Some CI environments
+/// omit it; tests that use it skip rather than fail when it's missing.
+fn have_zip_cmd() -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg("command -v zip >/dev/null 2>&1")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Run `tzip cat` and capture the raw stdout bytes (don't lossy-convert).
 fn tzip_cat_bytes(cwd: &Path, args: &[&str]) -> (bool, Vec<u8>, String) {
     let out = Command::new(tzip_bin())
@@ -374,4 +385,127 @@ fn create_then_extract_is_identity_plain() {
         let got = fs::read(tmp.path().join("extracted").join(rel)).unwrap();
         assert_eq!(&got, want);
     }
+}
+
+// ── Comments + external_attr (PR #19 scope) ────────────────────────────────
+
+#[test]
+fn ls_shows_entry_and_archive_comments() {
+    if !have_zip_cmd() {
+        eprintln!("skipping: system `zip` command not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("hello.txt"), b"hi\n").unwrap();
+
+    // `zip -c` is interactive; use a heredoc via sh to script the
+    // per-entry and archive comments.
+    let script = r#"
+        set -eu
+        cd "$1"
+        {
+            echo "per-entry note"
+            echo ""
+        } | zip -q -c out.zip hello.txt
+        echo "top-level archive banner" | zip -q -z out.zip
+    "#;
+    let st = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
+        .arg(tmp.path())
+        .status()
+        .expect("spawn sh");
+    assert!(st.success(), "zip comment script failed");
+
+    // Without -v: the entry comment line is suppressed; archive banner
+    // still shows after the summary.
+    let (ok, stdout, _) = run_tzip_capture(tmp.path(), &["ls", "out.zip"]);
+    assert!(ok);
+    assert!(
+        !stdout.contains("per-entry note"),
+        "non-verbose ls should hide entry comments: {stdout}"
+    );
+    assert!(
+        stdout.contains("top-level archive banner"),
+        "archive comment missing: {stdout}"
+    );
+
+    // -v: the entry comment appears below its row.
+    let (ok, stdout, _) = run_tzip_capture(tmp.path(), &["ls", "out.zip", "-v"]);
+    assert!(ok);
+    assert!(stdout.contains("per-entry note"), "verbose ls missing entry comment: {stdout}");
+}
+
+#[test]
+fn find_json_includes_comment_and_unix_mode() {
+    if !have_zip_cmd() {
+        eprintln!("skipping: system `zip` command not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("script.sh");
+    fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Use system zip so external_attr carries real Unix mode bits.
+    let st = Command::new("zip")
+        .current_dir(tmp.path())
+        .args(["-q", "out.zip", "script.sh"])
+        .status()
+        .expect("spawn zip");
+    assert!(st.success(), "zip failed");
+
+    let (ok, stdout, _) = run_tzip_capture(
+        tmp.path(),
+        &["find", "out.zip", "--json"],
+    );
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap())
+        .expect("valid JSON");
+    assert_eq!(v["entry"], "script.sh");
+    #[cfg(unix)]
+    {
+        let mode = v["unix_mode"].as_u64().expect("unix_mode present on Unix-origin zip");
+        // Permission bits only (type bits already stripped).
+        assert_eq!(mode & 0o777, 0o755, "expected 0o755, got {:o}", mode);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn extract_restores_unix_mode_when_origin_is_unix() {
+    if !have_zip_cmd() {
+        eprintln!("skipping: system `zip` command not available");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("exec.sh");
+    fs::write(&src, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o750)).unwrap();
+    let st = Command::new("zip")
+        .current_dir(tmp.path())
+        .args(["-q", "out.zip", "exec.sh"])
+        .status()
+        .expect("spawn zip");
+    assert!(st.success());
+
+    let out_dir = tmp.path().join("extracted");
+    fs::create_dir_all(&out_dir).unwrap();
+    run_tzip(
+        tmp.path(),
+        &["x", "out.zip", "--to", out_dir.to_str().unwrap()],
+    );
+
+    let got = fs::metadata(out_dir.join("exec.sh"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(got, 0o750, "expected 0o750, got {:o}", got);
 }

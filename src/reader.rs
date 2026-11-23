@@ -8,13 +8,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cli::{ReaderOp, ReaderOptions};
 use crate::crypto::{self, AE2_OVERHEAD};
 use crate::decompress::{self, ReadMethod};
+use crate::zipcrypto::{ZipCryptoReader, ZIPCRYPTO_HEADER_LEN};
+use crate::zipwriter::METHOD_AES;
 use crate::sources::{http::HttpSource, s3::S3Source};
 use crate::zipreader::{Archive, ReadEntry};
 
@@ -22,8 +24,20 @@ use crate::zipreader::{Archive, ReadEntry};
 /// anything else → local file path. Called by every reader subcommand so
 /// local and remote behave identically downstream of this seam.
 pub(crate) fn open_archive(spec: &str) -> Result<Archive> {
-    let src = open_source_for(spec)?;
-    Archive::open_source(src)
+    // Local paths go through `Archive::open` so multi-disk spanned
+    // archives get stitched across their sibling `.z01`..`.zip` files.
+    // Remote schemes (http/https/s3) don't have sibling disks — they
+    // use `open_source_for` + `open_source`, which fails loudly on
+    // multi-disk EOCDs rather than silently misinterpreting them.
+    if spec.starts_with("s3://")
+        || spec.starts_with("http://")
+        || spec.starts_with("https://")
+    {
+        let src = open_source_for(spec)?;
+        Archive::open_source(src)
+    } else {
+        Archive::open(Path::new(spec))
+    }
 }
 
 /// Open a raw `Read + Seek + Send` backing source for `spec` without
@@ -40,9 +54,45 @@ pub(crate) fn open_source_for(spec: &str) -> Result<Box<dyn crate::sources::Read
             .with_context(|| format!("open HTTP source {}", spec))?;
         Ok(Box::new(src))
     } else {
-        let file = std::fs::File::open(Path::new(spec))
-            .with_context(|| format!("open {}", spec))?;
-        Ok(Box::new(file))
+        // For local paths, detect multi-disk archives by peeking the
+        // EOCD and return a `MultiDiskSource` in that case. Parallel
+        // extract workers use this seam, so each worker gets its own
+        // set of file handles — exactly the same per-worker-source
+        // model HTTP + S3 already use for Range GET overlap.
+        local_source_for(Path::new(spec))
+    }
+}
+
+fn local_source_for(path: &Path) -> Result<Box<dyn crate::sources::ReadSeek>> {
+    use crate::sources::multidisk::MultiDiskSource;
+
+    let mut probe = std::fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    // Probe for multi-disk via the EOCD. On any read error treat as
+    // single-disk — Archive::open_source will surface the parse error.
+    let file_size = match probe.seek(SeekFrom::End(0)) {
+        Ok(n) => n,
+        Err(_) => {
+            drop(probe);
+            let f = std::fs::File::open(path)
+                .with_context(|| format!("re-open {}", path.display()))?;
+            return Ok(Box::new(f));
+        }
+    };
+    let total_disks = crate::zipreader::probe_total_disks(&mut probe, file_size).ok();
+    drop(probe);
+
+    match total_disks {
+        Some(n) if n >= 2 => {
+            let md = MultiDiskSource::open(path, n)
+                .with_context(|| format!("open multi-disk source for {}", path.display()))?;
+            Ok(Box::new(md))
+        }
+        _ => {
+            let f = std::fs::File::open(path)
+                .with_context(|| format!("re-open {}", path.display()))?;
+            Ok(Box::new(f))
+        }
     }
 }
 
@@ -67,25 +117,56 @@ pub(crate) fn stream_entry_to<W: Write>(
     if re.encrypted {
         let password = password.ok_or_else(|| {
             anyhow!(
-                "entry {} is AES-encrypted — pass --password / -p (or - to prompt)",
+                "entry {} is encrypted — pass --password / -p (or - to prompt)",
                 re.name
             )
         })?;
-        let ciphertext_len = re
-            .comp_size
-            .checked_sub(AE2_OVERHEAD as u64)
-            .ok_or_else(|| anyhow!("entry {} too small to be AE-2", re.name))?;
-        let mut plaintext: Vec<u8> = Vec::with_capacity(re.uncomp_size.min(64 * 1024 * 1024) as usize);
-        crypto::decrypt_ae2(password, source, ciphertext_len, &mut plaintext)?;
-        decompress::decompress(
-            inner_method,
-            std::io::Cursor::new(&plaintext),
-            re.uncomp_size,
-            dst,
-        )
+        if re.method_on_wire == METHOD_AES {
+            // WinZip AES-256 AE-2.
+            let ciphertext_len = re
+                .comp_size
+                .checked_sub(AE2_OVERHEAD as u64)
+                .ok_or_else(|| anyhow!("entry {} too small to be AE-2", re.name))?;
+            let mut plaintext: Vec<u8> =
+                Vec::with_capacity(re.uncomp_size.min(64 * 1024 * 1024) as usize);
+            crypto::decrypt_ae2(password, source, ciphertext_len, &mut plaintext)?;
+            decompress::decompress(
+                inner_method,
+                std::io::Cursor::new(&plaintext),
+                re.uncomp_size,
+                dst,
+            )
+        } else {
+            // Traditional PKZIP encryption (ZipCrypto). The 12-byte
+            // encryption header is baked into the comp_size, so after
+            // ZipCryptoReader consumes it the decompressor sees
+            // comp_size - 12 bytes of plaintext.
+            let verify_byte = zipcrypto_verify_byte(re);
+            let bounded = source.take(re.comp_size);
+            let decrypted = ZipCryptoReader::new(bounded, password.as_bytes(), verify_byte)
+                .with_context(|| format!("decrypt ZipCrypto entry {}", re.name))?;
+            // Hand decompress the ciphertext_len bytes of plaintext —
+            // bounded reader already enforces the limit.
+            let _ = ZIPCRYPTO_HEADER_LEN; // kept for documentation; not needed at the call site
+            decompress::decompress(inner_method, decrypted, re.uncomp_size, dst)
+        }
     } else {
         let bounded = source.take(re.comp_size);
         decompress::decompress(inner_method, bounded, re.uncomp_size, dst)
+    }
+}
+
+/// The verify byte ZipCrypto compares against the last plaintext byte
+/// of the 12-byte encryption header. When the entry uses a streaming
+/// data descriptor (GP bit 3) the CRC isn't known at header time, so
+/// the spec substitutes the high byte of the DOS time field.
+fn zipcrypto_verify_byte(re: &ReadEntry) -> u8 {
+    const GP_BIT_STREAMING_DATA_DESCRIPTOR: u16 = 1 << 3;
+    if re.gp_flags & GP_BIT_STREAMING_DATA_DESCRIPTOR != 0 {
+        // (date, time) tuple: time is the second field.
+        ((re.mtime.1 >> 8) & 0xff) as u8
+    } else {
+        ((re.crc32 >> 24) & 0xff) as u8
     }
 }
 
@@ -118,6 +199,9 @@ pub fn run_ls(opts: ReaderOptions) -> Result<()> {
             "{:>10}  {:>10}  {:<9} {}  {} {}",
             e.uncomp_size, e.comp_size, method, dt, encrypted_mark, e.name,
         )?;
+        if opts.verbose && !e.comment.is_empty() {
+            writeln!(out, "            # {}", e.comment)?;
+        }
         total_uncomp += e.uncomp_size;
         total_comp += e.comp_size;
     }
@@ -132,6 +216,13 @@ pub fn run_ls(opts: ReaderOptions) -> Result<()> {
         total_comp,
         arch.entries().len()
     )?;
+    if !arch.archive_comment().is_empty() {
+        writeln!(out)?;
+        writeln!(out, "Archive comment:")?;
+        for line in arch.archive_comment().lines() {
+            writeln!(out, "  {}", line)?;
+        }
+    }
     Ok(())
 }
 
@@ -285,6 +376,8 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
                         let mut buf = BufWriter::new(f);
                         stream_entry_to(&mut *source, &re, password.as_deref(), &mut buf)?;
                         buf.flush().context("flush extract buffer")?;
+                        drop(buf);
+                        apply_unix_mode(&dest, &re);
                         Ok(())
                     })();
                     match write_result {
@@ -347,6 +440,33 @@ fn stream_entry<W: Write>(
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
+/// If the archive was produced on a Unix host and carries sane mode
+/// bits in `external_attr`, apply them with `chmod`. Permission-only
+/// (we don't flip ownership, and we don't try to restore anything
+/// outside the standard rwx + setuid/setgid/sticky bits — a malicious
+/// archive can't set arbitrary bits this way). Non-Unix hosts or
+/// entries with a zero mode get left at the default from `File::create`.
+#[cfg(unix)]
+fn apply_unix_mode(dest: &Path, re: &ReadEntry) {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(mode) = re.unix_mode() else { return };
+    // Keep only the file-permission bits we're comfortable restoring:
+    // setuid/setgid/sticky + rwxrwxrwx (0o7777). Type bits (S_IFREG etc.)
+    // are dropped; the file is already a regular file we created.
+    let perm_bits = mode & 0o7777;
+    if perm_bits == 0 {
+        return;
+    }
+    let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(perm_bits));
+}
+
+#[cfg(not(unix))]
+fn apply_unix_mode(_dest: &Path, _re: &ReadEntry) {
+    // On Windows the external_attr DOS bits are a different beast; leave
+    // the default ACL that File::create produced. The ZIP spec defers to
+    // the platform on "how to restore attributes" — doing nothing is fine.
+}
+
 fn find_entry_index(arch: &Archive, name: &str) -> Result<usize> {
     arch.entries()
         .iter()
@@ -378,10 +498,12 @@ fn method_from_id(id: u16, gp_flags: u16) -> Option<ReadMethod> {
             lit_tree: (gp_flags & 0b0000_0100) != 0,
         },
         8 => ReadMethod::Deflate,
+        9 => ReadMethod::Deflate64,
         12 => ReadMethod::Bzip2,
         14 => ReadMethod::Lzma,
         93 => ReadMethod::Zstd,
         95 => ReadMethod::Xz,
+        98 => ReadMethod::Ppmd,
         _ => return None,
     })
 }
@@ -472,13 +594,16 @@ mod tests {
             other => panic!("expected Implode(large,lit), got {:?}", other),
         }
         assert!(matches!(method_from_id(8, 0), Some(ReadMethod::Deflate)));
+        assert!(matches!(method_from_id(9, 0), Some(ReadMethod::Deflate64)));
         assert!(matches!(method_from_id(12, 0), Some(ReadMethod::Bzip2)));
         assert!(matches!(method_from_id(14, 0), Some(ReadMethod::Lzma)));
         assert!(matches!(method_from_id(93, 0), Some(ReadMethod::Zstd)));
         assert!(matches!(method_from_id(95, 0), Some(ReadMethod::Xz)));
+        assert!(matches!(method_from_id(98, 0), Some(ReadMethod::Ppmd)));
         // Reserved / unknown method IDs stay unsupported.
         assert!(method_from_id(7, 0).is_none());
-        assert!(method_from_id(9, 0).is_none());
+        assert!(method_from_id(10, 0).is_none());
+        assert!(method_from_id(97, 0).is_none());
         assert!(method_from_id(99, 0).is_none());
     }
 }

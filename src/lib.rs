@@ -21,6 +21,7 @@ pub mod sources;
 pub mod tui;
 pub mod update;
 pub mod walker;
+pub mod zipcrypto;
 pub mod zipreader;
 pub mod zipwriter;
 

@@ -448,9 +448,14 @@ impl Drop for ServerGuard {
 }
 
 fn serve_files(mapping: Vec<(String, PathBuf)>) -> ServerGuard {
+    // Bind the TcpListener first to pin the port, then hand it to
+    // tiny_http via from_listener. The old pattern (bind → drop →
+    // rebind inside tiny_http) raced with the kernel on macOS and
+    // (under CI load) Linux too — between drop and rebind, something
+    // else could grab the port and we'd fail with AddrInUse or get a
+    // Connection refused on the first HEAD.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap();
-    drop(listener);
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
 
@@ -461,7 +466,8 @@ fn serve_files(mapping: Vec<(String, PathBuf)>) -> ServerGuard {
         .collect();
 
     let join = thread::spawn(move || {
-        let server = tiny_http::Server::http(addr).expect("tiny_http");
+        let server = tiny_http::Server::from_listener(listener, None)
+            .expect("tiny_http from_listener");
         loop {
             if stop2.load(Ordering::SeqCst) {
                 break;

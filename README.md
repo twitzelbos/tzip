@@ -232,10 +232,12 @@ All write-side methods compose orthogonally with AES-256.
 | `reduce` | 2-5 | r | `compcol` | PKZIP 1.x LZ + Huffman, factors 1-4. Vintage archives only |
 | `implode` | 6 | r | `compcol` | PKZIP 1.x Shannon-Fano + 4/8 KiB window. The dominant pre-Deflate method |
 | `deflate` | 8 | r+w | `libdeflater` | Default. 30-40% faster than flate2. Levels 0-12; 12 ≈ zopfli-lite |
+| `deflate64` | 9 | r | `compcol` | PKWARE's 64 KiB-window variant. Common in Windows-produced ZIPs (WinZip, `.NET` ZipArchive on large entries) |
 | `bzip2` | 12 | r+w | `bzip2` | 5-10% better than DEFLATE on text; ~4× slower |
 | `lzma` | 14 | r+w | `xz2` (LZMA1) | Better ratio than DEFLATE; ZIP consumers need LZMA support |
 | `xz` | 95 | r+w | `xz2` (LZMA2) | Same LZMA2 as `.7z`, but per-file inside a ZIP |
 | `zstd` | 93 | r+w | `zstd` | Great ratio + speed. Recipient needs zstd-aware unzipper |
+| `ppmd` | 98 | r | `compcol` | PPMd variant Ir1 (context-modelling entropy coder). Rare in the wild but valid per APPNOTE |
 
 Shrink / Reduce / Implode are read-only — modern tooling (Info-ZIP,
 libarchive, miniz, `zip` crate) all dropped encoder support decades
@@ -280,6 +282,39 @@ Password sourcing (in precedence order):
 - `--password-file` (first line of file)
 - `--password -` (interactive tty prompt)
 - `--password <pw>` (arg, visible in process list; prefer `--password-file` in scripts)
+
+### Multi-disk (spanned) archives
+
+tzip reads archives split across `base.z01`, `base.z02`, ...,
+`base.zip` — the format Info-ZIP's `zip -s`, and ancient PKZIP for
+floppy spanning, produce. Point tzip at the last disk (`.zip`) and
+it opens the siblings automatically:
+
+```
+tzip ls      bigarchive.zip                    # lists across all disks
+tzip cat     bigarchive.zip path/entry.log     # even if the body spans disks
+tzip x       bigarchive.zip --to ./extracted   # parallel workers open their own stitched views
+```
+
+Local files only — the sibling disks must live in the same
+directory as the `.zip`. HTTP and S3 multi-disk aren't supported;
+no standard cloud layout addresses them anyway.
+
+### Reading ZipCrypto-encrypted archives (vintage password protection)
+
+tzip also **reads** entries encrypted with traditional PKZIP
+encryption ("ZipCrypto") — the format `zip -e`, PKZIP 2.x, and most
+"password-protected ZIP" dialogs produce. Pass the password the same
+way as for AES. ZipCrypto is cryptographically broken (a known-
+plaintext attack recovers the key in seconds); tzip supports reading
+it only to open vintage archives. New encryption always goes through
+AES-256.
+
+Detection is automatic — tzip reads GP bit 0 + method ID to tell
+ZipCrypto apart from AES. Wrong-password detection relies on the
+format's single-byte header check (1/256 false-pass rate per the
+spec); downstream decompression usually fails noisily if a wrong
+password happens to pass the check.
 
 ---
 

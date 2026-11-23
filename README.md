@@ -33,6 +33,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Update mode](#update-mode)
 - [Reading archives](#reading-archives)
 - [Reading remote archives (HTTP / S3)](#reading-remote-archives-http--s3)
+- [Searching across many archives (`tzip grep`)](#searching-across-many-archives-tzip-grep)
 - [TUI mode](#tui-mode)
 - [Performance](#performance)
 - [External-drive tuning](#external-drive-tuning)
@@ -457,6 +458,135 @@ AssumeRole chains. If you need these, drop temporary creds into
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` via
 whatever tool you already use (`aws sso login`, `aws-vault exec`, etc.)
 and tzip will pick them up.
+
+## Searching across many archives (`tzip grep`)
+
+`tzip grep PATTERN <archive>...` fans a regex search out across many
+ZIPs in parallel — local, HTTP(S), or S3. CDR-side filters skip
+entries at the directory without ever fetching their bodies; the
+Range-GET primitive means only matching entries' bytes transit.
+Checkpoint/resume keeps multi-hour jobs recoverable.
+
+```
+# One archive, basic grep.
+tzip grep ERROR out.zip
+
+# Fan-out across many; parallelism knobs tuned for S3's soft limits.
+tzip grep ERROR s3://my-bucket/logs/*.zip -P 64 --inner-jobs 8
+
+# CDR filters: skip entries that can't match before fetching bodies.
+tzip grep ERROR s3://bucket/*.zip \
+    --include '*.log' --since 2026-11-01 --min-size 1024
+
+# Checkpoint + resume: a multi-hour job survives a Ctrl-C / SIGKILL.
+tzip grep ERROR s3://bucket/logs/*.zip --checkpoint run.ck
+# ... Ctrl-C ...
+tzip grep ERROR s3://bucket/logs/*.zip --checkpoint run.ck --resume
+
+# Delegate matching-entry output to ripgrep for its full feature set
+# (PCRE2, context lines, color, --json).
+tzip grep ERROR s3://bucket/*.zip \
+    --exec 'rg -C 3 --color=always {}'
+
+# Structured output for pipelining.
+tzip grep ERROR s3://bucket/*.zip --json | jq '.'
+```
+
+### What tzip owns vs. what it reuses
+
+Orchestration is tzip's job: fan-out, CDR-side filtering (so you
+never pay for bytes that can't match), remote sources via the
+existing HTTP/S3 reader stack, and checkpoint/resume. The actual
+regex engine is the **`regex` crate** — the exact engine ripgrep
+ships, factored as a reusable library. You get rg's regex syntax and
+speed without the "reinvented a regex engine" footgun.
+
+For features the regex crate doesn't cover (PCRE2, `-C/--context`,
+colored output, `--json` match context), `--exec CMD` writes each
+matched entry to a tempfile and runs `CMD` with `{}` → path. Only
+entries that passed tzip's regex are forwarded, so the external
+command acts as an rg pre-filter.
+
+### Parallelism knobs
+
+| flag | default | meaning |
+|---|---|---|
+| `-P, --parallel <N>` | 32 | Concurrent archives in flight. |
+| `--inner-jobs <N>` | 8 | Concurrent entries scanned within one archive. Each inner worker opens its own backing source so Range GETs overlap. |
+| `--connections <N>` | `P × inner` capped at 256 | Shared HTTP/S3 connection pool cap. |
+
+Defaults are tuned for S3's documented per-prefix soft limits
+(~5,500 GET/s per prefix historically). Override per workload.
+
+### CDR-side filters
+
+All applied at the central directory before any body fetch — on S3,
+every skipped entry is a saved Range GET.
+
+| flag | meaning |
+|---|---|
+| `--include GLOB` | Only scan entries matching the glob. Repeatable. |
+| `--exclude GLOB` | Skip entries matching the glob. Repeatable. |
+| `--min-size BYTES` | Skip entries smaller than this. |
+| `--max-size BYTES` | Skip entries larger than this. |
+| `--since YYYY-MM-DD` | Skip entries with mtime before the given UTC date. |
+| `--until YYYY-MM-DD` | Skip entries with mtime after the given UTC date. |
+
+### Checkpoint and resume
+
+`--checkpoint FILE` writes a JSONL file with:
+
+- **Header line** — the query (pattern, filters, archive set).
+- **One line per completed `(archive, entry)`** with match count + timestamp.
+
+`--resume` re-opens the same file, validates the header matches the
+current invocation (refuses with a clear error if pattern or filters
+changed), and skips `(archive, entry)` pairs already present. Output
+isn't duplicated on resume.
+
+Granularity is per-entry, not per-byte. An entry interrupted mid-scan
+restarts at byte 0 of that entry on resume — worst case ~one entry
+per worker is re-scanned. For log-archive workloads where entries are
+distinct files, this is essentially free; byte-offset resume would
+need deterministic match positions across decompression or format-
+specific restart markers, neither of which pay for themselves.
+
+Tune `--checkpoint-every N` (default 1) up if your corpus is many
+tiny entries and per-entry `fdatasync` dominates.
+
+### Output
+
+Default is grep-style, one line per match:
+
+```
+s3://bucket/logs/2026-11-22.zip:api/access.log:4521:[2026-11-22T14:05:11Z] ERROR connection refused
+```
+
+`--files-only` collapses to `archive:entry` once per entry with any
+match. `--json` emits `{"archive", "entry", "line", "match"}` one per
+match. Lines are written under a shared stdout lock so parallel
+workers don't interleave mid-line.
+
+### S3 bucket globbing
+
+`s3://bucket/prefix/*.zip` and friends are expanded via
+ListObjectsV2 (paginated) before fan-out. Everything before the first
+`*` or `?` becomes the S3 prefix passed to the API, so you don't
+list the whole bucket just to filter one subtree. Local file globs
+are still handled by your shell.
+
+### Known limits
+
+- **Per-entry memory**: each entry is decompressed to a `Vec<u8>` in
+  full for scanning. A 10 GB log inside a ZIP needs 10 GB of RAM.
+  Streaming line-at-a-time is a planned follow-up.
+- **`--exec` process spawn overhead** (~1-10 ms per spawn on Linux,
+  ~5-20 ms on macOS). Fine for typical workloads; defer to the
+  built-in matcher if you have many small matched entries per
+  archive.
+- **Output ordering is non-deterministic** with parallel workers.
+  Use `-P 1 --inner-jobs 1` for stable order, or pipe through
+  `--json | jq -s 'sort_by(.archive, .entry, .line)'`.
 
 ## TUI mode
 

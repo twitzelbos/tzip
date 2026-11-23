@@ -388,20 +388,36 @@ pub struct GrepArgs {
 #[derive(Args, Debug)]
 pub struct MountArgs {
     /// Archive. Accepts a local path, `http(s)://` URL, or
-    /// `s3://bucket/key` URL.
-    pub archive: String,
+    /// `s3://bucket/key` URL. Not required when `--install` or
+    /// `--uninstall` is used.
+    #[arg(required_unless_present_any = ["install", "uninstall"])]
+    pub archive: Option<String>,
     /// Mount point (must exist, be empty, and be writable to the
-    /// current user — standard FUSE requirements).
-    pub mountpoint: PathBuf,
+    /// current user — standard FUSE requirements). Not required when
+    /// `--install` or `--uninstall` is used.
+    #[arg(required_unless_present_any = ["install", "uninstall"])]
+    pub mountpoint: Option<PathBuf>,
 
     /// Memory budget for the per-entry decompressed-body LRU cache (MiB).
     #[arg(long, default_value_t = 256)]
     pub cache_mb: usize,
 
     /// Allow other users to read the mount. Adds `allow_other` to the
-    /// FUSE options; requires `user_allow_other` in /etc/fuse.conf.
+    /// FUSE options (Linux) / mount option (macOS FSKit); on Linux
+    /// requires `user_allow_other` in /etc/fuse.conf.
     #[arg(long)]
     pub allow_other: bool,
+
+    /// macOS + `--features fskit` only: register the tzip FSKit system
+    /// extension. One-time per install; user has to approve in System
+    /// Settings. No-op on Linux.
+    #[arg(long, conflicts_with = "uninstall")]
+    pub install: bool,
+
+    /// macOS + `--features fskit` only: deregister the tzip FSKit
+    /// system extension. No-op on Linux.
+    #[arg(long)]
+    pub uninstall: bool,
 
     #[arg(short = 'p', long)]
     pub password: Option<String>,
@@ -757,17 +773,41 @@ fn civil_to_unix(y: i64, m: u32, d: u32) -> i64 {
 }
 
 impl MountArgs {
-    pub fn into_options(self) -> Result<crate::mount::MountOptions> {
+    pub fn into_action(self) -> Result<crate::mount::MountAction> {
+        #[cfg(all(target_os = "macos", feature = "fskit"))]
+        {
+            if self.install {
+                return Ok(crate::mount::MountAction::Install);
+            }
+            if self.uninstall {
+                return Ok(crate::mount::MountAction::Uninstall);
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "fskit")))]
+        {
+            if self.install || self.uninstall {
+                bail!(
+                    "--install / --uninstall are macOS-only and require the \
+                     `fskit` cargo feature (build with `cargo build --features fskit`)"
+                );
+            }
+        }
         let password = resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
-        Ok(crate::mount::MountOptions {
-            archive_spec: self.archive,
-            mountpoint: self.mountpoint,
+        let archive_spec = self
+            .archive
+            .ok_or_else(|| anyhow::anyhow!("archive is required"))?;
+        let mountpoint = self
+            .mountpoint
+            .ok_or_else(|| anyhow::anyhow!("mountpoint is required"))?;
+        Ok(crate::mount::MountAction::Mount(crate::mount::MountOptions {
+            archive_spec,
+            mountpoint,
             cache_mb: self.cache_mb,
             allow_other: self.allow_other,
             password,
             quiet: self.quiet,
             verbose: self.verbose,
-        })
+        }))
     }
 }
 

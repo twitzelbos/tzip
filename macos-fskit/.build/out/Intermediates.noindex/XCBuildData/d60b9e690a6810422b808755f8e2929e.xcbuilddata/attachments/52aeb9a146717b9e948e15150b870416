@@ -1,0 +1,39 @@
+{
+  "" : {
+    "diagnostics" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension-primary.dia",
+    "emit-module-dependencies" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension-primary-emit-module.dia",
+    "pch" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension-primary.swiftdeps"
+  },
+  "/Users/thomaswitzel/projects/tzip/macos-fskit/Sources/TzipFSExtension/RustABI.swift" : {
+    "const-values" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/RustABI.swiftconstvalues",
+    "dependencies" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/RustABI.d",
+    "diagnostics" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/RustABI.dia",
+    "index-unit-output-path" : "/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/RustABI.o",
+    "llvm-bc" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/RustABI.bc",
+    "object" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/RustABI.o",
+    "swift-dependencies" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/RustABI.swiftdeps",
+    "swiftmodule" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/RustABI~partial.swiftmodule"
+  },
+  "/Users/thomaswitzel/projects/tzip/macos-fskit/Sources/TzipFSExtension/TzipFSExtension.swift" : {
+    "const-values" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension.swiftconstvalues",
+    "dependencies" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension.d",
+    "diagnostics" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension.dia",
+    "index-unit-output-path" : "/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension.o",
+    "llvm-bc" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension.bc",
+    "object" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension.o",
+    "swift-dependencies" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension.swiftdeps",
+    "swiftmodule" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSExtension~partial.swiftmodule"
+  },
+  "/Users/thomaswitzel/projects/tzip/macos-fskit/Sources/TzipFSExtension/TzipFSVolume.swift" : {
+    "const-values" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSVolume.swiftconstvalues",
+    "dependencies" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSVolume.d",
+    "diagnostics" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSVolume.dia",
+    "index-unit-output-path" : "/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSVolume.o",
+    "llvm-bc" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSVolume.bc",
+    "object" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSVolume.o",
+    "swift-dependencies" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSVolume.swiftdeps",
+    "swiftmodule" : "/Users/thomaswitzel/projects/tzip/macos-fskit/.build/out/Intermediates.noindex/TzipFSExtension.build/Debug/TzipFSExtension-t.build/Objects-normal/arm64/TzipFSVolume~partial.swiftmodule"
+  }
+}

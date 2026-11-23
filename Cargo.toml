@@ -22,6 +22,10 @@ io-uring = ["dep:io-uring"]
 # Bypasses the VFS layer and any AV that hooks it. Adds the vendored
 # `apfs` crate as a dependency (see vendor/dpp).
 raw-apfs = ["dep:apfs"]
+# Enable `tzip mount` on macOS 15+ via FSKit. Requires Xcode CLI tools
+# (`swiftc`, `codesign`) at build time. Pulls in Keychain support via
+# `security-framework` + runs cbindgen for the Rust↔Swift ABI header.
+fskit = ["dep:security-framework", "dep:cbindgen"]
 
 [dependencies]
 # Vendored (patched) APFS parser (MIT, upstream Dil4rd/dpp).
@@ -99,6 +103,11 @@ tempfile = "3"
 lru = "0.12"
 signal-hook = "0.3"
 
+# Optional: pulled in by the `fskit` feature on macOS 15+. `security-framework`
+# is a thin Rust wrapper over macOS Security.framework — used here to stash
+# AES mount passwords in the user Keychain under a per-mount UUID tag.
+security-framework = { version = "2.11", optional = true }
+
 # Linux io_uring reader (optional, behind the `io-uring` feature) +
 # FUSE3 for `tzip mount`. `fuser` only compiles on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -113,6 +122,10 @@ tiny_http = "0.12"
 
 [build-dependencies]
 cc = "1"
+# `fskit` feature builds a .fs extension bundle whose Swift side consumes
+# this C header to call into the Rust ABI. cbindgen is optional and only
+# pulled in by `--features fskit`.
+cbindgen = { version = "0.27", optional = true }
 
 [[example]]
 name = "raw_apfs_probe"

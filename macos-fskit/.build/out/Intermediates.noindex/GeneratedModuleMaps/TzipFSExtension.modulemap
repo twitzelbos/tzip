@@ -1,0 +1,4 @@
+module TzipFSExtension {
+header "TzipFSExtension-Swift.h"
+export *
+}

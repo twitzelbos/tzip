@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         cli::Cmd::Cat(args) => reader::run_cat(args.into_options()?),
         cli::Cmd::X(args) => reader::run_extract(args.into_options()?),
         cli::Cmd::Grep(args) => grep::run(args.into_options()?),
-        cli::Cmd::Mount(args) => mount::mount(args.into_options()?),
+        cli::Cmd::Mount(args) => mount::dispatch(args.into_action()?),
     }
 }
 

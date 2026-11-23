@@ -635,11 +635,32 @@ tzip mount https://example.com/release.zip /tmp/mnt &
 
 ### Platform support
 
-- **Linux (FUSE3)** — this release. Install `fuse3` via your package
+- **Linux (FUSE3)** — fully working. Install `fuse3` via your package
   manager (`apt install fuse3`, `dnf install fuse3`, etc.).
-- **macOS (FSKit, macOS 15+)** — planned follow-up PR. Needs a Swift
-  bridge module + `sysextensionsctl` registration. Until that lands,
-  `tzip mount` on macOS prints a clear "planned follow-up" error.
+- **macOS (FSKit, macOS 15.4+)** — **scaffolding landed, mount runtime
+  is a follow-up PR.** Current state:
+  - Swift extension module (`macos-fskit/`) compiles against the real
+    FSKit SDK — `FSUnaryFileSystem` subclass, `FSVolume` implementing
+    lookup / getAttributes / enumerateDirectory / readFromFile, R/O.
+  - Rust C ABI (`src/mount/fskit_abi.rs`) + macOS Keychain wrapper
+    (`src/mount/keychain.rs`, for AES password passing) both working;
+    Keychain roundtrip unit tests pass against the real Keychain.
+  - CLI gains `--install` / `--uninstall` flags (behind `--features
+    fskit`); `tzip mount --install` stub currently bails with a clear
+    "not yet wired to SystemExtensionManager" error.
+  - `scripts/build-fskit-bundle.sh` orchestrates the two-phase build
+    (cargo + swiftc) and assembles a `.fs` bundle.
+  - **Still missing before a real mount works**: (1) refactor tzip into
+    a workspace so a `tzip-fskit-abi` cdylib exports the `tzip_*`
+    symbols the Swift side needs at runtime; (2) wire the install /
+    uninstall path through the SystemExtension framework via `objc2`
+    or an Obj-C shim; (3) `mount(2)` dispatcher that encodes URL +
+    cache + keychain-tag into the FSKit mount options string. All
+    three are tracked as the Phase G4 FSKit follow-up on the ROADMAP.
+  - **If you just want a working Mac mount right now**, FUSE-T and
+    macFUSE both work today via a one-paragraph patch (both expose the
+    same libfuse API as Linux FUSE3). Not shipped here because the
+    ROADMAP's position is FSKit-first for KEXT-free.
 
 ### Known limits
 

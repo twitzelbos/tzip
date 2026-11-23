@@ -243,9 +243,11 @@ impl Drop for ServerGuard {
 }
 
 fn serve_files(mapping: Vec<(String, PathBuf)>) -> ServerGuard {
+    // See the matching comment in tests/grep.rs::serve_files — bind the
+    // TcpListener once and hand it to tiny_http instead of dropping +
+    // rebinding (racy on macOS and under CI load on Linux).
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap();
-    drop(listener);
     let stop = Arc::new(AtomicBool::new(false));
     let hits = Arc::new(AtomicUsize::new(0));
     let stop2 = Arc::clone(&stop);
@@ -257,7 +259,8 @@ fn serve_files(mapping: Vec<(String, PathBuf)>) -> ServerGuard {
         .collect();
 
     let join = thread::spawn(move || {
-        let server = tiny_http::Server::http(addr).expect("tiny_http");
+        let server = tiny_http::Server::from_listener(listener, None)
+            .expect("tiny_http from_listener");
         loop {
             if stop2.load(Ordering::SeqCst) {
                 break;

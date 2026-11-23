@@ -39,6 +39,14 @@ pub enum ReadMethod {
     Reduce(u8),
     /// PKZIP method 6 — Shannon-Fano coded LZ77 with 4 or 8 KiB window.
     Implode { large_window: bool, lit_tree: bool },
+    /// PKWARE Deflate64 (method 9) — like Deflate but with a 64 KiB
+    /// window and the longer-match extensions. Common in Windows-produced
+    /// ZIPs (WinZip, .NET's `ZipArchive` with CompressionLevel.Optimal
+    /// on large entries).
+    Deflate64,
+    /// PPMd variant Ir1 (method 98) — Dmitry Shkarin's context-modelling
+    /// coder. Rare in the wild but a legit ZIP format.
+    Ppmd,
 }
 
 impl ReadMethod {
@@ -54,6 +62,8 @@ impl ReadMethod {
             ReadMethod::Shrink => "shrink",
             ReadMethod::Reduce(_) => "reduce",
             ReadMethod::Implode { .. } => "implode",
+            ReadMethod::Deflate64 => "deflate64",
+            ReadMethod::Ppmd => "ppmd",
         }
     }
 
@@ -110,6 +120,19 @@ pub fn decompress<R: Read, W: Write>(
         ReadMethod::Implode { large_window, lit_tree } => {
             let dec = compcol::zip_implode::Decoder::raw(large_window, lit_tree, uncomp_size);
             drive_compcol("implode", dec, src, dst)
+        }
+        ReadMethod::Deflate64 => {
+            let dec = compcol::deflate64::Decoder::new();
+            drive_compcol("deflate64", dec, src, dst)
+        }
+        ReadMethod::Ppmd => {
+            // Cap the PPMd model arena at 256 MiB — enough for anything
+            // in the wild, well below "a malicious ZIP asks for 2 GiB".
+            // The decoder rejects over-ask with Error::Unsupported
+            // before allocating.
+            let dec = compcol::ppmd::ZipDecoder::new(uncomp_size)
+                .with_max_memory(256 * 1024 * 1024);
+            drive_compcol("ppmd", dec, src, dst)
         }
     }
 }

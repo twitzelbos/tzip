@@ -232,10 +232,12 @@ All write-side methods compose orthogonally with AES-256.
 | `reduce` | 2-5 | r | `compcol` | PKZIP 1.x LZ + Huffman, factors 1-4. Vintage archives only |
 | `implode` | 6 | r | `compcol` | PKZIP 1.x Shannon-Fano + 4/8 KiB window. The dominant pre-Deflate method |
 | `deflate` | 8 | r+w | `libdeflater` | Default. 30-40% faster than flate2. Levels 0-12; 12 ≈ zopfli-lite |
+| `deflate64` | 9 | r | `compcol` | PKWARE's 64 KiB-window variant. Common in Windows-produced ZIPs (WinZip, `.NET` ZipArchive on large entries) |
 | `bzip2` | 12 | r+w | `bzip2` | 5-10% better than DEFLATE on text; ~4× slower |
 | `lzma` | 14 | r+w | `xz2` (LZMA1) | Better ratio than DEFLATE; ZIP consumers need LZMA support |
 | `xz` | 95 | r+w | `xz2` (LZMA2) | Same LZMA2 as `.7z`, but per-file inside a ZIP |
 | `zstd` | 93 | r+w | `zstd` | Great ratio + speed. Recipient needs zstd-aware unzipper |
+| `ppmd` | 98 | r | `compcol` | PPMd variant Ir1 (context-modelling entropy coder). Rare in the wild but valid per APPNOTE |
 
 Shrink / Reduce / Implode are read-only — modern tooling (Info-ZIP,
 libarchive, miniz, `zip` crate) all dropped encoder support decades

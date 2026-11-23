@@ -120,7 +120,7 @@ signal-hook = "0.3"
 # is a thin Rust wrapper over macOS Security.framework — used here to stash
 # AES mount passwords in the user Keychain under a per-mount UUID tag.
 security-framework = { version = "2.11", optional = true }
-compcol = { version = "0.8", default-features = false, features = ["zip_shrink", "zip_reduce", "zip_implode", "alloc"] }
+compcol = { version = "0.8", default-features = false, features = ["zip_shrink", "zip_reduce", "zip_implode", "alloc", "deflate64", "ppmd"] }
 
 # Linux io_uring reader (optional, behind the `io-uring` feature) +
 # FUSE3 for `tzip mount`. `fuser` only compiles on Linux.

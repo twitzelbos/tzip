@@ -92,6 +92,12 @@ pub enum Cmd {
     /// Same `-P` fan-out + S3 bucket globbing as `tzip grep`.
     #[command(alias = "f")]
     Find(FindArgs),
+
+    /// Benchmark tzip against system `7z` / `zip` / `unzip` on a
+    /// reproducible corpus. Measures create speed, extract speed, list
+    /// speed, output size, and compression ratio. External tools are
+    /// detected on PATH and skipped when missing.
+    Bench(BenchArgs),
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -336,6 +342,39 @@ pub struct FindArgs {
 
     #[arg(short = 'q', long)]
     pub quiet: bool,
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct BenchArgs {
+    /// Directory to use as the input corpus. If omitted, a
+    /// deterministic synthetic corpus is generated in a tempdir
+    /// (mix of text + random binary, ~50 MB default or ~5 MB with
+    /// `--quick`).
+    #[arg(long, value_name = "DIR")]
+    pub corpus: Option<PathBuf>,
+
+    /// Iterations per benchmark. Median is reported alongside min/max.
+    #[arg(short = 'n', long, default_value_t = 3)]
+    pub iterations: usize,
+
+    /// Shorter corpus + 1 iteration — suitable for a CI-time sanity
+    /// check. Implies `-n 1`.
+    #[arg(long)]
+    pub quick: bool,
+
+    /// Emit results as JSON lines instead of a human-readable table.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Restrict to a comma-separated subset: `create`, `extract`, `list`.
+    #[arg(long, value_delimiter = ',')]
+    pub only: Vec<String>,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
     #[arg(short = 'v', long)]
     pub verbose: bool,
 }
@@ -620,6 +659,17 @@ pub struct FindOptions {
 }
 
 #[derive(Clone, Debug)]
+pub struct BenchOptions {
+    pub corpus: Option<PathBuf>,
+    pub iterations: usize,
+    pub quick: bool,
+    pub json: bool,
+    pub only: Vec<String>,
+    pub quiet: bool,
+    pub verbose: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct ReaderOptions {
     /// Local path, `http(s)://` URL, or `s3://bucket/key` URL.
     pub archive: String,
@@ -790,6 +840,21 @@ impl CatArgs {
             quiet: self.quiet,
             verbose: self.verbose,
             op: ReaderOp::Cat { name: self.name },
+        })
+    }
+}
+
+impl BenchArgs {
+    pub fn into_options(self) -> Result<BenchOptions> {
+        let iterations = if self.quick { 1 } else { self.iterations.max(1) };
+        Ok(BenchOptions {
+            corpus: self.corpus,
+            iterations,
+            quick: self.quick,
+            json: self.json,
+            only: self.only,
+            quiet: self.quiet,
+            verbose: self.verbose,
         })
     }
 }

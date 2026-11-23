@@ -46,9 +46,9 @@ jobs:
       # The roundtrip tests shell out to `7z` to verify bzip2 / lzma / xz /
       # zstd / .7z extraction. They skip gracefully if it isn't installed,
       # but we want to actually exercise those paths in CI.
-      - name: Install p7zip (Ubuntu)
+      - name: Install p7zip + FUSE3 (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full fuse3 libfuse3-dev
 
       - name: Install p7zip (macOS)
         if: matrix.os == 'macos-latest'

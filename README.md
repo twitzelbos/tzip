@@ -637,30 +637,38 @@ tzip mount https://example.com/release.zip /tmp/mnt &
 
 - **Linux (FUSE3)** — fully working. Install `fuse3` via your package
   manager (`apt install fuse3`, `dnf install fuse3`, etc.).
-- **macOS (FSKit, macOS 15.4+)** — **scaffolding landed, mount runtime
-  is a follow-up PR.** Current state:
-  - Swift extension module (`macos-fskit/`) compiles against the real
-    FSKit SDK — `FSUnaryFileSystem` subclass, `FSVolume` implementing
-    lookup / getAttributes / enumerateDirectory / readFromFile, R/O.
-  - Rust C ABI (`src/mount/fskit_abi.rs`) + macOS Keychain wrapper
-    (`src/mount/keychain.rs`, for AES password passing) both working;
-    Keychain roundtrip unit tests pass against the real Keychain.
-  - CLI gains `--install` / `--uninstall` flags (behind `--features
-    fskit`); `tzip mount --install` stub currently bails with a clear
-    "not yet wired to SystemExtensionManager" error.
-  - `scripts/build-fskit-bundle.sh` orchestrates the two-phase build
-    (cargo + swiftc) and assembles a `.fs` bundle.
-  - **Still missing before a real mount works**: (1) refactor tzip into
-    a workspace so a `tzip-fskit-abi` cdylib exports the `tzip_*`
-    symbols the Swift side needs at runtime; (2) wire the install /
-    uninstall path through the SystemExtension framework via `objc2`
-    or an Obj-C shim; (3) `mount(2)` dispatcher that encodes URL +
-    cache + keychain-tag into the FSKit mount options string. All
-    three are tracked as the Phase G4 FSKit follow-up on the ROADMAP.
-  - **If you just want a working Mac mount right now**, FUSE-T and
-    macFUSE both work today via a one-paragraph patch (both expose the
-    same libfuse API as Linux FUSE3). Not shipped here because the
-    ROADMAP's position is FSKit-first for KEXT-free.
+- **macOS (FSKit, macOS 15.4+)** — fully working after a one-time
+  setup. The host build needs Xcode CLI tools (`swiftc`, `codesign`)
+  and `--features fskit`. One-time setup:
+
+  ```
+  cargo build --release --features fskit
+  scripts/build-fskit-bundle.sh                # builds + signs tzip.fs
+  ./target/release/tzip mount --install         # approve in System Settings
+  ```
+
+  Then day-to-day:
+
+  ```
+  tzip mount s3://my-bucket/archive.zip /tmp/mnt &
+  rg PATTERN /tmp/mnt/
+  umount /tmp/mnt                                # or Ctrl-C the tzip mount
+  ```
+
+  **One OS policy gate**. On stock SIP-enabled macOS,
+  `OSSystemExtensionManager` only accepts activation requests whose
+  host binary is signed with a Developer ID (and whose extension
+  bundle is notarized). For local dev without a $99/year Developer
+  Program account, enable developer mode:
+
+  ```
+  csrutil disable                # from Recovery mode (one-time)
+  sudo systemextensionsctl developer on
+  ```
+
+  Then ad-hoc-signed builds install. A properly signed + notarized
+  distribution build that works on stock macOS is a packaging
+  follow-up — not a code change.
 
 ### Known limits
 

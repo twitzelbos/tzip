@@ -55,7 +55,7 @@ pub fn mount(opts: MountOptions) -> Result<()> {
 
     let mut session = fuser::Session::new(fs, &opts.mountpoint, &mount_opts)
         .context("fuser Session::new (is FUSE3 installed?)")?;
-    let unmounter = session.unmount_callable();
+    let mut unmounter = session.unmount_callable();
 
     // Signal handler: SIGINT / SIGTERM → trigger clean unmount so
     // session.run() returns.

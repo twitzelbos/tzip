@@ -25,7 +25,7 @@ use regex::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -175,46 +175,44 @@ fn scan_entry(
     cp_writer: Option<&Arc<Mutex<File>>>,
     out: &Arc<Mutex<Box<dyn Write + Send>>>,
 ) -> Result<()> {
-    // Materialise the full decompressed body. For a grep that scans every
-    // byte anyway, per-entry buffering is simplest; a future streaming
-    // line scanner is a follow-up.
-    let mut body: Vec<u8> = Vec::with_capacity(re.uncomp_size.min(16 * 1024 * 1024) as usize);
-    stream_entry_to(source, re, opts.password.as_deref(), &mut body)
-        .with_context(|| format!("read body of {} in {}", re.name, url))?;
+    // For --exec we tee decompress output straight to a tempfile as it
+    // comes out, so a 10 GB entry costs ~1 line of RAM in the scanner
+    // + whatever decompress needs internally, not 10 GB.
+    let mut exec_tmp: Option<tempfile::NamedTempFile> = if opts.exec.is_some() {
+        Some(tempfile::NamedTempFile::new().context("create exec tempfile")?)
+    } else {
+        None
+    };
 
-    // Always scan first — it decides whether `--exec` runs (so the
-    // external command only sees entries that actually matched the
-    // pattern, acting as an rg pre-filter) and drives the default
-    // grep-style output otherwise.
-    let mut match_count: u64 = 0;
-    let mut first_matched_line: Option<(u64, Vec<u8>)> = None;
-    let mut line_no: u64 = 0;
-    let total_newlines = count_newlines(&body);
-    for line in body.split(|&b| b == b'\n') {
-        line_no += 1;
-        // split yields a trailing empty element when the buffer ends
-        // in \n — skip it so we don't invent a blank last line.
-        if line.is_empty() && line_no == 1 + total_newlines {
-            break;
+    // files_only can short-circuit only when --exec is absent — under
+    // --exec we need the full match_count for the checkpoint.
+    let stop_after_first = opts.files_only && opts.exec.is_none();
+    let emit_ctx = if opts.exec.is_none() {
+        Some(EmitCtx { out, opts, archive: url, entry: &re.name })
+    } else {
+        None
+    };
+
+    let match_count: u64;
+    {
+        let tee: Option<&mut File> = exec_tmp.as_mut().map(|f| f.as_file_mut());
+        let mut scanner = LineScanner::new(regex, tee, emit_ctx, stop_after_first);
+        stream_entry_to(source, re, opts.password.as_deref(), &mut scanner)
+            .with_context(|| format!("read body of {} in {}", re.name, url))?;
+        scanner.finish()
+            .with_context(|| format!("finalise scan of {} in {}", re.name, url))?;
+        if let Some(err) = scanner.deferred_err.take() {
+            return Err(err);
         }
-        if regex.is_match(line) {
-            match_count += 1;
-            if opts.exec.is_none() {
-                emit_match(out, opts, url, &re.name, line_no, line)?;
-                if opts.files_only {
-                    break;
-                }
-            } else if first_matched_line.is_none() {
-                first_matched_line = Some((line_no, line.to_vec()));
-                // Don't bail — count all matches for the checkpoint record.
-            }
-        }
+        match_count = scanner.match_count;
     }
 
     if let Some(cmd) = &opts.exec {
         if match_count > 0 {
-            let tmp = tempfile::NamedTempFile::new().context("create exec tempfile")?;
-            std::fs::write(tmp.path(), &body).context("write exec tempfile")?;
+            let tmp = exec_tmp
+                .take()
+                .expect("exec_tmp is Some whenever opts.exec is Some");
+            tmp.as_file().sync_data().ok();
             let cmd_rendered = cmd.replace("{}", &tmp.path().to_string_lossy());
             {
                 let mut out = out.lock().unwrap();
@@ -225,9 +223,9 @@ fn scan_entry(
                 .arg(&cmd_rendered)
                 .status()
                 .with_context(|| format!("spawn --exec command: {}", cmd_rendered))?;
+            // Explicit drop keeps the tempfile alive until here.
+            drop(tmp);
         }
-        // Track the first matched line so a checkpoint knows what we saw.
-        let _ = first_matched_line;
     }
 
     // Checkpoint the completion of this (archive, entry).
@@ -246,8 +244,144 @@ fn scan_entry(
     Ok(())
 }
 
-fn count_newlines(bytes: &[u8]) -> u64 {
-    bytes.iter().filter(|&&b| b == b'\n').count() as u64
+/// Context the scanner uses to emit a match line. Absent when `--exec`
+/// is in effect — then matches drive whether the command runs, not
+/// what's written to stdout.
+struct EmitCtx<'a> {
+    out: &'a Arc<Mutex<Box<dyn Write + Send>>>,
+    opts: &'a GrepOptions,
+    archive: &'a str,
+    entry: &'a str,
+}
+
+/// A `Write` that scans decompress output chunk-by-chunk, keeping only
+/// the trailing partial line in memory. Optional tee to a tempfile for
+/// `--exec`. The final line (no trailing `\n`) is scanned by `finish()`
+/// after the stream closes.
+struct LineScanner<'a, T: Write> {
+    regex: &'a Regex,
+    tee: Option<T>,
+    emit: Option<EmitCtx<'a>>,
+    stop_after_first: bool,
+
+    buf: Vec<u8>,
+    line_no: u64,
+    match_count: u64,
+    halted: bool,
+    /// Errors raised inside `write()` by the emit callback can't travel
+    /// as `anyhow::Error` through the `io::Write` contract; stash them
+    /// here and surface after `stream_entry_to` returns.
+    deferred_err: Option<anyhow::Error>,
+}
+
+impl<'a, T: Write> LineScanner<'a, T> {
+    fn new(
+        regex: &'a Regex,
+        tee: Option<T>,
+        emit: Option<EmitCtx<'a>>,
+        stop_after_first: bool,
+    ) -> Self {
+        Self {
+            regex,
+            tee,
+            emit,
+            stop_after_first,
+            buf: Vec::new(),
+            line_no: 0,
+            match_count: 0,
+            halted: false,
+            deferred_err: None,
+        }
+    }
+
+    /// Scan the final line (one without a trailing `\n`), if any. The
+    /// existing semantic — don't invent a blank line when the body ends
+    /// in `\n` — is captured naturally: `buf` is empty in that case.
+    fn finish(&mut self) -> Result<()> {
+        if let Some(t) = self.tee.as_mut() {
+            t.flush().context("flush exec tempfile")?;
+        }
+        if self.halted || self.buf.is_empty() {
+            return Ok(());
+        }
+        self.line_no += 1;
+        let line = std::mem::take(&mut self.buf);
+        if self.regex.is_match(&line) {
+            self.match_count += 1;
+            if let Some(ctx) = &self.emit {
+                emit_match(ctx.out, ctx.opts, ctx.archive, ctx.entry, self.line_no, &line)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Scan one completed line (buf + chunk-slice). Returns Err to
+    /// defer anyhow errors — see `deferred_err`.
+    fn scan_line(&mut self, chunk_slice: &[u8]) -> Result<()> {
+        self.line_no += 1;
+        // If `buf` is empty we can match on `chunk_slice` directly; this
+        // is the common case and skips a vec alloc per line.
+        let is_hit = if self.buf.is_empty() {
+            self.regex.is_match(chunk_slice)
+        } else {
+            self.buf.extend_from_slice(chunk_slice);
+            self.regex.is_match(&self.buf)
+        };
+        if !is_hit {
+            self.buf.clear();
+            return Ok(());
+        }
+        self.match_count += 1;
+        if let Some(ctx) = &self.emit {
+            let line_bytes: &[u8] = if self.buf.is_empty() { chunk_slice } else { &self.buf };
+            emit_match(ctx.out, ctx.opts, ctx.archive, ctx.entry, self.line_no, line_bytes)?;
+            if self.stop_after_first {
+                self.halted = true;
+            }
+        }
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl<'a, T: Write> Write for LineScanner<'a, T> {
+    fn write(&mut self, chunk: &[u8]) -> io::Result<usize> {
+        // Tee first so --exec always sees the full body regardless of
+        // whether the scanner has halted on first match.
+        if let Some(t) = self.tee.as_mut() {
+            t.write_all(chunk)?;
+        }
+        if self.halted || self.deferred_err.is_some() {
+            // Consume silently to let decompress finish cleanly.
+            return Ok(chunk.len());
+        }
+        let mut start = 0usize;
+        for i in 0..chunk.len() {
+            if chunk[i] == b'\n' {
+                let slice = &chunk[start..i];
+                if let Err(e) = self.scan_line(slice) {
+                    self.deferred_err = Some(e);
+                    return Ok(chunk.len());
+                }
+                start = i + 1;
+                if self.halted {
+                    break;
+                }
+            }
+        }
+        // Keep the trailing partial line (if any) for the next chunk.
+        if start < chunk.len() && !self.halted {
+            self.buf.extend_from_slice(&chunk[start..]);
+        }
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(t) = self.tee.as_mut() {
+            t.flush()?;
+        }
+        Ok(())
+    }
 }
 
 fn emit_match(

@@ -310,6 +310,98 @@ fn grep_no_match_is_clean_exit() {
 }
 
 #[test]
+fn grep_entry_without_trailing_newline() {
+    // Streaming scanner must still match the final line even when the
+    // entry body doesn't end in `\n` — without materialising the body.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("corpus")).unwrap();
+    fs::write(
+        tmp.path().join("corpus/trailing.log"),
+        // No trailing newline: last line is "ERROR final".
+        b"first\nsecond\nERROR final",
+    )
+    .unwrap();
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+
+    let (ok, stdout, stderr) = run_tzip(tmp.path(), &["grep", "ERROR", "out.zip"], &[]);
+    assert!(ok, "grep failed: {stderr}");
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "expected exactly one match, got:\n{stdout}"
+    );
+    let line = stdout.lines().next().unwrap();
+    assert!(line.contains("corpus/trailing.log"));
+    assert!(line.contains(":3:"), "line number should be 3: {line}");
+    assert!(line.ends_with("ERROR final"));
+}
+
+#[test]
+fn grep_streaming_match_spans_chunk_boundary() {
+    // The scanner's line is `buf + chunk_slice` — the scan has to work
+    // when the matching text straddles two chunks. A ~200 KiB entry with
+    // the pattern deep inside a very long line exercises both the chunk
+    // boundary and the read-across-\n behaviour.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("corpus")).unwrap();
+    let mut body: Vec<u8> = Vec::with_capacity(220 * 1024);
+    for i in 0..5000 {
+        use std::io::Write as _;
+        writeln!(body, "line {i} with some filler").unwrap();
+    }
+    // Inject the pattern inside one long line (no newline for a while).
+    let mut long_line: Vec<u8> = b"START".to_vec();
+    long_line.extend(std::iter::repeat(b'a').take(120 * 1024));
+    long_line.extend_from_slice(b"NEEDLE");
+    long_line.extend(std::iter::repeat(b'a').take(120 * 1024));
+    long_line.push(b'\n');
+    body.extend_from_slice(&long_line);
+    body.extend_from_slice(b"tail\n");
+    fs::write(tmp.path().join("corpus/wide.log"), &body).unwrap();
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+
+    let (ok, stdout, stderr) =
+        run_tzip(tmp.path(), &["grep", "NEEDLE", "out.zip", "--files-only"], &[]);
+    assert!(ok, "chunk-boundary grep failed: {stderr}");
+    assert_eq!(stdout.trim(), "out.zip:corpus/wide.log");
+}
+
+#[test]
+fn grep_streaming_large_entry_memory_bounded() {
+    // A 20 MiB entry of short lines, searched for a pattern that lives
+    // in a known late line. With the old materialising scanner we'd
+    // hold the full 20 MiB plaintext; here we only hold the trailing
+    // partial line (< 1 KiB). This is a correctness test — the memory
+    // claim is enforced structurally by LineScanner's buf semantics —
+    // but a wrong implementation would fail on content.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("corpus")).unwrap();
+    let mut body: Vec<u8> = Vec::with_capacity(20 * 1024 * 1024);
+    let before = 200_000usize;
+    for i in 0..before {
+        use std::io::Write as _;
+        writeln!(body, "normal line {i}").unwrap();
+    }
+    body.extend_from_slice(b"TARGETED_MATCH right here\n");
+    for i in 0..before {
+        use std::io::Write as _;
+        writeln!(body, "more line {i}").unwrap();
+    }
+    fs::write(tmp.path().join("corpus/big.log"), &body).unwrap();
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+
+    let (ok, stdout, stderr) =
+        run_tzip(tmp.path(), &["grep", "TARGETED_MATCH", "out.zip"], &[]);
+    assert!(ok, "big-entry grep failed: {stderr}");
+    assert_eq!(stdout.lines().count(), 1);
+    let expected_line_no = before as u64 + 1;
+    assert!(
+        stdout.contains(&format!(":{}:", expected_line_no)),
+        "expected line number {expected_line_no} in: {stdout}"
+    );
+}
+
+#[test]
 fn grep_aes_entries_with_password() {
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir_all(tmp.path().join("corpus")).unwrap();

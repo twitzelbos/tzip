@@ -283,6 +283,23 @@ Password sourcing (in precedence order):
 - `--password -` (interactive tty prompt)
 - `--password <pw>` (arg, visible in process list; prefer `--password-file` in scripts)
 
+### Multi-disk (spanned) archives
+
+tzip reads archives split across `base.z01`, `base.z02`, ...,
+`base.zip` — the format Info-ZIP's `zip -s`, and ancient PKZIP for
+floppy spanning, produce. Point tzip at the last disk (`.zip`) and
+it opens the siblings automatically:
+
+```
+tzip ls      bigarchive.zip                    # lists across all disks
+tzip cat     bigarchive.zip path/entry.log     # even if the body spans disks
+tzip x       bigarchive.zip --to ./extracted   # parallel workers open their own stitched views
+```
+
+Local files only — the sibling disks must live in the same
+directory as the `.zip`. HTTP and S3 multi-disk aren't supported;
+no standard cloud layout addresses them anyway.
+
 ### Reading ZipCrypto-encrypted archives (vintage password protection)
 
 tzip also **reads** entries encrypted with traditional PKZIP

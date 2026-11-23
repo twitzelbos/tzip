@@ -8,7 +8,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -24,8 +24,20 @@ use crate::zipreader::{Archive, ReadEntry};
 /// anything else → local file path. Called by every reader subcommand so
 /// local and remote behave identically downstream of this seam.
 pub(crate) fn open_archive(spec: &str) -> Result<Archive> {
-    let src = open_source_for(spec)?;
-    Archive::open_source(src)
+    // Local paths go through `Archive::open` so multi-disk spanned
+    // archives get stitched across their sibling `.z01`..`.zip` files.
+    // Remote schemes (http/https/s3) don't have sibling disks — they
+    // use `open_source_for` + `open_source`, which fails loudly on
+    // multi-disk EOCDs rather than silently misinterpreting them.
+    if spec.starts_with("s3://")
+        || spec.starts_with("http://")
+        || spec.starts_with("https://")
+    {
+        let src = open_source_for(spec)?;
+        Archive::open_source(src)
+    } else {
+        Archive::open(Path::new(spec))
+    }
 }
 
 /// Open a raw `Read + Seek + Send` backing source for `spec` without
@@ -42,9 +54,45 @@ pub(crate) fn open_source_for(spec: &str) -> Result<Box<dyn crate::sources::Read
             .with_context(|| format!("open HTTP source {}", spec))?;
         Ok(Box::new(src))
     } else {
-        let file = std::fs::File::open(Path::new(spec))
-            .with_context(|| format!("open {}", spec))?;
-        Ok(Box::new(file))
+        // For local paths, detect multi-disk archives by peeking the
+        // EOCD and return a `MultiDiskSource` in that case. Parallel
+        // extract workers use this seam, so each worker gets its own
+        // set of file handles — exactly the same per-worker-source
+        // model HTTP + S3 already use for Range GET overlap.
+        local_source_for(Path::new(spec))
+    }
+}
+
+fn local_source_for(path: &Path) -> Result<Box<dyn crate::sources::ReadSeek>> {
+    use crate::sources::multidisk::MultiDiskSource;
+
+    let mut probe = std::fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    // Probe for multi-disk via the EOCD. On any read error treat as
+    // single-disk — Archive::open_source will surface the parse error.
+    let file_size = match probe.seek(SeekFrom::End(0)) {
+        Ok(n) => n,
+        Err(_) => {
+            drop(probe);
+            let f = std::fs::File::open(path)
+                .with_context(|| format!("re-open {}", path.display()))?;
+            return Ok(Box::new(f));
+        }
+    };
+    let total_disks = crate::zipreader::probe_total_disks(&mut probe, file_size).ok();
+    drop(probe);
+
+    match total_disks {
+        Some(n) if n >= 2 => {
+            let md = MultiDiskSource::open(path, n)
+                .with_context(|| format!("open multi-disk source for {}", path.display()))?;
+            Ok(Box::new(md))
+        }
+        _ => {
+            let f = std::fs::File::open(path)
+                .with_context(|| format!("re-open {}", path.display()))?;
+            Ok(Box::new(f))
+        }
     }
 }
 

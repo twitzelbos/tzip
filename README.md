@@ -34,6 +34,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Reading archives](#reading-archives)
 - [Reading remote archives (HTTP / S3)](#reading-remote-archives-http--s3)
 - [Searching across many archives (`tzip grep`)](#searching-across-many-archives-tzip-grep)
+- [Mounting archives as a filesystem (`tzip mount`)](#mounting-archives-as-a-filesystem-tzip-mount)
 - [TUI mode](#tui-mode)
 - [Performance](#performance)
 - [External-drive tuning](#external-drive-tuning)
@@ -587,6 +588,71 @@ are still handled by your shell.
 - **Output ordering is non-deterministic** with parallel workers.
   Use `-P 1 --inner-jobs 1` for stable order, or pipe through
   `--json | jq -s 'sort_by(.archive, .entry, .line)'`.
+
+## Mounting archives as a filesystem (`tzip mount`)
+
+`tzip mount <archive> <mountpoint>` serves any ZIP as a read-only
+filesystem via FUSE3. Every shell tool — `cat`, `grep`, `ripgrep`,
+`vim`, `find`, `git` — works against the mount transparently. Combined
+with the S3 reader, you can mount a 100 GB archive from S3 locally and
+read individual files out of it without staging anything:
+
+```
+mkdir /tmp/mnt
+tzip mount s3://my-bucket/huge.zip /tmp/mnt &
+cat /tmp/mnt/path/to/entry.log           # Range GETs only the needed bytes
+rg PATTERN /tmp/mnt/                     # same, bodies decrypted on access
+fusermount3 -u /tmp/mnt                  # unmount (or Ctrl-C the tzip mount)
+```
+
+Also works on local files and HTTP URLs:
+
+```
+tzip mount out.zip /tmp/mnt &
+tzip mount https://example.com/release.zip /tmp/mnt &
+```
+
+### Flags
+
+| flag | default | meaning |
+|---|---|---|
+| `--cache-mb <N>` | 256 | Memory budget for the per-entry decompressed-body LRU cache. Soft limit — one oversized entry won't force a thrash, just briefly exceeds the budget. |
+| `--allow-other` | off | Add the `allow_other` FUSE option so other users on the host can read the mount. Needs `user_allow_other` in `/etc/fuse.conf`. |
+| `-p, --password <PW>` | | AES password for encrypted entries. `--password-file` reads from file. |
+
+### Semantics
+
+- **Read-only.** Writes fail with `EROFS`. R/W is a planned Phase H2
+  feature with its own multi-month POSIX-edge-case work.
+- **First access decompresses.** The first read of an entry decompresses
+  the whole body into RAM; subsequent reads (same entry, any offset) are
+  RAM-speed memcpy. The LRU evicts cold entries to stay under `--cache-mb`.
+- **AES decryption happens on access** — the password stays in-process
+  for the life of the mount. Only entries you actually read get
+  decrypted.
+- **Unmount** via Ctrl-C on the foreground `tzip mount` or
+  `fusermount3 -u <mountpoint>` from another shell.
+
+### Platform support
+
+- **Linux (FUSE3)** — this release. Install `fuse3` via your package
+  manager (`apt install fuse3`, `dnf install fuse3`, etc.).
+- **macOS (FSKit, macOS 15+)** — planned follow-up PR. Needs a Swift
+  bridge module + `sysextensionsctl` registration. Until that lands,
+  `tzip mount` on macOS prints a clear "planned follow-up" error.
+
+### Known limits
+
+- **Inode numbers are stable within one mount session but not across
+  remounts.** Shell tools that rely on persistent inodes (very rare)
+  will get confused.
+- **Concurrent reads of different entries serialise** through a single
+  archive-source mutex. A follow-up can pool sources per-mount for
+  parallel Range GETs (mirroring `tzip grep --inner-jobs`).
+- **mtime from the DOS-epoch default** if the archive was created by
+  tzip's macOS bulk walker — same limitation documented elsewhere.
+- **Symlinks** aren't surfaced as symlinks (ZIP writer doesn't emit
+  them yet). Follow-up.
 
 ## TUI mode
 

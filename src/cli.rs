@@ -81,6 +81,10 @@ pub enum Cmd {
     /// fan-out, filter, and checkpoint flags.
     #[command(alias = "g")]
     Grep(GrepArgs),
+
+    /// Mount an archive as a read-only filesystem. Linux FUSE3 ships
+    /// in this release; macOS FSKit support is a planned follow-up PR.
+    Mount(MountArgs),
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -368,6 +372,37 @@ pub struct GrepArgs {
     pub resume: bool,
 
     /// Password for AES-encrypted entries.
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+
+    #[arg(long, conflicts_with = "password")]
+    pub password_file: Option<PathBuf>,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct MountArgs {
+    /// Archive. Accepts a local path, `http(s)://` URL, or
+    /// `s3://bucket/key` URL.
+    pub archive: String,
+    /// Mount point (must exist, be empty, and be writable to the
+    /// current user — standard FUSE requirements).
+    pub mountpoint: PathBuf,
+
+    /// Memory budget for the per-entry decompressed-body LRU cache (MiB).
+    #[arg(long, default_value_t = 256)]
+    pub cache_mb: usize,
+
+    /// Allow other users to read the mount. Adds `allow_other` to the
+    /// FUSE options; requires `user_allow_other` in /etc/fuse.conf.
+    #[arg(long)]
+    pub allow_other: bool,
+
     #[arg(short = 'p', long)]
     pub password: Option<String>,
 
@@ -719,6 +754,21 @@ fn civil_to_unix(y: i64, m: u32, d: u32) -> i64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe as i64 - 719_468;
     days * 86_400
+}
+
+impl MountArgs {
+    pub fn into_options(self) -> Result<crate::mount::MountOptions> {
+        let password = resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
+        Ok(crate::mount::MountOptions {
+            archive_spec: self.archive,
+            mountpoint: self.mountpoint,
+            cache_mb: self.cache_mb,
+            allow_other: self.allow_other,
+            password,
+            quiet: self.quiet,
+            verbose: self.verbose,
+        })
+    }
 }
 
 impl ExtractArgs {

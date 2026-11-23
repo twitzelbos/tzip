@@ -118,6 +118,9 @@ pub fn run_ls(opts: ReaderOptions) -> Result<()> {
             "{:>10}  {:>10}  {:<9} {}  {} {}",
             e.uncomp_size, e.comp_size, method, dt, encrypted_mark, e.name,
         )?;
+        if opts.verbose && !e.comment.is_empty() {
+            writeln!(out, "            # {}", e.comment)?;
+        }
         total_uncomp += e.uncomp_size;
         total_comp += e.comp_size;
     }
@@ -132,6 +135,13 @@ pub fn run_ls(opts: ReaderOptions) -> Result<()> {
         total_comp,
         arch.entries().len()
     )?;
+    if !arch.archive_comment().is_empty() {
+        writeln!(out)?;
+        writeln!(out, "Archive comment:")?;
+        for line in arch.archive_comment().lines() {
+            writeln!(out, "  {}", line)?;
+        }
+    }
     Ok(())
 }
 
@@ -285,6 +295,8 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
                         let mut buf = BufWriter::new(f);
                         stream_entry_to(&mut *source, &re, password.as_deref(), &mut buf)?;
                         buf.flush().context("flush extract buffer")?;
+                        drop(buf);
+                        apply_unix_mode(&dest, &re);
                         Ok(())
                     })();
                     match write_result {
@@ -346,6 +358,33 @@ fn stream_entry<W: Write>(
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
+
+/// If the archive was produced on a Unix host and carries sane mode
+/// bits in `external_attr`, apply them with `chmod`. Permission-only
+/// (we don't flip ownership, and we don't try to restore anything
+/// outside the standard rwx + setuid/setgid/sticky bits — a malicious
+/// archive can't set arbitrary bits this way). Non-Unix hosts or
+/// entries with a zero mode get left at the default from `File::create`.
+#[cfg(unix)]
+fn apply_unix_mode(dest: &Path, re: &ReadEntry) {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(mode) = re.unix_mode() else { return };
+    // Keep only the file-permission bits we're comfortable restoring:
+    // setuid/setgid/sticky + rwxrwxrwx (0o7777). Type bits (S_IFREG etc.)
+    // are dropped; the file is already a regular file we created.
+    let perm_bits = mode & 0o7777;
+    if perm_bits == 0 {
+        return;
+    }
+    let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(perm_bits));
+}
+
+#[cfg(not(unix))]
+fn apply_unix_mode(_dest: &Path, _re: &ReadEntry) {
+    // On Windows the external_attr DOS bits are a different beast; leave
+    // the default ACL that File::create produced. The ZIP spec defers to
+    // the platform on "how to restore attributes" — doing nothing is fine.
+}
 
 fn find_entry_index(arch: &Archive, name: &str) -> Result<usize> {
     arch.entries()

@@ -7,19 +7,37 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use crate::cli::{Method, ReaderOp, ReaderOptions};
 use crate::crypto::{self, AE2_OVERHEAD};
 use crate::decompress;
+use crate::sources::{http::HttpSource, s3::S3Source};
 use crate::zipreader::{Archive, ReadEntry};
+
+/// Dispatches on scheme: `s3://…` → `S3Source`, `http(s)://…` → `HttpSource`,
+/// anything else → local file path. Called by every reader subcommand so
+/// local and remote behave identically downstream of this seam.
+fn open_archive(spec: &str) -> Result<Archive> {
+    if let Some(rest) = spec.strip_prefix("s3://") {
+        let src = S3Source::open(rest)
+            .with_context(|| format!("open S3 source s3://{}", rest))?;
+        Archive::open_source(Box::new(src))
+    } else if spec.starts_with("http://") || spec.starts_with("https://") {
+        let src = HttpSource::open(spec)
+            .with_context(|| format!("open HTTP source {}", spec))?;
+        Archive::open_source(Box::new(src))
+    } else {
+        Archive::open(Path::new(spec))
+    }
+}
 
 // ── Entry points ───────────────────────────────────────────────────────────
 
 pub fn run_ls(opts: ReaderOptions) -> Result<()> {
-    let arch = Archive::open(&opts.archive)
-        .with_context(|| format!("open {}", opts.archive.display()))?;
+    let arch = open_archive(&opts.archive)
+        .with_context(|| format!("open {}", opts.archive))?;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -66,8 +84,8 @@ pub fn run_cat(opts: ReaderOptions) -> Result<()> {
         ReaderOp::Cat { name } => name.clone(),
         _ => unreachable!("run_cat called with wrong op"),
     };
-    let mut arch = Archive::open(&opts.archive)
-        .with_context(|| format!("open {}", opts.archive.display()))?;
+    let mut arch = open_archive(&opts.archive)
+        .with_context(|| format!("open {}", opts.archive))?;
 
     let idx = find_entry_index(&arch, &name)?;
     arch.lfh_total_size_of(idx)?;
@@ -90,8 +108,8 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     let to = fs::canonicalize(&to)
         .with_context(|| format!("canonicalize {}", to.display()))?;
 
-    let mut arch = Archive::open(&opts.archive)
-        .with_context(|| format!("open {}", opts.archive.display()))?;
+    let mut arch = open_archive(&opts.archive)
+        .with_context(|| format!("open {}", opts.archive))?;
 
     let selected_set: Option<std::collections::HashSet<String>> = if names_filter.is_empty() {
         None
@@ -189,7 +207,7 @@ fn stream_entry<W: Write>(
     dst: &mut W,
 ) -> Result<u64> {
     let body_offset = re.lfh_offset + re.lfh_total_size as u64;
-    arch.file_mut()
+    arch.source_mut()
         .seek(SeekFrom::Start(body_offset))
         .with_context(|| format!("seek to body of {}", re.name))?;
 
@@ -215,7 +233,7 @@ fn stream_entry<W: Write>(
         // A future optimization: wire crypto::decrypt_ae2 as a Read adapter
         // instead of materializing the plaintext.
         let mut plaintext: Vec<u8> = Vec::with_capacity(re.uncomp_size.min(64 * 1024 * 1024) as usize);
-        crypto::decrypt_ae2(password, arch.file_mut(), ciphertext_len, &mut plaintext)?;
+        crypto::decrypt_ae2(password, arch.source_mut(), ciphertext_len, &mut plaintext)?;
 
         let written = decompress::decompress(
             inner_method,
@@ -226,10 +244,11 @@ fn stream_entry<W: Write>(
         Ok(written)
     } else {
         // Non-encrypted: feed the archive body directly through decompress,
-        // taking only `re.comp_size` bytes so a corrupt entry can't drag in
-        // bytes from a trailing entry.
-        let body = arch.file_mut().try_clone().context("clone archive fd")?;
-        let bounded = body.take(re.comp_size);
+        // bounded to `re.comp_size` so a corrupt entry can't drag in bytes
+        // from the next entry. `(&mut *source).take(n)` wraps the source
+        // without needing to clone it — works for Box<dyn ReadSeek> where
+        // `try_clone` isn't available.
+        let bounded = arch.source_mut().take(re.comp_size);
         let written = decompress::decompress(inner_method, bounded, re.uncomp_size, dst)?;
         Ok(written)
     }

@@ -152,7 +152,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// plaintext is written to `dst`. On MAC mismatch we fail *after* the
 /// stream is through — the caller must treat any bytes already written to
 /// `dst` as untrusted and discard them.
-pub fn decrypt_ae2<R: Read, W: Write>(
+pub fn decrypt_ae2<R: Read + ?Sized, W: Write + ?Sized>(
     password: &str,
     src: &mut R,
     ciphertext_len: u64,

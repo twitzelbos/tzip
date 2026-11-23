@@ -10,6 +10,7 @@ mod platform;
 mod progress;
 mod reader;
 mod sevenz;
+mod sources;
 mod tui;
 mod update;
 mod walker;

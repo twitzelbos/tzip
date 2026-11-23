@@ -115,7 +115,7 @@ impl<W: Write + Seek> ZipWriter<W> {
     /// current `pos`, then record its central entry at the new offset.
     /// Used by rebuild mode. `src` must be seekable and `re.lfh_total_size`
     /// must be populated (via `Archive::lfh_total_size_of`).
-    pub fn carry_existing_entry<R: Read + Seek>(
+    pub fn carry_existing_entry<R: Read + Seek + ?Sized>(
         &mut self,
         src: &mut R,
         re: &ReadEntry,

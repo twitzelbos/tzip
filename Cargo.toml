@@ -76,6 +76,14 @@ byteorder = "1.5"
 libc = "0.2"
 parking_lot = "0.12"
 
+# Remote archive sources: HTTP(S) Range reader + S3 reader (SigV4-signed).
+# ureq is synchronous (no tokio runtime), tiny dep tree, rustls by default —
+# matches tzip's std-thread model. url is used by both sources for parsing.
+# sha2 pairs with the existing sha1 for SigV4's HMAC chain.
+ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
+url = "2.5"
+sha2 = "0.10"
+
 # Linux io_uring reader (optional, behind the `io-uring` feature).
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.6", optional = true }
@@ -83,6 +91,8 @@ io-uring = { version = "0.6", optional = true }
 [dev-dependencies]
 tempfile = "3"
 zip = "0.6"
+# Local HTTP fixture for reader_http / reader_s3 integration tests.
+tiny_http = "0.12"
 
 [build-dependencies]
 cc = "1"

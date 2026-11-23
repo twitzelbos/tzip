@@ -97,6 +97,22 @@ pub(crate) struct RawItem {
     pub(crate) bytes: platform::ReadBuf,
 }
 
+/// Create and update stay local-only. Reject URL-shaped archive paths
+/// upfront with a clear error pointing users at the right subcommand.
+pub(crate) fn reject_remote_archive(archive: &std::path::Path) -> Result<()> {
+    let s = archive.to_string_lossy();
+    for scheme in &["http://", "https://", "s3://"] {
+        if s.starts_with(scheme) {
+            anyhow::bail!(
+                "remote writes are not supported — {} is a URL; \
+                 only `ls`, `cat`, and `x` work on remote URLs",
+                s
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Shared single-file encoder used by both the main pipeline and update mode.
 pub(crate) fn encode_item(
     raw: &RawItem,
@@ -110,6 +126,8 @@ pub(crate) fn encode_item(
 }
 
 pub fn run(opts: Options) -> Result<()> {
+    reject_remote_archive(&opts.archive)?;
+
     // --update dispatches to the update-mode entry point when the target
     // archive already exists. On a non-existent archive, `-u` falls back
     // to create mode (matches `7z u`). `.7z` is rejected upfront at CLI

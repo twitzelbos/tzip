@@ -237,8 +237,10 @@ pub struct UpdateArgs {
 
 #[derive(Args, Debug)]
 pub struct LsArgs {
-    /// Archive to list.
-    pub archive: PathBuf,
+    /// Archive to list. Accepts a local file path, an `http(s)://` URL, or
+    /// an `s3://bucket/key` URL (requires AWS credentials in the usual env
+    /// vars or `~/.aws/credentials`).
+    pub archive: String,
 
     /// Password for AES-encrypted archives. Not needed for `ls` output
     /// itself; accepted for parity with `cat` / `x`.
@@ -257,7 +259,9 @@ pub struct LsArgs {
 
 #[derive(Args, Debug)]
 pub struct CatArgs {
-    pub archive: PathBuf,
+    /// Archive. Accepts a local file path, an `http(s)://` URL, or an
+    /// `s3://bucket/key` URL.
+    pub archive: String,
     /// Archive-internal name of the entry to stream.
     pub name: String,
 
@@ -276,7 +280,9 @@ pub struct CatArgs {
 
 #[derive(Args, Debug)]
 pub struct ExtractArgs {
-    pub archive: PathBuf,
+    /// Archive. Accepts a local file path, an `http(s)://` URL, or an
+    /// `s3://bucket/key` URL.
+    pub archive: String,
     /// Specific entries to extract. Empty = extract the whole archive.
     #[arg(required = false)]
     pub names: Vec<String>,
@@ -352,7 +358,8 @@ pub enum ReaderOp {
 
 #[derive(Clone, Debug)]
 pub struct ReaderOptions {
-    pub archive: PathBuf,
+    /// Local path, `http(s)://` URL, or `s3://bucket/key` URL.
+    pub archive: String,
     pub password: Option<String>,
     pub quiet: bool,
     pub verbose: bool,

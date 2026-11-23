@@ -288,7 +288,7 @@ fn run_update_rebuild(
                         let mut re = re.clone();
                         let name = re.name.clone();
                         populate_lfh_size(&mut arch, &mut re, name)?;
-                        zw.carry_existing_entry(arch.file_mut(), &re)?;
+                        zw.carry_existing_entry(arch.source_mut(), &re)?;
                         progress.inc(re.comp_size);
                         progress.set_msg(format!("carried {}", re.name));
                     }
@@ -310,7 +310,7 @@ fn run_update_rebuild(
                 let mut re = re.clone();
                 let name = re.name.clone();
                 populate_lfh_size(&mut arch, &mut re, name)?;
-                zw.carry_existing_entry(arch.file_mut(), &re)?;
+                zw.carry_existing_entry(arch.source_mut(), &re)?;
                 progress.inc(re.comp_size);
                 progress.set_msg(format!("carried {}", re.name));
             }

@@ -7,38 +7,195 @@
 //! `props_len_le_u16`) that is NOT part of the LZMA_ALONE format. On the
 //! decode side we strip that prefix, re-assemble a well-formed LZMA_ALONE
 //! stream with a known uncompressed size, and feed xz2's LZMA decoder.
+//!
+//! The pre-Deflate PKZIP methods — Shrink (1), Reduce (2-5), Implode (6)
+//! — go through `compcol`, a pure-Rust codec collection, via a push-pull
+//! adapter (`drive_compcol`). Each needs out-of-band metadata from the
+//! ZIP entry: Shrink needs the uncompressed length, Reduce needs the
+//! factor (encoded in the method ID), Implode needs the window size +
+//! literal-tree flags (from general-purpose bits 1 and 2).
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{Read, Write};
 
 use crate::cli::Method;
+use compcol::Decoder as CompcolDecoder;
+
+/// All methods tzip can *read*. A superset of the write-side `Method`
+/// enum (the pre-Deflate PKZIP methods are decode-only, as they are in
+/// every modern toolchain since PKZIP 2.x). Per-entry config travels
+/// inside the variants so `decompress` stays a single uniform call.
+#[derive(Copy, Clone, Debug)]
+pub enum ReadMethod {
+    Store,
+    Deflate,
+    Bzip2,
+    Lzma,
+    Xz,
+    Zstd,
+    /// PKZIP method 1 — LZW variant (9-13 bit codes, partial clear).
+    Shrink,
+    /// PKZIP methods 2-5 — `factor` is 1, 2, 3, or 4.
+    Reduce(u8),
+    /// PKZIP method 6 — Shannon-Fano coded LZ77 with 4 or 8 KiB window.
+    Implode { large_window: bool, lit_tree: bool },
+}
+
+impl ReadMethod {
+    /// Short label for `tzip ls` output.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReadMethod::Store => "store",
+            ReadMethod::Deflate => "deflate",
+            ReadMethod::Bzip2 => "bzip2",
+            ReadMethod::Lzma => "lzma",
+            ReadMethod::Xz => "xz",
+            ReadMethod::Zstd => "zstd",
+            ReadMethod::Shrink => "shrink",
+            ReadMethod::Reduce(_) => "reduce",
+            ReadMethod::Implode { .. } => "implode",
+        }
+    }
+
+    /// Lift the modern write-side method into its read-side equivalent.
+    /// Used by `compress.rs`'s self-test / round-trip helpers that
+    /// already have a `Method` on hand.
+    pub fn from_write_method(m: Method) -> Self {
+        match m {
+            Method::Store => ReadMethod::Store,
+            Method::Deflate => ReadMethod::Deflate,
+            Method::Bzip2 => ReadMethod::Bzip2,
+            Method::Lzma => ReadMethod::Lzma,
+            Method::Xz => ReadMethod::Xz,
+            Method::Zstd => ReadMethod::Zstd,
+        }
+    }
+}
 
 pub fn decompress<R: Read, W: Write>(
-    method: Method,
+    method: ReadMethod,
     src: R,
     uncomp_size: u64,
     dst: &mut W,
 ) -> Result<u64> {
     match method {
-        Method::Store => copy_exact(src, dst, uncomp_size).context("store copy"),
-        Method::Deflate => {
+        ReadMethod::Store => copy_exact(src, dst, uncomp_size).context("store copy"),
+        ReadMethod::Deflate => {
             let mut dec = flate2::read::DeflateDecoder::new(src);
             std::io::copy(&mut dec, dst).context("deflate decompress")
         }
-        Method::Bzip2 => {
+        ReadMethod::Bzip2 => {
             let mut dec = bzip2::read::BzDecoder::new(src);
             std::io::copy(&mut dec, dst).context("bzip2 decompress")
         }
-        Method::Xz => {
+        ReadMethod::Xz => {
             let mut dec = xz2::read::XzDecoder::new(src);
             std::io::copy(&mut dec, dst).context("xz decompress")
         }
-        Method::Zstd => {
+        ReadMethod::Zstd => {
             let mut dec =
                 zstd::stream::read::Decoder::new(src).context("zstd decoder init")?;
             std::io::copy(&mut dec, dst).context("zstd decompress")
         }
-        Method::Lzma => decompress_lzma(src, uncomp_size, dst),
+        ReadMethod::Lzma => decompress_lzma(src, uncomp_size, dst),
+        ReadMethod::Shrink => {
+            let dec = compcol::zip_shrink::Decoder::raw(uncomp_size);
+            drive_compcol("shrink", dec, src, dst)
+        }
+        ReadMethod::Reduce(factor) => {
+            let dec = compcol::zip_reduce::Decoder::raw(factor, uncomp_size)
+                .map_err(|e| anyhow!("reduce decoder init (factor {}): {:?}", factor, e))?;
+            drive_compcol("reduce", dec, src, dst)
+        }
+        ReadMethod::Implode { large_window, lit_tree } => {
+            let dec = compcol::zip_implode::Decoder::raw(large_window, lit_tree, uncomp_size);
+            drive_compcol("implode", dec, src, dst)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Store is trivial, but exercises the full `decompress` entry point
+    /// end-to-end. `ReadMethod::Store` doesn't touch compcol — the real
+    /// coverage of the compcol adapter lives in `drive_compcol_smoke`.
+    #[test]
+    fn store_roundtrips() {
+        let payload = b"hello store".to_vec();
+        let mut out = Vec::new();
+        let n = decompress(
+            ReadMethod::Store,
+            std::io::Cursor::new(&payload),
+            payload.len() as u64,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(n as usize, payload.len());
+        assert_eq!(out, payload);
+    }
+
+    /// Validate the push-pull adapter with a tiny decoder that returns
+    /// `StreamEnd` after copying input to output — no feature flags
+    /// needed, and it touches every branch of `drive_compcol`.
+    #[test]
+    fn drive_compcol_smoke() {
+        use compcol::{Error as CcErr, Progress, Status};
+
+        struct Identity {
+            done: bool,
+        }
+
+        impl CompcolDecoder for Identity {
+            fn decode(
+                &mut self,
+                input: &[u8],
+                output: &mut [u8],
+            ) -> Result<(Progress, Status), CcErr> {
+                if self.done {
+                    return Ok((Progress { consumed: 0, written: 0 }, Status::StreamEnd));
+                }
+                let n = input.len().min(output.len());
+                output[..n].copy_from_slice(&input[..n]);
+                let status = if n < input.len() {
+                    Status::OutputFull
+                } else {
+                    Status::InputEmpty
+                };
+                Ok((Progress { consumed: n, written: n }, status))
+            }
+            fn finish(
+                &mut self,
+                _output: &mut [u8],
+            ) -> Result<(Progress, Status), CcErr> {
+                self.done = true;
+                Ok((Progress { consumed: 0, written: 0 }, Status::StreamEnd))
+            }
+            fn reset(&mut self) {
+                self.done = false;
+            }
+            fn discard_output(
+                &mut self,
+                _input: &[u8],
+                _n: usize,
+            ) -> Result<(Progress, Status), CcErr> {
+                Ok((Progress { consumed: 0, written: 0 }, Status::InputEmpty))
+            }
+        }
+
+        // 200 KiB — big enough to exercise multiple refills.
+        let payload: Vec<u8> = (0..200 * 1024).map(|i| (i & 0xff) as u8).collect();
+        let mut out = Vec::new();
+        let n = drive_compcol(
+            "identity",
+            Identity { done: false },
+            std::io::Cursor::new(&payload),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(n as usize, payload.len());
+        assert_eq!(out, payload);
     }
 }
 
@@ -96,4 +253,87 @@ fn decompress_lzma<R: Read, W: Write>(
         .map_err(|e| anyhow!("lzma decoder init: {e:?}"))?;
     let mut dec = xz2::read::XzDecoder::new_stream(chained, stream);
     std::io::copy(&mut dec, dst).context("lzma decompress")
+}
+
+/// Bridge the push-pull `compcol::Decoder` trait (`decode(input,
+/// output) -> (Progress, Status)` + `finish(output)`) to the
+/// `Read` + `Write` streaming pattern the rest of tzip uses. Reads from
+/// `src` into a 64 KiB input buffer, hands it to the decoder, writes
+/// its 256 KiB output chunk to `dst`, repeats. Exits on
+/// `Status::StreamEnd` or when `src` runs dry (then calls `finish`).
+fn drive_compcol<D: CompcolDecoder, R: Read, W: Write>(
+    name: &'static str,
+    mut dec: D,
+    mut src: R,
+    dst: &mut W,
+) -> Result<u64> {
+    use compcol::Status;
+
+    let mut in_buf = [0u8; 64 * 1024];
+    let mut out_buf = vec![0u8; 256 * 1024];
+    let mut in_fill: usize = 0;
+    let mut in_pos: usize = 0;
+    let mut src_eof = false;
+    let mut total_out: u64 = 0;
+
+    loop {
+        // Refill the input buffer when empty and the source isn't done.
+        if in_pos == in_fill && !src_eof {
+            in_fill = 0;
+            in_pos = 0;
+            let n = src
+                .read(&mut in_buf)
+                .with_context(|| format!("{} decompress: read source", name))?;
+            if n == 0 {
+                src_eof = true;
+            } else {
+                in_fill = n;
+            }
+        }
+
+        if in_pos == in_fill && src_eof {
+            // No more input — tell the decoder we're done and flush any
+            // final output. Loop in case the decoder emits more than
+            // one output buffer worth.
+            loop {
+                let (progress, status) = dec
+                    .finish(&mut out_buf)
+                    .map_err(|e| anyhow!("{} finish: {:?}", name, e))?;
+                if progress.written > 0 {
+                    dst.write_all(&out_buf[..progress.written])
+                        .with_context(|| format!("{} decompress: write dst", name))?;
+                    total_out += progress.written as u64;
+                }
+                match status {
+                    Status::StreamEnd => return Ok(total_out),
+                    Status::OutputFull => continue,
+                    Status::InputEmpty => {
+                        bail!("{} decoder requested more input at EOF", name);
+                    }
+                }
+            }
+        }
+
+        let (progress, status) = dec
+            .decode(&in_buf[in_pos..in_fill], &mut out_buf)
+            .map_err(|e| anyhow!("{} decode: {:?}", name, e))?;
+        in_pos += progress.consumed;
+        if progress.written > 0 {
+            dst.write_all(&out_buf[..progress.written])
+                .with_context(|| format!("{} decompress: write dst", name))?;
+            total_out += progress.written as u64;
+        }
+        match status {
+            Status::StreamEnd => return Ok(total_out),
+            Status::InputEmpty | Status::OutputFull => {
+                if progress.consumed == 0 && progress.written == 0 {
+                    // Guard against a pathological no-progress loop.
+                    bail!(
+                        "{} decoder stalled (no input consumed, no output produced)",
+                        name
+                    );
+                }
+            }
+        }
+    }
 }

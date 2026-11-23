@@ -12,9 +12,9 @@ use std::io::{BufWriter, Read, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::cli::{Method, ReaderOp, ReaderOptions};
+use crate::cli::{ReaderOp, ReaderOptions};
 use crate::crypto::{self, AE2_OVERHEAD};
-use crate::decompress;
+use crate::decompress::{self, ReadMethod};
 use crate::sources::{http::HttpSource, s3::S3Source};
 use crate::zipreader::{Archive, ReadEntry};
 
@@ -61,7 +61,7 @@ pub(crate) fn stream_entry_to<W: Write>(
         .seek(SeekFrom::Start(body_offset))
         .with_context(|| format!("seek to body of {}", re.name))?;
 
-    let inner_method = method_from_id(re.inner_method)
+    let inner_method = method_from_id(re.inner_method, re.gp_flags)
         .ok_or_else(|| anyhow!("unsupported compression method {} on {}", re.inner_method, re.name))?;
 
     if re.encrypted {
@@ -355,25 +355,33 @@ fn find_entry_index(arch: &Archive, name: &str) -> Result<usize> {
 }
 
 fn method_label(e: &ReadEntry) -> &'static str {
-    match method_from_id(e.inner_method) {
-        Some(Method::Store) => "store",
-        Some(Method::Deflate) => "deflate",
-        Some(Method::Bzip2) => "bzip2",
-        Some(Method::Lzma) => "lzma",
-        Some(Method::Xz) => "xz",
-        Some(Method::Zstd) => "zstd",
+    match method_from_id(e.inner_method, e.gp_flags) {
+        Some(m) => m.label(),
         None => "?",
     }
 }
 
-fn method_from_id(id: u16) -> Option<Method> {
+/// Resolve a ZIP compression method ID + general-purpose flag word to
+/// the read-side enum. The GP flags are needed by Implode (bits 1 and 2
+/// carry the window size and literal-tree decisions); everything else
+/// ignores them.
+fn method_from_id(id: u16, gp_flags: u16) -> Option<ReadMethod> {
     Some(match id {
-        0 => Method::Store,
-        8 => Method::Deflate,
-        12 => Method::Bzip2,
-        14 => Method::Lzma,
-        93 => Method::Zstd,
-        95 => Method::Xz,
+        0 => ReadMethod::Store,
+        1 => ReadMethod::Shrink,
+        2 => ReadMethod::Reduce(1),
+        3 => ReadMethod::Reduce(2),
+        4 => ReadMethod::Reduce(3),
+        5 => ReadMethod::Reduce(4),
+        6 => ReadMethod::Implode {
+            large_window: (gp_flags & 0b0000_0010) != 0,
+            lit_tree: (gp_flags & 0b0000_0100) != 0,
+        },
+        8 => ReadMethod::Deflate,
+        12 => ReadMethod::Bzip2,
+        14 => ReadMethod::Lzma,
+        93 => ReadMethod::Zstd,
+        95 => ReadMethod::Xz,
         _ => return None,
     })
 }
@@ -429,4 +437,48 @@ fn safe_join(root: &Path, name: &str) -> Result<PathBuf> {
         out.push(seg);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ZIP method ID → `ReadMethod` mapping. Covers the modern
+    /// tzip-written methods *and* the pre-Deflate PKZIP methods so a
+    /// future ID change (`inner_method` field widening, say) fails
+    /// loudly instead of silently rerouting Imploded entries to Store.
+    #[test]
+    fn method_from_id_covers_all_supported() {
+        assert!(matches!(method_from_id(0, 0), Some(ReadMethod::Store)));
+        assert!(matches!(method_from_id(1, 0), Some(ReadMethod::Shrink)));
+        assert!(matches!(method_from_id(2, 0), Some(ReadMethod::Reduce(1))));
+        assert!(matches!(method_from_id(3, 0), Some(ReadMethod::Reduce(2))));
+        assert!(matches!(method_from_id(4, 0), Some(ReadMethod::Reduce(3))));
+        assert!(matches!(method_from_id(5, 0), Some(ReadMethod::Reduce(4))));
+        // Implode with no flags → small window, two trees.
+        match method_from_id(6, 0) {
+            Some(ReadMethod::Implode { large_window, lit_tree }) => {
+                assert!(!large_window);
+                assert!(!lit_tree);
+            }
+            other => panic!("expected Implode, got {:?}", other),
+        }
+        // Implode with GP bits 1 and 2 → large window, literal tree.
+        match method_from_id(6, 0b0000_0110) {
+            Some(ReadMethod::Implode { large_window, lit_tree }) => {
+                assert!(large_window);
+                assert!(lit_tree);
+            }
+            other => panic!("expected Implode(large,lit), got {:?}", other),
+        }
+        assert!(matches!(method_from_id(8, 0), Some(ReadMethod::Deflate)));
+        assert!(matches!(method_from_id(12, 0), Some(ReadMethod::Bzip2)));
+        assert!(matches!(method_from_id(14, 0), Some(ReadMethod::Lzma)));
+        assert!(matches!(method_from_id(93, 0), Some(ReadMethod::Zstd)));
+        assert!(matches!(method_from_id(95, 0), Some(ReadMethod::Xz)));
+        // Reserved / unknown method IDs stay unsupported.
+        assert!(method_from_id(7, 0).is_none());
+        assert!(method_from_id(9, 0).is_none());
+        assert!(method_from_id(99, 0).is_none());
+    }
 }

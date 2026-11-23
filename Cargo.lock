@@ -366,6 +366,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "compcol"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4be160df80e77bdf4902bb026c6a0f6c700ec7793379c26305d45e293e17b8c"
+
+[[package]]
 name = "console"
 version = "0.15.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2021,6 +2027,7 @@ dependencies = [
  "cc",
  "cipher",
  "clap",
+ "compcol",
  "crc32fast",
  "crossbeam-channel",
  "crossterm",

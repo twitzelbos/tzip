@@ -223,16 +223,25 @@ Full help: `tzip --help`.
 
 ## Compression methods
 
-All methods compose orthogonally with AES-256.
+All write-side methods compose orthogonally with AES-256.
 
-| method | ZIP ID | crate | notes |
-|---|---|---|---|
-| `store` | 0 | — | Uncompressed. Fast; use for pre-compressed data (JPEGs, MP4, `.gz`) |
-| `deflate` | 8 | `libdeflater` | Default. 30-40% faster than flate2. Levels 0-12; 12 ≈ zopfli-lite |
-| `bzip2` | 12 | `bzip2` | 5-10% better than DEFLATE on text; ~4× slower |
-| `lzma` | 14 | `xz2` (LZMA1) | Better ratio than DEFLATE; ZIP consumers need LZMA support |
-| `xz` | 95 | `xz2` (LZMA2) | Same LZMA2 as `.7z`, but per-file inside a ZIP |
-| `zstd` | 93 | `zstd` | Great ratio + speed. Recipient needs zstd-aware unzipper |
+| method | ZIP ID | r/w | crate | notes |
+|---|---|:-:|---|---|
+| `store` | 0 | r+w | — | Uncompressed. Fast; use for pre-compressed data (JPEGs, MP4, `.gz`) |
+| `shrink` | 1 | r | `compcol` | PKZIP 1.x LZW variant (9-13 bit, partial clear). Vintage archives only |
+| `reduce` | 2-5 | r | `compcol` | PKZIP 1.x LZ + Huffman, factors 1-4. Vintage archives only |
+| `implode` | 6 | r | `compcol` | PKZIP 1.x Shannon-Fano + 4/8 KiB window. The dominant pre-Deflate method |
+| `deflate` | 8 | r+w | `libdeflater` | Default. 30-40% faster than flate2. Levels 0-12; 12 ≈ zopfli-lite |
+| `bzip2` | 12 | r+w | `bzip2` | 5-10% better than DEFLATE on text; ~4× slower |
+| `lzma` | 14 | r+w | `xz2` (LZMA1) | Better ratio than DEFLATE; ZIP consumers need LZMA support |
+| `xz` | 95 | r+w | `xz2` (LZMA2) | Same LZMA2 as `.7z`, but per-file inside a ZIP |
+| `zstd` | 93 | r+w | `zstd` | Great ratio + speed. Recipient needs zstd-aware unzipper |
+
+Shrink / Reduce / Implode are read-only — modern tooling (Info-ZIP,
+libarchive, miniz, `zip` crate) all dropped encoder support decades
+ago and there is no reason to produce new archives in these formats.
+tzip still opens them so a 1990-era PKZIP 1.x archive is readable.
+See [Reading archives](#reading-archives) for the subcommands.
 
 ### Compatibility matrix (method + AES-256 → who can read it)
 

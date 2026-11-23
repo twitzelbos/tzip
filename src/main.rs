@@ -1,47 +1,12 @@
+//! tzip binary entry point. All real logic lives in `tzip::*` (see
+//! `src/lib.rs`); this file only does argv parsing + dispatch so the
+//! same library can be reused by the `libtzip.dylib` cdylib target
+//! that the macOS FSKit extension links against.
+
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
 
-mod cli;
-mod compress;
-mod crypto;
-mod decompress;
-mod grep;
-mod mount;
-mod pipeline;
-mod platform;
-mod progress;
-mod reader;
-mod sevenz;
-mod sources;
-mod tui;
-mod update;
-mod walker;
-mod zipreader;
-mod zipwriter;
-
-#[cfg(target_os = "macos")]
-mod bulk_walker;
-
-#[cfg(target_os = "macos")]
-mod dispatch_io;
-
-#[cfg(target_os = "macos")]
-mod usb_info;
-
-#[cfg(target_os = "macos")]
-mod contention;
-
-#[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
-mod raw_apfs;
-
-#[cfg(target_os = "linux")]
-mod fiemap;
-
-#[cfg(target_os = "linux")]
-mod linux_raw;
-
-#[cfg(all(feature = "io-uring", target_os = "linux"))]
-mod io_uring_src;
+use tzip::{cli, grep, mount, pipeline, reader};
 
 fn main() -> Result<()> {
     // Parse via ArgMatches so UserSetFlags::from_matches can distinguish

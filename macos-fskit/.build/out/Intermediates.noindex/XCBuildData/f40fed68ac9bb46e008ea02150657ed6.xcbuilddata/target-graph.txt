@@ -1,7 +1,0 @@
-Target dependency graph (3 targets)
-Target 'AllExcludingTests' in project 'Aggregate'
-➜ Explicit dependency on target 'TzipFSExtension-product' in project 'TzipFSExtension'
-➜ Explicit dependency on target 'TzipFSExtension' in project 'TzipFSExtension'
-Target 'TzipFSExtension-product' in project 'TzipFSExtension'
-➜ Explicit dependency on target 'TzipFSExtension' in project 'TzipFSExtension'
-Target 'TzipFSExtension' in project 'TzipFSExtension' (no dependencies)

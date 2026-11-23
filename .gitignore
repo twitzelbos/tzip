@@ -1,2 +1,5 @@
 /target
 /fastzip_plan.md
+
+# Swift package build output (macOS FSKit extension).
+/macos-fskit/.build

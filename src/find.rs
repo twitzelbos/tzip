@@ -86,6 +86,8 @@ fn emit(buf: &mut Vec<u8>, url: &str, re: &ReadEntry, opts: &FindOptions) -> Res
             encrypted: re.encrypted,
             mtime: dos_to_unix(re.mtime),
             crc32: re.crc32,
+            comment: &re.comment,
+            unix_mode: re.unix_mode().map(|m| m & 0o7777),
         };
         let line = serde_json::to_string(&rec).context("serialize find JSON")?;
         writeln!(buf, "{}", line)?;
@@ -241,6 +243,13 @@ struct EntryRecord<'a> {
     encrypted: bool,
     mtime: i64,
     crc32: u32,
+    /// Per-entry CDR comment. Empty string if the entry has no comment.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    comment: &'a str,
+    /// Unix mode bits (file-permission portion) when the archive was
+    /// produced on a Unix host. Null on DOS/Windows-origin archives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unix_mode: Option<u32>,
 }
 
 #[cfg(test)]

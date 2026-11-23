@@ -40,6 +40,10 @@ pub struct ReadEntry {
     /// Equal to `method_on_wire` otherwise.
     pub inner_method: u16,
     pub gp_flags: u16,
+    /// "Version made by" — low byte is the ZIP version, high byte is the
+    /// originating host OS. Needed so `external_attr` can be interpreted:
+    /// `host_os == 3` (Unix) ⇒ high 16 bits of external_attr are Unix mode.
+    pub made_by: u16,
     pub version_needed: u16,
     pub crc32: u32,
     pub comp_size: u64,
@@ -47,15 +51,34 @@ pub struct ReadEntry {
     pub lfh_offset: u64,
     pub mtime: (u16, u16),
     pub encrypted: bool,
-    /// Parsed from the CDR but currently not threaded into the rewritten
-    /// CDR — the writer emits a fixed Unix mode (0o100644). Preserved here
-    /// for a future round-trip of external attributes.
-    #[allow(dead_code)]
+    /// External file attributes. On Unix-origin archives
+    /// (`host_os(made_by) == 3`), the high 16 bits are the Unix mode
+    /// (including type bits + rwx). On DOS-origin archives the low 8
+    /// bits carry DOS file attributes. See `unix_mode()`.
     pub external_attr: u32,
+    /// Per-entry comment (raw bytes, decoded from CP437 via `decode_name`
+    /// semantics — same encoding path as the entry name).
+    pub comment: String,
+    /// Raw comment bytes, preserved for round-trip into a rewritten CDR.
+    pub comment_bytes: Vec<u8>,
     /// `30 + name_len + extra_len` for this entry's LFH. Zero until the
     /// first call to `Archive::lfh_total_size_of`, which reads the LFH header
     /// bytes to learn `extra_len` (not derivable from the CDR).
     pub lfh_total_size: u32,
+}
+
+impl ReadEntry {
+    /// Returns the Unix mode bits encoded in `external_attr` when the
+    /// archive was produced on a Unix host (version_made_by byte 1 == 3).
+    /// None for DOS-origin, Windows-origin, Mac-origin archives etc.
+    pub fn unix_mode(&self) -> Option<u32> {
+        let host_os = (self.made_by >> 8) & 0xff;
+        if host_os == 3 {
+            Some(self.external_attr >> 16)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct Archive {
@@ -68,6 +91,9 @@ pub struct Archive {
     /// append-mode crash recovery. Cached length only; bytes are read on
     /// demand via `tail_bytes()`.
     tail_size: u64,
+    /// Archive-level comment lifted from the EOCD trailer. Decoded as
+    /// CP437 (ZIP's default), which passes modern UTF-8 through unchanged.
+    archive_comment: String,
 }
 
 impl Archive {
@@ -115,11 +141,26 @@ impl Archive {
         let entries = parse_central_directory(&cdr_bytes, entry_count)?;
 
         let tail_size = file_size - cd_offset;
-        Ok(Self { source, entries, file_size, cd_offset, cd_size, tail_size })
+        let archive_comment = decode_name(&eocd.comment_bytes, 0);
+        Ok(Self {
+            source,
+            entries,
+            file_size,
+            cd_offset,
+            cd_size,
+            tail_size,
+            archive_comment,
+        })
     }
 
     pub fn entries(&self) -> &[ReadEntry] {
         &self.entries
+    }
+
+    /// Archive-level comment from the EOCD trailer. Empty string if the
+    /// archive has no comment.
+    pub fn archive_comment(&self) -> &str {
+        &self.archive_comment
     }
 
     /// Mutable access to the underlying source so callers can seek + read
@@ -189,6 +230,7 @@ struct Eocd {
     entry_count: u16,
     cd_size: u32,
     cd_offset: u32,
+    comment_bytes: Vec<u8>,
 }
 
 impl Eocd {
@@ -227,10 +269,14 @@ fn find_eocd<S: Read + Seek + ?Sized>(file: &mut S, file_size: u64) -> Result<(u
         }
     }
     let i = pos.ok_or_else(|| anyhow!("EOCD signature not found in last {} bytes", window))?;
+    let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+    let comment_start = i + 22;
+    let comment_bytes = buf[comment_start..comment_start + comment_len].to_vec();
     let eocd = Eocd {
         entry_count: u16::from_le_bytes([buf[i + 10], buf[i + 11]]),
         cd_size: u32::from_le_bytes([buf[i + 12], buf[i + 13], buf[i + 14], buf[i + 15]]),
         cd_offset: u32::from_le_bytes([buf[i + 16], buf[i + 17], buf[i + 18], buf[i + 19]]),
+        comment_bytes,
     };
     Ok((start + i as u64, eocd))
 }
@@ -284,7 +330,7 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
             // Treat an unexpected signature as end-of-CDR — some tools pad.
             break;
         }
-        let _ver_made_by = cursor.read_u16::<LittleEndian>()?;
+        let made_by = cursor.read_u16::<LittleEndian>()?;
         let version_needed = cursor.read_u16::<LittleEndian>()?;
         let gp_flags = cursor.read_u16::<LittleEndian>()?;
         let method_on_wire = cursor.read_u16::<LittleEndian>()?;
@@ -307,6 +353,8 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
         }
         let name_bytes = bytes[pos..pos + name_len].to_vec();
         let extra = &bytes[pos + name_len..pos + name_len + extra_len];
+        let comment_bytes =
+            bytes[pos + name_len + extra_len..pos + name_len + extra_len + comment_len].to_vec();
         // Skip past name + extra + comment for the next iteration.
         cursor.set_position((pos + name_len + extra_len + comment_len) as u64);
 
@@ -353,6 +401,7 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
 
         let encrypted = method_on_wire == METHOD_AES || (gp_flags & 0x0001 != 0);
         let name = decode_name(&name_bytes, gp_flags);
+        let comment = decode_name(&comment_bytes, gp_flags);
 
         entries.push(ReadEntry {
             name,
@@ -360,6 +409,7 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
             method_on_wire,
             inner_method: if encrypted { inner_method } else { method_on_wire },
             gp_flags,
+            made_by,
             version_needed,
             crc32,
             comp_size,
@@ -368,6 +418,8 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
             mtime: (date, time),
             encrypted,
             external_attr,
+            comment,
+            comment_bytes,
             lfh_total_size: 0,
         });
     }

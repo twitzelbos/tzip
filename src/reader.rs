@@ -378,10 +378,12 @@ fn method_from_id(id: u16, gp_flags: u16) -> Option<ReadMethod> {
             lit_tree: (gp_flags & 0b0000_0100) != 0,
         },
         8 => ReadMethod::Deflate,
+        9 => ReadMethod::Deflate64,
         12 => ReadMethod::Bzip2,
         14 => ReadMethod::Lzma,
         93 => ReadMethod::Zstd,
         95 => ReadMethod::Xz,
+        98 => ReadMethod::Ppmd,
         _ => return None,
     })
 }
@@ -472,13 +474,16 @@ mod tests {
             other => panic!("expected Implode(large,lit), got {:?}", other),
         }
         assert!(matches!(method_from_id(8, 0), Some(ReadMethod::Deflate)));
+        assert!(matches!(method_from_id(9, 0), Some(ReadMethod::Deflate64)));
         assert!(matches!(method_from_id(12, 0), Some(ReadMethod::Bzip2)));
         assert!(matches!(method_from_id(14, 0), Some(ReadMethod::Lzma)));
         assert!(matches!(method_from_id(93, 0), Some(ReadMethod::Zstd)));
         assert!(matches!(method_from_id(95, 0), Some(ReadMethod::Xz)));
+        assert!(matches!(method_from_id(98, 0), Some(ReadMethod::Ppmd)));
         // Reserved / unknown method IDs stay unsupported.
         assert!(method_from_id(7, 0).is_none());
-        assert!(method_from_id(9, 0).is_none());
+        assert!(method_from_id(10, 0).is_none());
+        assert!(method_from_id(97, 0).is_none());
         assert!(method_from_id(99, 0).is_none());
     }
 }

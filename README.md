@@ -283,6 +283,22 @@ Password sourcing (in precedence order):
 - `--password -` (interactive tty prompt)
 - `--password <pw>` (arg, visible in process list; prefer `--password-file` in scripts)
 
+### Reading ZipCrypto-encrypted archives (vintage password protection)
+
+tzip also **reads** entries encrypted with traditional PKZIP
+encryption ("ZipCrypto") — the format `zip -e`, PKZIP 2.x, and most
+"password-protected ZIP" dialogs produce. Pass the password the same
+way as for AES. ZipCrypto is cryptographically broken (a known-
+plaintext attack recovers the key in seconds); tzip supports reading
+it only to open vintage archives. New encryption always goes through
+AES-256.
+
+Detection is automatic — tzip reads GP bit 0 + method ID to tell
+ZipCrypto apart from AES. Wrong-password detection relies on the
+format's single-byte header check (1/256 false-pass rate per the
+spec); downstream decompression usually fails noisily if a wrong
+password happens to pass the check.
+
 ---
 
 ## `.7z` solid archives

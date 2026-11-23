@@ -4,17 +4,41 @@ Living document. Captures the direction the project could take,
 with honest scope + effort estimates + build-vs-buy analysis for
 each phase.
 
-**Current state (2026-09-29).** tzip is a fast parallel ZIP/7z
+**Current state (2026-11-23).** tzip is a fast parallel ZIP/7z
 creator with a macOS `--raw-block` fast path that hits 2-8× the
-default VFS throughput on APFS-on-USB. Ratatui `--tui` dashboard
-with throughput sparkline. `zip -r`-style archive paths.
-Byte-verified interop with 7-zip.
+default VFS throughput on APFS-on-USB, a Linux FIEMAP / io_uring
+reader path, and a Ratatui `--tui` dashboard. It now also:
+
+- **Updates archives in place** — `tzip u` adds / replaces / deletes
+  entries without re-compressing or re-decrypting the kept bodies.
+  Picks between an **append** path (truncate at old CDR, append in
+  place, zero-rewrite — crash-safe via an on-disk undo file with
+  auto-recovery) and a **rebuild** path (byte-copy kept entries into
+  a temp, atomic rename) based on whether the op is pure-add.
+- **Reads what it writes.** `tzip ls` / `tzip cat` / `tzip x` cover
+  every method tzip can produce (store / deflate / bzip2 / lzma / xz
+  / zstd) plus WinZIP AES-256 AE-2, with streaming decrypt +
+  decompress, constant-time password verification before any
+  plaintext ships, HMAC verification, and a zip-slip guard on
+  extract.
+- **Subcommand CLI** (v0.2). `tzip <archive> <paths>` → `tzip create
+  <archive> <paths>`. Reader subcommands land at the same time.
+- **CI + branch protection.** GitHub Actions matrix (ubuntu + macos)
+  runs all three integration suites (43 tests); branch ruleset on
+  `main` requires PRs and both CI jobs to pass.
 
 **Guiding constraints for the next phases.**
 
-- **The S3 layer is the top priority.** Goal: minimum S3 storage
-  billed, maximum effective bandwidth by ensuring only highly-
-  compressed data traverses the internet.
+- **ZIP-as-a-filesystem is the new near-term direction.** The
+  reader stack (Phase G below) extends tzip past "archive creator"
+  toward "mountable, grep-able, cat-able live view of any ZIP —
+  local, HTTP, S3." This ladders naturally and ships value at every
+  increment (local reader is already live; remote and mount are
+  queued).
+- **S3-backed storage is still the strategic end state** (Phases
+  C → D → E / F below), but the reader stack is a strictly
+  smaller, faster-landing path to the same "read an archive in S3"
+  outcome without committing to a new on-disk format.
 - **Target platforms:** macOS 15+ (FSKit-based mount is fine) and
   modern Linux. Windows deferred.
 - **Every phase must be measurable against JuiceFS** as the honest
@@ -320,6 +344,62 @@ years of JuiceFS engineering.
 
 ---
 
+## Phase G — ZIP as a readable / mountable filesystem
+
+**Pitch.** The elevation-past-7-zip play. 7-zip (and every other
+archiver) treats a ZIP as a container you *extract from*. tzip treats
+it as a **live filesystem you can browse, grep, cat, and mount —
+local or remote**. The ZIP spec cooperates: the CDR lives at the end
+of the file and every entry's LFH + body is independent, so a Range
+GET against a ZIP in S3 can pull one 10 KB file out of a 100 GB
+archive without staging anything locally.
+
+Works on every existing ZIP ever written. **No new on-disk format
+needed.** Composes orthogonally with the C→D→E `.tpk` + S3 + mount
+path: that story is "tzip owns the container"; this story is "tzip
+makes *any* ZIP behave like a modern cloud object store."
+
+Ladders in four increments, each shippable on its own.
+
+### Increment 1 — local reader (SHIPPED, PR #4)
+
+`tzip ls`, `tzip cat`, `tzip x` over a local `.zip`. Streaming
+decrypt + decompress for every method tzip can write. Zip-slip
+rejection on extract. 18 integration tests.
+
+### Increment 2 — HTTP(S) Range source (~1 week)
+
+`tzip ls https://host/archive.zip`, `tzip cat https://…
+path/to/file.txt`. Adds a feature-flagged dependency (`ureq` or
+`reqwest`). Three Range GETs per `cat`: last 64 KiB for the EOCD,
+then the CDR, then the LFH + body for the target entry. The
+per-entry pipeline (zipreader → crypto::decrypt_ae2 → decompress)
+is unchanged — only the `Read + Seek` source swaps.
+
+### Increment 3 — S3 source (~1-2 weeks)
+
+`tzip ls s3://bucket/key.zip`, same for cat / x. Auth via env /
+profile / instance role. Bounded retries + 429/503 backoff. The
+`Seek` abstraction over an S3 object uses Range GETs identically to
+Increment 2; the delta is auth and operational robustness.
+
+### Increment 4 — read-only mount (~2-4 weeks per platform)
+
+`tzip mount archive.zip /mnt/arch` makes every shell tool — `cat`,
+`grep`, `vim`, `find`, `git` — work against the archive as if it
+were a regular directory. FSKit on macOS 15+, FUSE3 on Linux. R/O
+first; R/W is deliberately deferred (see "next killer" below).
+
+**Access to a 1 TB S3-hosted archive, after Increments 2-4**:
+`mount` at ~instant (only metadata fetched), `ls` at RAM speed,
+`cat` at S3-Range latency, `grep` at the speed of the matching
+subset (not the whole archive).
+
+**Combined estimate for Increments 2-4**: ~1-2 months of focused
+work. Ships value after every increment.
+
+---
+
 ## Recommended ordering
 
 **Primary constraint (per project owner):**
@@ -329,26 +409,164 @@ years of JuiceFS engineering.
 - **Target platform:** macOS 15+ (FSKit-based mount is acceptable)
   and modern Linux.
 
-Given those constraints, ordering shifts. The S3-critical path is
-**C → D → E** with F (JuiceFS) as the honest baseline to beat.
+The shipped work (update mode + Phase G Increment 1) revealed a
+shorter path to the "read what's in S3 without downloading the whole
+thing" outcome than the full C→D→E rebuild requires. Updated ordering:
 
-1. **Phase C (`.tpk` chunked container)** — prerequisite for D.
-   Nail chunk-index + dedup + on-disk format locally first, so the
-   S3 layer becomes purely a backend swap. **~1-2 weeks.**
-2. **Phase D (S3 backend for `.tpk`)** — the top priority. Restic-
-   style pack layout, content-addressed dedup, zstd (or user-selected
-   codec) at rest, Range-GET partial reads. This alone hits the
-   "minimum S3 storage + only-compressed-data-transits" target,
-   even before any mount exists — because tzip's CLI already knows
-   how to pull individual files. **~2-4 weeks.**
-3. **Phase E (mount)** — makes the S3-backed store shell-transparent.
-   FSKit on macOS 15+, FUSE3 on Linux. Read-only mount first
-   (~2 weeks/platform); R/W adds months of edge-case work.
-4. **Phase B (`tzip compact`)** — orthogonal quick win for local
-   macOS transparent compression. Can slot in any time; doesn't
-   block the S3 path. **~3-5 days.**
-5. **Phase A (Linux platform port)** — needed if the machines that
-   push to S3 include Linux boxes. Otherwise defer.
+1. **Phase G Increments 2-3 (HTTP + S3 reader).** ~2-3 weeks total.
+   Delivers the primary S3 goal — cat and extract one file out of a
+   remote ZIP without staging — without any new container format.
+   Works on any ZIP anyone else has ever produced. Reuses the local
+   reader pipeline shipped in Increment 1.
+2. **Phase G Increment 4 (read-only mount).** ~2-4 weeks per
+   platform. Turns the reader into a shell-transparent view of any
+   ZIP, local or remote. R/W deferred.
+3. **Phase B (`tzip compact`).** ~3-5 days. Orthogonal local-APFS
+   quick win; can slot in any time.
+4. **Phase C (`.tpk` chunked container)** — still prerequisite for D
+   if the dedup story matters. Reconsider after Increments 2-3 ship:
+   at that point we'll know whether S3 with per-ZIP Range reads is
+   already enough (likely for Qbio-style workloads with few archive
+   versions) or whether dedup across archives is load-bearing.
+5. **Phase D (S3 backend for `.tpk`)** — depends on C. Build iff the
+   cross-archive dedup savings justify a new format vs. just dropping
+   many ZIPs in S3.
+6. **Phase H candidates (see below)** — the "next killer after Phase
+   G" question.
+7. **Phase A (Linux platform port)** — SHIPPED (FIEMAP + io_uring +
+   Linux auto-tune, per Phase A section above).
+
+---
+
+## Phase H — candidates for the next step-change after Phase G
+
+Once Phase G lands end-to-end (local + HTTP + S3 + read-only mount),
+two credible step-change features are on deck. Pick one; they aren't
+mutually exclusive but they pull the project in different directions.
+
+### Phase H1 — `tzip grep` / `tzip find` across many archives (recommended)
+
+**Pitch.** Fan the reader pipeline out across many ZIPs. `tzip grep
+'PANIC' s3://bucket/logs-*.zip` opens each archive's CDR via a Range
+GET, filters entries by name/size/mtime, streams-decrypts-decompresses
+only the matching bodies, and greps them in parallel. Same for `tzip
+find`. The outcome is "search 500 nightly backup archives totalling
+10 TB in S3, get hits in seconds, download nothing you don't match."
+
+**Why it matters.** No other archiver does this. `aws s3 cp *.zip .
+&& 7z x *.zip && grep …` is hours and terabytes; `tzip grep` is
+seconds and megabytes. It's the most direct way to turn Phase G's
+"random-access ZIP reader" into a clear replacement for an entire
+ops workflow.
+
+#### Required capabilities (not optional)
+
+- **Controllable parallelism, three independent levels.** Massive S3
+  fan-outs need dialable concurrency — hammer too hard and you hit
+  per-prefix 503s; too soft and you leave bandwidth on the floor.
+  - `-P, --parallel <N>` — concurrent *archives* in flight. Default
+    ~32; cap is the fan-out across the archive set.
+  - `--inner-jobs <N>` — concurrent *entries* within one archive.
+    Default ~8; this is the fan-out *inside* a single ZIP so a
+    large archive doesn't serialize behind one entry at a time.
+  - `--connections <N>` — shared HTTP(S)/S3 connection pool cap.
+    Default = `parallel × inner_jobs` capped at a sane ceiling
+    (e.g., 256) to keep TLS handshakes bounded independently of
+    the two fan-out knobs.
+  - All three overridable; tzip prints the effective values under
+    `-v`. Defaults are tuned for S3's documented per-prefix soft
+    limits (~5,500 GET/s per prefix historically) and typical
+    bucket layouts.
+
+- **Resumable long operations (`--checkpoint` + `--resume`).** A
+  multi-hour grep over 10 TB of S3 archives cannot afford to start
+  over if it's interrupted (Ctrl-C, OOM, spot-instance reclaim,
+  network blip, the operator's laptop closing). tzip persists
+  progress to a small on-disk checkpoint and can pick up where it
+  left off.
+  - `--checkpoint <FILE>` — JSONL file atomically updated as each
+    `(archive, entry)` completes: `{archive, entry_name, hits,
+    bytes_read, ts}`. One line per completed entry; fsync on each
+    flush batch (tunable). No central lock — each worker appends
+    to its own shard which is merged at the end.
+  - `--resume` — on next invocation with the same args + checkpoint,
+    skip every `(archive, entry)` already present and emit only
+    new matches. Output dedup is implicit: a match that landed in
+    the checkpoint will not be re-emitted.
+  - **Granularity is per-entry, not per-byte.** An entry interrupted
+    mid-stream restarts at byte 0 of that entry on resume — doing
+    byte-offset resume would require either stable deterministic
+    match positions across decompression (hard) or
+    decompressor-restart markers (format-specific). Per-entry
+    granularity is cheap and sufficient: the worst-case extra work
+    is one in-flight entry per worker, repeated. For grep-style
+    ops over log archives, that's negligible.
+  - Checkpoint is self-describing: it records the invocation's
+    pattern, archive-set glob, and filter flags. `--resume`
+    refuses to run against a checkpoint written by a different
+    invocation (prevents accidentally resuming the wrong query).
+  - Crash safety: the checkpoint is append-only JSONL with atomic
+    per-line writes; a half-written line is ignored on parse.
+  - Optional `--checkpoint-every <N>` to flush less aggressively
+    for tiny-entry corpora where per-entry fsync dominates.
+
+- **Entry filtering at the CDR.** `--include GLOB`, `--exclude GLOB`
+  (both repeatable), `--max-size`, `--min-size`, `--since MTIME`,
+  `--until MTIME`. All applied at the CDR, so entries that don't
+  match never trigger a body fetch — big win on S3 where every
+  skipped entry is a saved Range GET.
+
+- **Output format.** Default: `archive.zip:entry/path:line-no:match`
+  (grep-style, colorized when stdout is a TTY). `--json` for
+  structured consumption. Line-buffered so a long run can be piped
+  into `head` without full-buffer deadlock.
+
+**Scope.** Builds directly on Phase G Increments 2-3 (HTTP + S3
+readers). ~2-3 weeks including the parallelism + resume work (the
+original ~1-2 week estimate was for the naive fan-out only).
+
+**Tradeoff.** Narrower than mount R/W. Doesn't change the "tzip is
+a filesystem" story — just makes the reader fan out. But it's a
+clean win that ships fast and composes with everything in Phase G.
+
+### Phase H2 — Read/write mount
+
+**Pitch.** Promote Phase G Increment 4 from R/O to R/W. Edit a file
+in the mounted archive; tzip batches the dirty entries and commits
+them to the underlying ZIP via the existing `tzip u` machinery
+(append when safe, rebuild otherwise). Combined with S3 (Phase G
+Increment 3), this is "mount a 100 GB S3-hosted ZIP, `vim` a config
+file inside it, save, the archive updates in place."
+
+**Why it matters.** This is the full "tzip is a live filesystem,
+not an archive" positioning. Once R/W works, the archive stops
+being a container and starts being an addressable, encrypted,
+compressed filesystem — a step-change in mental model that nothing
+else in the archiver space offers.
+
+**Scope.** Multi-month, per existing Phase E notes. The hard part
+is POSIX edge-case stability under R/W: vim swap-file rename
+patterns, git's atomic-rename-over-target, mmap, hardlinks /
+symlinks, inode-number stability, crash consistency on the ZIP
+tail, concurrent writers. The archive-side primitives are already
+there (append + rebuild + undo recovery); the mount-side plumbing
+is what takes the time.
+
+**Tradeoff.** Biggest payoff, biggest cost. Needs a product
+commitment to "tzip is a filesystem," not just an archiver.
+
+### Which to pick
+
+- **Pick H1 if** you want the next ship-and-measure win on the
+  critical path and are willing to defer R/W mount to a later cycle.
+  Matches the lesson from the reader-stack pivot: there's a shorter
+  path to the primary outcome.
+- **Pick H2 if** you're ready to commit multi-month runway to the
+  full filesystem story and the R/W mount's mental-model shift is
+  worth more than any amount of grep speed.
+
+If unsure, ship H1 first — it's small, it's measurable, and it
+makes H2 easier to justify later.
 
 **Critical check before committing to C→D→E: benchmark against
 JuiceFS (Phase F).** If JuiceFS's storage ratio + bandwidth

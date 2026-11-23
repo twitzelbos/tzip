@@ -495,6 +495,17 @@ pub struct ExtractArgs {
     #[arg(long, value_name = "DIR")]
     pub to: Option<PathBuf>,
 
+    /// Concurrent entries in flight. Each worker holds its own backing
+    /// source (its own HTTP/S3 connection or its own local fd) so Range
+    /// GETs and decompression overlap.
+    #[arg(short = 'P', long, default_value_t = 8)]
+    pub parallel: usize,
+
+    /// Cap on the shared HTTP(S) / S3 connection pool. Default = `parallel`.
+    /// Local-path archives ignore this.
+    #[arg(long)]
+    pub connections: Option<usize>,
+
     #[arg(short = 'p', long)]
     pub password: Option<String>,
 
@@ -557,7 +568,12 @@ pub struct Options {
 pub enum ReaderOp {
     Ls,
     Cat { name: String },
-    Extract { to: PathBuf, names: Vec<String> },
+    Extract {
+        to: PathBuf,
+        names: Vec<String>,
+        parallel: usize,
+        connections: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -902,12 +918,18 @@ impl ExtractArgs {
     pub fn into_options(self) -> Result<ReaderOptions> {
         let password = resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
         let to = self.to.unwrap_or_else(|| PathBuf::from("."));
+        let parallel = self.parallel.max(1);
         Ok(ReaderOptions {
             archive: self.archive,
             password,
             quiet: self.quiet,
             verbose: self.verbose,
-            op: ReaderOp::Extract { to, names: self.names },
+            op: ReaderOp::Extract {
+                to,
+                names: self.names,
+                parallel,
+                connections: self.connections,
+            },
         })
     }
 }

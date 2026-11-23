@@ -388,11 +388,24 @@ tzip cat out.zip secret.txt -p 'hunter2'
 tzip x out.zip --to ./extracted
 tzip x out.zip a.txt nested/c.txt --to ./extracted     # selected entries only
 tzip x aes.zip --to ./extracted -p 'hunter2'
+
+# Parallel extraction (default -P 8). Each worker holds its own
+# backing source, so HTTP/S3 Range GETs and decompression overlap.
+tzip x out.zip --to ./extracted -P 16
+tzip x s3://bucket/huge.zip --to ./extracted -P 32 --connections 16
 ```
 
 Extraction rejects *zip-slip* entries (any archive entry whose name
 contains `..`, is absolute, or looks like a Windows drive/UNC path)
 before touching the filesystem. Partial writes on error are deleted.
+Typo'd entry names fail fast before anything is written.
+
+`-P N` controls concurrent entries in flight (default 8); each worker
+opens its own backing source (its own fd for local archives, its own
+HTTP/S3 client for remote). On HTTP/S3 this is the big win — many
+Range GETs overlap instead of serialising through one connection.
+`--connections N` caps worker count below `-P` if you need a smaller
+HTTP pool; it is a no-op on local archives.
 
 Wrong password on a `cat` fails *before* any plaintext hits stdout —
 the AES-256 verifier mismatch is checked before the CTR stream starts.

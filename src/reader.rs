@@ -6,9 +6,11 @@
 //! body range from CDR → stream decrypt → stream decompress).
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cli::{Method, ReaderOp, ReaderOptions};
 use crate::crypto::{self, AE2_OVERHEAD};
@@ -152,8 +154,13 @@ pub fn run_cat(opts: ReaderOptions) -> Result<()> {
 }
 
 pub fn run_extract(opts: ReaderOptions) -> Result<()> {
-    let (to, names_filter) = match &opts.op {
-        ReaderOp::Extract { to, names } => (to.clone(), names.clone()),
+    let (to, names_filter, parallel_req, connections) = match &opts.op {
+        ReaderOp::Extract {
+            to,
+            names,
+            parallel,
+            connections,
+        } => (to.clone(), names.clone(), *parallel, *connections),
         _ => unreachable!("run_extract called with wrong op"),
     };
 
@@ -161,6 +168,14 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
         .with_context(|| format!("create extraction root {}", to.display()))?;
     let to = fs::canonicalize(&to)
         .with_context(|| format!("canonicalize {}", to.display()))?;
+
+    // `--connections` caps worker count so you can bound an HTTP pool to a
+    // size smaller than `-P`. On local archives the two flags collapse.
+    let parallel = match connections {
+        Some(c) => parallel_req.min(c.max(1)),
+        None => parallel_req,
+    }
+    .max(1);
 
     let mut arch = open_archive(&opts.archive)
         .with_context(|| format!("open {}", opts.archive))?;
@@ -171,88 +186,155 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
         Some(names_filter.iter().cloned().collect())
     };
 
-    let n = arch.entries().len();
-    let mut extracted = 0usize;
-    for idx in 0..n {
-        {
-            let re_ref = &arch.entries()[idx];
-            if let Some(sel) = &selected_set {
-                if !sel.contains(&re_ref.name) {
-                    continue;
-                }
-            }
-        }
-        // Populate lfh_total_size before cloning so the clone carries it.
-        arch.lfh_total_size_of(idx)?;
-        let re = arch.entries()[idx].clone();
-        extract_one(&mut arch, &re, &to, opts.password.as_deref(), opts.verbose)?;
-        extracted += 1;
-    }
-
+    // Fail fast on typo'd names before we start writing anything.
     if let Some(sel) = &selected_set {
-        if extracted != sel.len() {
+        let present: std::collections::HashSet<&str> =
+            arch.entries().iter().map(|e| e.name.as_str()).collect();
+        let missing: Vec<&String> = sel
+            .iter()
+            .filter(|n| !present.contains(n.as_str()))
+            .collect();
+        if !missing.is_empty() {
             bail!(
-                "extracted {} of {} requested entries (some names did not match)",
-                extracted,
-                sel.len()
+                "entries not in archive: {}",
+                missing
+                    .iter()
+                    .map(|s| format!("{:?}", s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
     }
+
+    // Phase A (serial, needs &mut arch): populate lfh_total_size and clone
+    // the selected entries so the parallel workers get owned, self-contained
+    // metadata and never touch `arch`.
+    let selected_idx: Vec<usize> = (0..arch.entries().len())
+        .filter(|&idx| match &selected_set {
+            None => true,
+            Some(sel) => sel.contains(&arch.entries()[idx].name),
+        })
+        .collect();
+    let mut selected: Vec<ReadEntry> = Vec::with_capacity(selected_idx.len());
+    for idx in selected_idx {
+        arch.lfh_total_size_of(idx)?;
+        selected.push(arch.entries()[idx].clone());
+    }
+    drop(arch);
+
+    // Phase B (serial): resolve on-disk destinations, create every parent
+    // directory upfront (dedup'd via BTreeSet) so file-writing workers
+    // never race on `mkdir`. Entries that are purely directories (name
+    // ends in `/`, zero body) are created here too and don't enter the
+    // worker queue.
+    let mut tasks: Vec<(ReadEntry, PathBuf)> = Vec::with_capacity(selected.len());
+    let mut explicit_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut mkdir_set: BTreeSet<PathBuf> = BTreeSet::new();
+    for re in selected {
+        let dest = safe_join(&to, &re.name)
+            .with_context(|| format!("entry name {:?}", re.name))?;
+        if re.name.ends_with('/') && re.uncomp_size == 0 {
+            mkdir_set.insert(dest.clone());
+            explicit_dirs.insert(dest);
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            mkdir_set.insert(parent.to_path_buf());
+        }
+        tasks.push((re, dest));
+    }
+    for d in &mkdir_set {
+        fs::create_dir_all(d)
+            .with_context(|| format!("mkdir {}", d.display()))?;
+    }
+
+    // Phase C (parallel): fan-out file extractions. Each worker holds its
+    // own backing source so HTTP/S3 Range GETs overlap. Unbounded channel
+    // is intentional — the task list is already materialised, and a
+    // bounded buffer would deadlock on `total_files > buffer` because we
+    // send all tasks before spawning workers.
+    let total_files = tasks.len();
+    let (tx, rx) = crossbeam_channel::unbounded::<(ReadEntry, PathBuf)>();
+    for t in tasks {
+        if tx.send(t).is_err() {
+            break;
+        }
+    }
+    drop(tx);
+
+    let password = opts.password.clone();
+    let spec = opts.archive.clone();
+    let verbose = opts.verbose;
+    let extracted = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::with_capacity(parallel);
+        let workers = parallel.min(total_files.max(1));
+        for _ in 0..workers {
+            let rx = rx.clone();
+            let password = password.clone();
+            let spec = spec.clone();
+            let extracted = &extracted;
+            let handle = scope.spawn(move || -> Result<()> {
+                let mut source = open_source_for(&spec)
+                    .with_context(|| format!("open worker source for {}", spec))?;
+                while let Ok((re, dest)) = rx.recv() {
+                    let write_result = (|| -> Result<()> {
+                        let f = File::create(&dest)
+                            .with_context(|| format!("create {}", dest.display()))?;
+                        let mut buf = BufWriter::new(f);
+                        stream_entry_to(&mut *source, &re, password.as_deref(), &mut buf)?;
+                        buf.flush().context("flush extract buffer")?;
+                        Ok(())
+                    })();
+                    match write_result {
+                        Ok(()) => {
+                            if verbose {
+                                eprintln!("extracted {}", re.name);
+                            }
+                            extracted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&dest);
+                            return Err(e).with_context(|| format!("extract {}", re.name));
+                        }
+                    }
+                }
+                Ok(())
+            });
+            handles.push(handle);
+        }
+        let mut first_err: Option<anyhow::Error> = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(anyhow!("extract worker thread panicked"));
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })?;
+
+    let file_count = extracted.into_inner();
+    let total = file_count + explicit_dirs.len();
     if !opts.quiet {
-        eprintln!("extracted {} entries to {}", extracted, to.display());
+        eprintln!("extracted {} entries to {}", total, to.display());
     }
     Ok(())
 }
 
 // ── Shared per-entry pipeline ──────────────────────────────────────────────
-
-fn extract_one(
-    arch: &mut Archive,
-    re: &ReadEntry,
-    root: &Path,
-    password: Option<&str>,
-    verbose: bool,
-) -> Result<()> {
-    let dest = safe_join(root, &re.name)
-        .with_context(|| format!("entry name {:?}", re.name))?;
-
-    // If the entry represents a directory (trailing / and zero body), create
-    // the directory and move on.
-    if re.name.ends_with('/') && re.uncomp_size == 0 {
-        fs::create_dir_all(&dest)
-            .with_context(|| format!("mkdir {}", dest.display()))?;
-        return Ok(());
-    }
-
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("mkdir -p {}", parent.display()))?;
-    }
-
-    // Stream into a BufWriter. On any error, delete the partial output so
-    // the caller sees an atomic failure.
-    let write_result = (|| -> Result<u64> {
-        let f = File::create(&dest)
-            .with_context(|| format!("create {}", dest.display()))?;
-        let mut buf = BufWriter::new(f);
-        let n = stream_entry(arch, re, password, &mut buf)?;
-        buf.flush().context("flush extract buffer")?;
-        Ok(n)
-    })();
-
-    match write_result {
-        Ok(_) => {
-            if verbose {
-                eprintln!("extracted {}", re.name);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&dest);
-            Err(e).with_context(|| format!("extract {}", re.name))
-        }
-    }
-}
 
 fn stream_entry<W: Write>(
     arch: &mut Archive,

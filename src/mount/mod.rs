@@ -24,6 +24,9 @@ pub mod fskit;
 pub mod fskit_abi;
 
 #[cfg(all(target_os = "macos", feature = "fskit"))]
+pub mod fskit_install;
+
+#[cfg(all(target_os = "macos", feature = "fskit"))]
 pub mod keychain;
 
 use anyhow::Result;

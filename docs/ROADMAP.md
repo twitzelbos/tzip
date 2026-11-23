@@ -459,13 +459,71 @@ seconds and megabytes. It's the most direct way to turn Phase G's
 "random-access ZIP reader" into a clear replacement for an entire
 ops workflow.
 
-**Scope.** Builds directly on Phase G. ~1-2 weeks. Needs:
-- Fan-out controller (parallel reader pipelines, shared S3 client
-  with connection pooling).
-- `--include` / `--exclude` glob filters applied at the CDR to skip
-  entries without pulling their bodies.
-- Output format: `archive.zip:entry/path:line-no:match` (grep-style)
-  or JSON (`--json`) for pipelining.
+#### Required capabilities (not optional)
+
+- **Controllable parallelism, three independent levels.** Massive S3
+  fan-outs need dialable concurrency — hammer too hard and you hit
+  per-prefix 503s; too soft and you leave bandwidth on the floor.
+  - `-P, --parallel <N>` — concurrent *archives* in flight. Default
+    ~32; cap is the fan-out across the archive set.
+  - `--inner-jobs <N>` — concurrent *entries* within one archive.
+    Default ~8; this is the fan-out *inside* a single ZIP so a
+    large archive doesn't serialize behind one entry at a time.
+  - `--connections <N>` — shared HTTP(S)/S3 connection pool cap.
+    Default = `parallel × inner_jobs` capped at a sane ceiling
+    (e.g., 256) to keep TLS handshakes bounded independently of
+    the two fan-out knobs.
+  - All three overridable; tzip prints the effective values under
+    `-v`. Defaults are tuned for S3's documented per-prefix soft
+    limits (~5,500 GET/s per prefix historically) and typical
+    bucket layouts.
+
+- **Resumable long operations (`--checkpoint` + `--resume`).** A
+  multi-hour grep over 10 TB of S3 archives cannot afford to start
+  over if it's interrupted (Ctrl-C, OOM, spot-instance reclaim,
+  network blip, the operator's laptop closing). tzip persists
+  progress to a small on-disk checkpoint and can pick up where it
+  left off.
+  - `--checkpoint <FILE>` — JSONL file atomically updated as each
+    `(archive, entry)` completes: `{archive, entry_name, hits,
+    bytes_read, ts}`. One line per completed entry; fsync on each
+    flush batch (tunable). No central lock — each worker appends
+    to its own shard which is merged at the end.
+  - `--resume` — on next invocation with the same args + checkpoint,
+    skip every `(archive, entry)` already present and emit only
+    new matches. Output dedup is implicit: a match that landed in
+    the checkpoint will not be re-emitted.
+  - **Granularity is per-entry, not per-byte.** An entry interrupted
+    mid-stream restarts at byte 0 of that entry on resume — doing
+    byte-offset resume would require either stable deterministic
+    match positions across decompression (hard) or
+    decompressor-restart markers (format-specific). Per-entry
+    granularity is cheap and sufficient: the worst-case extra work
+    is one in-flight entry per worker, repeated. For grep-style
+    ops over log archives, that's negligible.
+  - Checkpoint is self-describing: it records the invocation's
+    pattern, archive-set glob, and filter flags. `--resume`
+    refuses to run against a checkpoint written by a different
+    invocation (prevents accidentally resuming the wrong query).
+  - Crash safety: the checkpoint is append-only JSONL with atomic
+    per-line writes; a half-written line is ignored on parse.
+  - Optional `--checkpoint-every <N>` to flush less aggressively
+    for tiny-entry corpora where per-entry fsync dominates.
+
+- **Entry filtering at the CDR.** `--include GLOB`, `--exclude GLOB`
+  (both repeatable), `--max-size`, `--min-size`, `--since MTIME`,
+  `--until MTIME`. All applied at the CDR, so entries that don't
+  match never trigger a body fetch — big win on S3 where every
+  skipped entry is a saved Range GET.
+
+- **Output format.** Default: `archive.zip:entry/path:line-no:match`
+  (grep-style, colorized when stdout is a TTY). `--json` for
+  structured consumption. Line-buffered so a long run can be piped
+  into `head` without full-buffer deadlock.
+
+**Scope.** Builds directly on Phase G Increments 2-3 (HTTP + S3
+readers). ~2-3 weeks including the parallelism + resume work (the
+original ~1-2 week estimate was for the naive fan-out only).
 
 **Tradeoff.** Narrower than mount R/W. Doesn't change the "tzip is
 a filesystem" story — just makes the reader fan out. But it's a

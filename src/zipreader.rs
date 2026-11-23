@@ -1,0 +1,403 @@
+//! ZIP archive reader — EOCD + central-directory + per-entry local-file-header
+//! metadata. Enough to drive `--update` / `--delete`: we need each entry's
+//! name, offset, sizes, mtime, flags, and the AES-extra inner method; we do
+//! *not* need to decompress or decrypt. Kept entries are passed through
+//! downstream as byte-for-byte copies.
+//!
+//! References:
+//! - PKWARE APPNOTE.TXT v6.3.10
+//! - WinZIP AES specification (0x9901 extra field, AE-2 variant)
+//!
+//! Scope:
+//! - Streams-in-EOCD scan (last 64 KiB), ZIP64 EOCD locator + record.
+//! - CDR iteration: parses ZIP64 extra `0x0001` and AES extra `0x9901`.
+//! - Lazy LFH probe to compute `lfh_total_size` (needed for byte-copy ranges).
+//! - UTF-8 names (GP bit 11). CP437 fallback for the long tail of legacy
+//!   tooling — decoded best-effort; the raw `name_bytes` is preserved verbatim
+//!   for round-tripping.
+
+use anyhow::{anyhow, bail, Context, Result};
+use byteorder::{LittleEndian, ReadBytesExt};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
+use crate::zipwriter::{AES_EXTRA_ID, METHOD_AES, SIG_CDR, SIG_EOCD, SIG_EOCD64, SIG_EOCD64_LOC, SIG_LFH};
+
+const EOCD_SCAN_WINDOW: u64 = 64 * 1024;
+const EOCD_MIN_SIZE: u64 = 22;
+
+/// A central-directory entry, parsed from an existing archive. Enough to
+/// re-emit as a central entry in a rewritten archive, and enough for the
+/// writer's byte-copy path to locate the original LFH + body on disk.
+#[derive(Clone, Debug)]
+pub struct ReadEntry {
+    pub name: String,
+    pub name_bytes: Vec<u8>,
+    pub method_on_wire: u16,
+    /// Inner compression method when `encrypted` (from the AES extra).
+    /// Equal to `method_on_wire` otherwise.
+    pub inner_method: u16,
+    pub gp_flags: u16,
+    pub version_needed: u16,
+    pub crc32: u32,
+    pub comp_size: u64,
+    pub uncomp_size: u64,
+    pub lfh_offset: u64,
+    pub mtime: (u16, u16),
+    pub encrypted: bool,
+    /// Parsed from the CDR but currently not threaded into the rewritten
+    /// CDR — the writer emits a fixed Unix mode (0o100644). Preserved here
+    /// for a future round-trip of external attributes.
+    #[allow(dead_code)]
+    pub external_attr: u32,
+    /// `30 + name_len + extra_len` for this entry's LFH. Zero until the
+    /// first call to `Archive::lfh_total_size_of`, which reads the LFH header
+    /// bytes to learn `extra_len` (not derivable from the CDR).
+    pub lfh_total_size: u32,
+}
+
+pub struct Archive {
+    file: File,
+    entries: Vec<ReadEntry>,
+    file_size: u64,
+    cd_offset: u64,
+    cd_size: u64,
+    /// `[cd_offset .. file_size]` — the on-disk tail we restore from in
+    /// append-mode crash recovery. Cached length only; bytes are read on
+    /// demand via `tail_bytes()`.
+    tail_size: u64,
+}
+
+impl Archive {
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut file = File::open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let file_size = file
+            .seek(SeekFrom::End(0))
+            .with_context(|| format!("seek-end {}", path.display()))?;
+        if file_size < EOCD_MIN_SIZE {
+            bail!("{} is too small to be a ZIP ({} bytes)", path.display(), file_size);
+        }
+
+        let (eocd_pos, eocd) = find_eocd(&mut file, file_size)
+            .with_context(|| format!("find EOCD in {}", path.display()))?;
+
+        let (entry_count, cd_size, cd_offset) = if eocd.needs_zip64() {
+            let z64 = find_eocd64(&mut file, eocd_pos)
+                .context("archive looks like ZIP64 but no EOCD64 could be found")?;
+            (z64.entry_count, z64.cd_size, z64.cd_offset)
+        } else {
+            (eocd.entry_count as u64, eocd.cd_size as u64, eocd.cd_offset as u64)
+        };
+
+        if cd_offset + cd_size > file_size {
+            bail!(
+                "central directory extends past end of archive: offset={} size={} file={}",
+                cd_offset, cd_size, file_size
+            );
+        }
+
+        file.seek(SeekFrom::Start(cd_offset))
+            .with_context(|| format!("seek to central directory at {}", cd_offset))?;
+        let mut cdr_bytes = vec![0u8; cd_size as usize];
+        file.read_exact(&mut cdr_bytes).context("read central directory")?;
+
+        let entries = parse_central_directory(&cdr_bytes, entry_count)?;
+
+        let tail_size = file_size - cd_offset;
+        Ok(Self { file, entries, file_size, cd_offset, cd_size, tail_size })
+    }
+
+    pub fn entries(&self) -> &[ReadEntry] {
+        &self.entries
+    }
+
+    pub fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    pub fn cd_offset(&self) -> u64 {
+        self.cd_offset
+    }
+
+    #[allow(dead_code)]
+    pub fn cd_size(&self) -> u64 {
+        self.cd_size
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    #[allow(dead_code)]
+    pub fn tail_size(&self) -> u64 {
+        self.tail_size
+    }
+
+    /// Reads `[cd_offset .. file_size]` — the central directory, EOCD, and
+    /// any ZIP64 trailer records. Used to populate the append-mode undo
+    /// file so a crashed update can be rolled back.
+    pub fn tail_bytes(&mut self) -> Result<Vec<u8>> {
+        self.file
+            .seek(SeekFrom::Start(self.cd_offset))
+            .context("seek to cd_offset for tail copy")?;
+        let mut buf = vec![0u8; self.tail_size as usize];
+        self.file.read_exact(&mut buf).context("read tail bytes")?;
+        Ok(buf)
+    }
+
+    /// Lazily populates `entries[i].lfh_total_size` by reading that entry's
+    /// LFH header fields. Needed for byte-copy in rebuild mode. Idempotent.
+    pub fn lfh_total_size_of(&mut self, idx: usize) -> Result<u32> {
+        let cached = self.entries[idx].lfh_total_size;
+        if cached != 0 {
+            return Ok(cached);
+        }
+        let off = self.entries[idx].lfh_offset;
+        self.file.seek(SeekFrom::Start(off)).context("seek to LFH")?;
+        let mut hdr = [0u8; 30];
+        self.file.read_exact(&mut hdr).context("read LFH header")?;
+        let sig = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        if sig != SIG_LFH {
+            bail!("bad LFH signature at offset {}: {:#x}", off, sig);
+        }
+        let name_len = u16::from_le_bytes([hdr[26], hdr[27]]) as u32;
+        let extra_len = u16::from_le_bytes([hdr[28], hdr[29]]) as u32;
+        let total = 30 + name_len + extra_len;
+        self.entries[idx].lfh_total_size = total;
+        Ok(total)
+    }
+}
+
+// ── EOCD ────────────────────────────────────────────────────────────────────
+
+struct Eocd {
+    entry_count: u16,
+    cd_size: u32,
+    cd_offset: u32,
+}
+
+impl Eocd {
+    fn needs_zip64(&self) -> bool {
+        self.entry_count == 0xFFFF || self.cd_size == 0xFFFF_FFFF || self.cd_offset == 0xFFFF_FFFF
+    }
+}
+
+fn find_eocd(file: &mut File, file_size: u64) -> Result<(u64, Eocd)> {
+    // Scan the last 64 KiB for the EOCD signature. The EOCD is a 22-byte
+    // fixed-size record *followed* by a variable-length comment (0..65535
+    // bytes). Scanning from the end lets us find it without knowing the
+    // comment length.
+    let window = file_size.min(EOCD_SCAN_WINDOW + EOCD_MIN_SIZE);
+    let start = file_size - window;
+    file.seek(SeekFrom::Start(start))
+        .context("seek to EOCD scan window")?;
+    let mut buf = vec![0u8; window as usize];
+    file.read_exact(&mut buf).context("read EOCD scan window")?;
+
+    let sig = SIG_EOCD.to_le_bytes();
+    let mut pos: Option<usize> = None;
+    // Prefer the last match (in case of any false-positive earlier signature
+    // in a comment). EOCD must leave at least 22 bytes till end of buffer.
+    if buf.len() >= 22 {
+        let max_i = buf.len() - 22;
+        for i in (0..=max_i).rev() {
+            if buf[i] == sig[0] && buf[i + 1] == sig[1] && buf[i + 2] == sig[2] && buf[i + 3] == sig[3] {
+                // Verify by reading comment length and ensuring it fits.
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    pos = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    let i = pos.ok_or_else(|| anyhow!("EOCD signature not found in last {} bytes", window))?;
+    let eocd = Eocd {
+        entry_count: u16::from_le_bytes([buf[i + 10], buf[i + 11]]),
+        cd_size: u32::from_le_bytes([buf[i + 12], buf[i + 13], buf[i + 14], buf[i + 15]]),
+        cd_offset: u32::from_le_bytes([buf[i + 16], buf[i + 17], buf[i + 18], buf[i + 19]]),
+    };
+    Ok((start + i as u64, eocd))
+}
+
+struct Eocd64 {
+    entry_count: u64,
+    cd_size: u64,
+    cd_offset: u64,
+}
+
+fn find_eocd64(file: &mut File, eocd_pos: u64) -> Result<Eocd64> {
+    // The EOCD64 locator is exactly 20 bytes immediately before the EOCD.
+    if eocd_pos < 20 {
+        bail!("no room for EOCD64 locator before EOCD at offset {}", eocd_pos);
+    }
+    let loc_pos = eocd_pos - 20;
+    file.seek(SeekFrom::Start(loc_pos))
+        .context("seek to EOCD64 locator")?;
+    let mut loc = [0u8; 20];
+    file.read_exact(&mut loc).context("read EOCD64 locator")?;
+    let sig = u32::from_le_bytes([loc[0], loc[1], loc[2], loc[3]]);
+    if sig != SIG_EOCD64_LOC {
+        bail!("bad EOCD64 locator signature: {:#x}", sig);
+    }
+    let z64_off = u64::from_le_bytes(loc[8..16].try_into().unwrap());
+
+    file.seek(SeekFrom::Start(z64_off))
+        .context("seek to EOCD64")?;
+    let mut hdr = [0u8; 56];
+    file.read_exact(&mut hdr).context("read EOCD64")?;
+    let z64_sig = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    if z64_sig != SIG_EOCD64 {
+        bail!("bad EOCD64 signature at {}: {:#x}", z64_off, z64_sig);
+    }
+    Ok(Eocd64 {
+        entry_count: u64::from_le_bytes(hdr[32..40].try_into().unwrap()),
+        cd_size: u64::from_le_bytes(hdr[40..48].try_into().unwrap()),
+        cd_offset: u64::from_le_bytes(hdr[48..56].try_into().unwrap()),
+    })
+}
+
+// ── Central directory ──────────────────────────────────────────────────────
+
+fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<ReadEntry>> {
+    let mut entries = Vec::with_capacity(expected_count.min(1 << 20) as usize);
+    let mut cursor = std::io::Cursor::new(bytes);
+
+    while (cursor.position() as usize) < bytes.len() {
+        let sig = cursor.read_u32::<LittleEndian>().context("read CDR sig")?;
+        if sig != SIG_CDR {
+            // Treat an unexpected signature as end-of-CDR — some tools pad.
+            break;
+        }
+        let _ver_made_by = cursor.read_u16::<LittleEndian>()?;
+        let version_needed = cursor.read_u16::<LittleEndian>()?;
+        let gp_flags = cursor.read_u16::<LittleEndian>()?;
+        let method_on_wire = cursor.read_u16::<LittleEndian>()?;
+        let time = cursor.read_u16::<LittleEndian>()?;
+        let date = cursor.read_u16::<LittleEndian>()?;
+        let crc32 = cursor.read_u32::<LittleEndian>()?;
+        let comp_size_32 = cursor.read_u32::<LittleEndian>()?;
+        let uncomp_size_32 = cursor.read_u32::<LittleEndian>()?;
+        let name_len = cursor.read_u16::<LittleEndian>()? as usize;
+        let extra_len = cursor.read_u16::<LittleEndian>()? as usize;
+        let comment_len = cursor.read_u16::<LittleEndian>()? as usize;
+        let _disk_start = cursor.read_u16::<LittleEndian>()?;
+        let _internal_attr = cursor.read_u16::<LittleEndian>()?;
+        let external_attr = cursor.read_u32::<LittleEndian>()?;
+        let lfh_offset_32 = cursor.read_u32::<LittleEndian>()?;
+
+        let pos = cursor.position() as usize;
+        if pos + name_len + extra_len + comment_len > bytes.len() {
+            bail!("central directory entry overflows: pos={} total={}", pos, bytes.len());
+        }
+        let name_bytes = bytes[pos..pos + name_len].to_vec();
+        let extra = &bytes[pos + name_len..pos + name_len + extra_len];
+        // Skip past name + extra + comment for the next iteration.
+        cursor.set_position((pos + name_len + extra_len + comment_len) as u64);
+
+        let mut comp_size: u64 = comp_size_32 as u64;
+        let mut uncomp_size: u64 = uncomp_size_32 as u64;
+        let mut lfh_offset: u64 = lfh_offset_32 as u64;
+        let mut inner_method = method_on_wire;
+
+        // Walk extras: look for ZIP64 (0x0001) and AES (0x9901). Unknown
+        // extras are skipped (we only need to round-trip to re-emit).
+        let mut ex = 0usize;
+        while ex + 4 <= extra.len() {
+            let id = u16::from_le_bytes([extra[ex], extra[ex + 1]]);
+            let sz = u16::from_le_bytes([extra[ex + 2], extra[ex + 3]]) as usize;
+            let body_start = ex + 4;
+            if body_start + sz > extra.len() {
+                break;
+            }
+            let body = &extra[body_start..body_start + sz];
+            if id == 0x0001 {
+                // ZIP64 extended info: fields present only for those whose
+                // 32-bit field is 0xFFFFFFFF, in this order:
+                //   uncomp_size (8), comp_size (8), lfh_offset (8), disk# (4)
+                let mut b = 0;
+                if uncomp_size_32 == 0xFFFF_FFFF && b + 8 <= body.len() {
+                    uncomp_size = u64::from_le_bytes(body[b..b + 8].try_into().unwrap());
+                    b += 8;
+                }
+                if comp_size_32 == 0xFFFF_FFFF && b + 8 <= body.len() {
+                    comp_size = u64::from_le_bytes(body[b..b + 8].try_into().unwrap());
+                    b += 8;
+                }
+                if lfh_offset_32 == 0xFFFF_FFFF && b + 8 <= body.len() {
+                    lfh_offset = u64::from_le_bytes(body[b..b + 8].try_into().unwrap());
+                }
+            } else if id == AES_EXTRA_ID {
+                // WinZIP AES 0x9901: [ ver_u16 | 'A' 'E' | strength_u8 | inner_method_u16 ]
+                if sz >= 7 {
+                    inner_method = u16::from_le_bytes([body[5], body[6]]);
+                }
+            }
+            ex = body_start + sz;
+        }
+
+        let encrypted = method_on_wire == METHOD_AES || (gp_flags & 0x0001 != 0);
+        let name = decode_name(&name_bytes, gp_flags);
+
+        entries.push(ReadEntry {
+            name,
+            name_bytes,
+            method_on_wire,
+            inner_method: if encrypted { inner_method } else { method_on_wire },
+            gp_flags,
+            version_needed,
+            crc32,
+            comp_size,
+            uncomp_size,
+            lfh_offset,
+            mtime: (date, time),
+            encrypted,
+            external_attr,
+            lfh_total_size: 0,
+        });
+    }
+
+    Ok(entries)
+}
+
+/// Decode a ZIP entry name. Bit 11 of GP flags signals UTF-8 (the way tzip
+/// emits them). Otherwise we try UTF-8 and fall back to a lossy CP437-style
+/// read of the bytes — the raw `name_bytes` is preserved separately so
+/// round-trip into a rewritten CDR is byte-exact regardless.
+fn decode_name(bytes: &[u8], gp_flags: u16) -> String {
+    if gp_flags & (1 << 11) != 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => cp437_to_string(bytes),
+    }
+}
+
+/// Best-effort CP437 → UTF-8. Printable ASCII passes through; high bytes
+/// are mapped by a small table matching the IBM PC code page. Not a full
+/// implementation — good enough for display in logs. Byte-for-byte
+/// round-tripping goes through `name_bytes`, not this.
+fn cp437_to_string(bytes: &[u8]) -> String {
+    const HI: [char; 128] = [
+        'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å',
+        'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ',
+        'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»',
+        '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐',
+        '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧',
+        '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀',
+        'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩',
+        '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', ' ',
+    ];
+    let mut s = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if b < 0x80 {
+            s.push(b as char);
+        } else {
+            s.push(HI[(b - 0x80) as usize]);
+        }
+    }
+    s
+}

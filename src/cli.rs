@@ -201,6 +201,28 @@ pub struct Args {
     /// Enabled automatically when the output is not a regular seekable file.
     #[arg(long)]
     pub streaming: bool,
+
+    /// Modify an existing ZIP archive in place: add new files, replace
+    /// entries whose archive name matches an input, remove entries listed
+    /// via `--delete`. When safe (pure-add with no name collisions) the
+    /// archive is updated by truncating the old central directory and
+    /// appending — crash-safe via an on-disk undo file. Otherwise tzip
+    /// writes a new archive to a temp file and atomic-renames it over the
+    /// original. If the archive doesn't exist, falls back to create mode.
+    /// Not supported for `.7z`.
+    #[arg(short = 'u', long)]
+    pub update: bool,
+
+    /// Delete archive entries matching this glob. Only valid with `--update`.
+    /// Repeatable. Uses the same `*` / `?` matcher as `--exclude`, applied
+    /// to the archive-internal path.
+    #[arg(long, requires = "update")]
+    pub delete: Vec<String>,
+
+    /// Force rebuild-to-temp + atomic rename for `--update`. Without it,
+    /// pure-add updates are applied in place.
+    #[arg(long, requires = "update")]
+    pub atomic: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -238,6 +260,9 @@ pub struct Options {
     pub io_uring: bool,
     pub basename_only: bool,
     pub user_flags: UserSetFlags,
+    pub update: bool,
+    pub delete: Vec<String>,
+    pub atomic: bool,
 }
 
 impl Args {
@@ -271,9 +296,18 @@ impl Args {
                 .map(|s| s.eq_ignore_ascii_case("7z"))
                 .unwrap_or(false);
 
+        if self.update && solid {
+            bail!(
+                ".7z archives do not support --update — rebuild the .7z from source"
+            );
+        }
+        if self.update && self.streaming {
+            bail!("--update is incompatible with --streaming");
+        }
+
         // Resolve input paths. With --apfs-device, an empty path list means
         // "whole volume" (in-volume root `/`); otherwise at least one path is
-        // required.
+        // required. In update mode, a delete-only invocation is also valid.
         let mut paths = self.paths;
         #[cfg(all(feature = "raw-apfs", any(target_os = "macos", target_os = "linux")))]
         {
@@ -282,10 +316,16 @@ impl Args {
             }
         }
         if paths.is_empty() {
-            bail!(
-                "need at least one input path \
-                 (or use --apfs-device to archive a whole APFS volume)"
-            );
+            if self.update && !self.delete.is_empty() {
+                // delete-only update is fine
+            } else if self.update {
+                bail!("--update needs at least one input path or --delete GLOB");
+            } else {
+                bail!(
+                    "need at least one input path \
+                     (or use --apfs-device to archive a whole APFS volume)"
+                );
+            }
         }
 
         Ok(Options {
@@ -320,6 +360,9 @@ impl Args {
             io_uring: self.io_uring,
             basename_only: self.basename_only,
             user_flags,
+            update: self.update,
+            delete: self.delete,
+            atomic: self.atomic,
         })
     }
 }

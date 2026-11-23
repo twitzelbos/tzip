@@ -9,6 +9,7 @@ pub mod cli;
 pub mod compress;
 pub mod crypto;
 pub mod decompress;
+pub mod find;
 pub mod grep;
 pub mod mount;
 pub mod pipeline;

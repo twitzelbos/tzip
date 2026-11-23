@@ -34,6 +34,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Reading archives](#reading-archives)
 - [Reading remote archives (HTTP / S3)](#reading-remote-archives-http--s3)
 - [Searching across many archives (`tzip grep`)](#searching-across-many-archives-tzip-grep)
+- [Finding entries across archives (`tzip find`)](#finding-entries-across-archives-tzip-find)
 - [Mounting archives as a filesystem (`tzip mount`)](#mounting-archives-as-a-filesystem-tzip-mount)
 - [TUI mode](#tui-mode)
 - [Performance](#performance)
@@ -588,6 +589,47 @@ are still handled by your shell.
 - **Output ordering is non-deterministic** with parallel workers.
   Use `-P 1 --inner-jobs 1` for stable order, or pipe through
   `--json | jq -s 'sort_by(.archive, .entry, .line)'`.
+
+## Finding entries across archives (`tzip find`)
+
+`tzip find <archive>...` lists entries that match CDR-side filters
+(name glob, size range, mtime range) without ever fetching an entry
+body. For remote archives that's a single HEAD + one CDR fetch per
+archive, then pure in-memory filtering — orders of magnitude cheaper
+than `grep` when you only need "which entries are in here."
+
+```
+# Everything in a local archive (tabular: archive, mtime, size, name).
+tzip find out.zip
+
+# Just entry names (good for piping into xargs).
+tzip find out.zip --names-only
+
+# Across 1000 S3 archives in parallel, filtered to .log files
+# bigger than 1 MiB modified since 2026-01-01.
+tzip find s3://bucket/logs/*.zip -P 64 \
+  --include '*.log' --min-size 1048576 --since 2026-01-01
+
+# JSON for jq / downstream tooling.
+tzip find s3://bucket/*.zip --json | jq -s 'map(.size) | add'
+```
+
+Flags:
+
+| Flag | What it does |
+| --- | --- |
+| `-P N` | Concurrent archives in flight. Default 32. |
+| `--include GLOB` | Only entries matching GLOB (repeatable). |
+| `--exclude GLOB` | Skip entries matching GLOB (repeatable). |
+| `--min-size N` / `--max-size N` | Uncompressed-size range, bytes. |
+| `--since DATE` / `--until DATE` | mtime range, `YYYY-MM-DD` (UTC). |
+| `--names-only` | One `archive:entry` per line, nothing else. |
+| `--json` | JSONL with `archive`, `entry`, `size`, `compressed_size`, `method`, `encrypted`, `mtime`, `crc32`. |
+
+S3 bucket-globbing is the same as `tzip grep`: prefix expansion via
+ListObjectsV2. Local shell globs are handled by your shell. `find` has
+no body-fetching inner loop, so it skips `grep`'s `--inner-jobs` /
+`--connections` / `--checkpoint` / `--exec` flags.
 
 ## Mounting archives as a filesystem (`tzip mount`)
 

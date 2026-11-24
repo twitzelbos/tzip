@@ -452,9 +452,18 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
             let handle = scope.spawn(move || -> Result<()> {
                 let mut source = open_source_for_with_hint(&spec, worker_hint)
                     .with_context(|| format!("open worker source for {}", spec))?;
+                // Per-worker cache of parent-directory fds. For a flat
+                // extract, one cached fd handles every entry — turning
+                // the per-entry `File::create(absolute_path)` into
+                // `openat(cached_dir_fd, basename)` and skipping the
+                // kernel's path-component walk from the mount point
+                // down to the parent. Small LRU covers nested archives.
+                let mut dirfd_cache =
+                    crate::dirfd_cache::DirFdCache::new(crate::dirfd_cache::DEFAULT_DIRFD_CAP);
                 while let Ok((re, dest)) = rx.recv() {
                     let write_result = (|| -> Result<()> {
-                        let f = File::create(&dest)
+                        let f = dirfd_cache
+                            .create_at(&dest)
                             .with_context(|| format!("create {}", dest.display()))?;
                         // 64 KiB buffer: most zip entries are small enough
                         // that one or two writev syscalls per file is

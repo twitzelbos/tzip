@@ -11,6 +11,7 @@ pub mod compress;
 pub mod crypto;
 pub mod decompress;
 pub mod diff;
+pub mod dirfd_cache;
 pub mod dos_time;
 pub mod find;
 pub mod grep;

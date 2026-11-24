@@ -74,9 +74,12 @@ impl Drop for ServerGuard {
 /// bytes, respecting Range. Accepts the Authorization header verbatim —
 /// signature validation is the SigV4 unit tests' job.
 fn serve_mock_s3(bucket: &str, key: &str, file_path: PathBuf) -> ServerGuard {
+    // Hand the already-bound listener straight to tiny_http so the
+    // port never gets released between bind and rebind — the old
+    // drop-and-rebind dance was a TOCTOU race that occasionally lost
+    // the port to a concurrent test on Linux CI (EADDRINUSE).
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
     let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
 
     let want_path = format!("/{}/{}", bucket, key);
     let body = fs::read(&file_path).expect("read fixture");
@@ -84,7 +87,8 @@ fn serve_mock_s3(bucket: &str, key: &str, file_path: PathBuf) -> ServerGuard {
     let stop2 = Arc::clone(&stop);
 
     let join = thread::spawn(move || {
-        let server = tiny_http::Server::http(addr).expect("tiny_http server");
+        let server = tiny_http::Server::from_listener(listener, None)
+            .expect("tiny_http from_listener");
         loop {
             if stop2.load(Ordering::SeqCst) {
                 break;
@@ -121,7 +125,7 @@ fn serve_mock_s3(bucket: &str, key: &str, file_path: PathBuf) -> ServerGuard {
 }
 
 fn serve_bytes(req: tiny_http::Request, body: &[u8]) {
-    use tiny_http::{Header, Response, StatusCode};
+    use tiny_http::{Response, StatusCode};
 
     let range_hdr = req
         .headers()

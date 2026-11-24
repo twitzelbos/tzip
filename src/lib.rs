@@ -14,6 +14,7 @@ pub mod diff;
 pub mod dos_time;
 pub mod find;
 pub mod grep;
+pub mod hash;
 pub mod mount;
 pub mod pipeline;
 pub mod platform;

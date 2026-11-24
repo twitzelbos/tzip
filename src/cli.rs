@@ -112,6 +112,14 @@ pub enum Cmd {
     /// 2 = error.
     #[command(alias = "d")]
     Diff(DiffArgs),
+
+    /// Hash entries in an archive. `--algo crc32` reads the CRC
+    /// straight out of the central directory — zero body I/O, free
+    /// for HTTP/S3. `--algo md5` or `--algo sha256` streams each
+    /// entry's body through a hasher (decompression + decrypt done
+    /// in parallel workers, same model as `tzip x`).
+    #[command(alias = "h")]
+    Hash(HashArgs),
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -1108,4 +1116,78 @@ fn resolve_password(password: Option<&str>, password_file: Option<&std::path::Pa
         }
         Some(s) => Ok(Some(s.to_string())),
     }
+}
+
+// ── Hash ──────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum HashAlgo {
+    /// CRC-32 read from the central directory. Zero body I/O; free
+    /// for HTTP / S3. Weak as a cryptographic hash (32 bits) but
+    /// exact for change detection.
+    Crc32,
+    /// MD5 of the uncompressed body. Streams every entry through
+    /// a decompressor + hasher in parallel workers. 128 bits.
+    Md5,
+    /// SHA-256 of the uncompressed body. Same streaming model as
+    /// `md5`. 256 bits — the right default for anything security-
+    /// adjacent.
+    Sha256,
+}
+
+impl HashAlgo {
+    pub fn needs_body(self) -> bool {
+        !matches!(self, HashAlgo::Crc32)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            HashAlgo::Crc32 => "crc32",
+            HashAlgo::Md5 => "md5",
+            HashAlgo::Sha256 => "sha256",
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct HashArgs {
+    /// Archive. Local path, `http(s)://` URL, or `s3://bucket/key.zip` URL.
+    pub archive: String,
+
+    /// Specific entry names to hash. Empty = all entries that pass
+    /// `--include` / `--exclude`.
+    #[arg(required = false)]
+    pub names: Vec<String>,
+
+    /// Hash algorithm.
+    #[arg(long, value_enum, default_value_t = HashAlgo::Sha256)]
+    pub algo: HashAlgo,
+
+    /// Only hash entries matching this glob (repeatable).
+    #[arg(long)]
+    pub include: Vec<String>,
+
+    /// Skip entries matching this glob (repeatable).
+    #[arg(long)]
+    pub exclude: Vec<String>,
+
+    /// Parallel decompress-hash workers (ignored by `--algo crc32`,
+    /// which never touches entry bodies).
+    #[arg(short = 'P', long, default_value_t = 8)]
+    pub parallel: usize,
+
+    /// Password for AES / ZipCrypto entries. `-` reads from a prompt.
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+    #[arg(long)]
+    pub password_file: Option<PathBuf>,
+
+    /// Emit as JSON lines (`{"name": "...", "algo": "sha256", "hash": "..."}`)
+    /// instead of the default `<hex> <name>` tabular output.
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
 }

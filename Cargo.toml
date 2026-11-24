@@ -100,6 +100,7 @@ parking_lot = "0.12"
 ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
 url = "2.5"
 sha2 = "0.10"
+md-5 = "0.10"
 
 # `tzip grep` fan-out: regex is the exact engine ripgrep uses.
 # serde/serde_json handle checkpoint JSONL + --json output with correct

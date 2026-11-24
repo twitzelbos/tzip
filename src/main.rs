@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
 
-use tzip::{cli, find, grep, mount, pipeline, reader};
+use tzip::{bench, cli, find, grep, mount, pipeline, reader};
 
 fn main() -> Result<()> {
     // Parse via ArgMatches so UserSetFlags::from_matches can distinguish
@@ -28,6 +28,7 @@ fn main() -> Result<()> {
         cli::Cmd::Grep(args) => grep::run(args.into_options()?),
         cli::Cmd::Mount(args) => mount::dispatch(args.into_action()?),
         cli::Cmd::Find(args) => find::run(args.into_options()?),
+        cli::Cmd::Bench(args) => bench::run(args.into_options()?),
     }
 }
 

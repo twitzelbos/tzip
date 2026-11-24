@@ -37,6 +37,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Finding entries across archives (`tzip find`)](#finding-entries-across-archives-tzip-find)
 - [Mounting archives as a filesystem (`tzip mount`)](#mounting-archives-as-a-filesystem-tzip-mount)
 - [TUI mode](#tui-mode)
+- [Benchmarks (`tzip bench`)](#benchmarks-tzip-bench)
 - [Performance](#performance)
 - [External-drive tuning](#external-drive-tuning)
 - [macOS-specific fast paths](#macos-specific-fast-paths)
@@ -820,6 +821,46 @@ the sparkline and worker rows still show live activity.
 
 Keys: `q` or Esc to signal cancel. Cancel is currently cooperative
 — the pipeline finishes in-flight items before exiting.
+
+---
+
+## Benchmarks (`tzip bench`)
+
+`tzip bench` measures tzip against system `7z`, `zip`, and `unzip`
+on a reproducible corpus. Three benchmarks: **create**, **extract**,
+**list**. External tools that aren't on PATH are skipped (noted in
+the header line).
+
+```
+# Default: ~50 MB synthetic corpus, 3 iterations, human-readable table.
+tzip bench
+
+# ~5 MB corpus, 1 iteration — CI-time sanity check.
+tzip bench --quick
+
+# Against your own directory (any contents).
+tzip bench --corpus ./my-code -n 5
+
+# JSON lines for scripting / charting.
+tzip bench --json | jq -r 'select(.benchmark=="create") | [.tool, .throughput_mib_per_s] | @tsv'
+
+# Just one section.
+tzip bench --only extract
+```
+
+Output includes **median**, **min**, **max** wall time, **throughput
+(MiB/s)**, and for the create section also **output size** and
+**compression ratio**. Each tool runs against its own
+self-created archive so the extract column reflects the real
+end-to-end pipeline, not just the decompressor. The synthetic
+corpus is deterministic (seeded PRNG, fixed layout) — rerunning on
+the same host gives repeatable numbers.
+
+**Caveat on tiny corpora**: `--quick`'s ~5 MB input is below the
+regime where tzip's fan-out architecture pays for its thread-pool
+startup. Use the default (~50 MB) or `--corpus <big dir>` to see
+realistic numbers. CI uses `--quick` as a correctness smoke test,
+not a perf claim.
 
 ---
 

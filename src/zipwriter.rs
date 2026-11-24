@@ -64,6 +64,10 @@ pub struct ZipWriter<W: Write + Seek> {
     /// offset (CDR-order rebuild of a gap-free archive — the common
     /// case) we can skip the per-entry lseek.
     carry_src_pos: Option<u64>,
+    /// Reusable scratch for assembling each entry's local-file header
+    /// before writing. Writer is single-threaded so one buffer is
+    /// enough; keeping it avoids an alloc+free per entry.
+    lfh_scratch: Vec<u8>,
 }
 
 struct CentralEntry {
@@ -83,7 +87,7 @@ struct CentralEntry {
 
 impl<W: Write + Seek> ZipWriter<W> {
     pub fn new(inner: W) -> Self {
-        Self { inner, entries: Vec::new(), pos: 0, carry_src_pos: None }
+        Self { inner, entries: Vec::new(), pos: 0, carry_src_pos: None, lfh_scratch: Vec::new() }
     }
 
     /// Fresh writer positioned at `start_pos`. Used by update:
@@ -95,7 +99,7 @@ impl<W: Write + Seek> ZipWriter<W> {
     /// writing. `finish()` will treat `start_pos` + accumulated writes as
     /// `cd_offset`.
     pub fn new_at(inner: W, start_pos: u64) -> Self {
-        Self { inner, entries: Vec::new(), pos: start_pos, carry_src_pos: None }
+        Self { inner, entries: Vec::new(), pos: start_pos, carry_src_pos: None, lfh_scratch: Vec::new() }
     }
 
     /// Record a central-directory entry for a body that is already on disk
@@ -173,8 +177,14 @@ impl<W: Write + Seek> ZipWriter<W> {
 
         let lfh_offset = self.pos;
 
-        // -- Local file header
-        let mut lfh = Vec::with_capacity(30 + name_bytes.len() + 16);
+        // -- Local file header. Reuse the per-writer scratch by
+        // `mem::take`-ing it so we can borrow `self` for `self.inner`
+        // during write-out; we swap the (now-filled) buffer back in
+        // so its capacity carries across entries. Saves one alloc +
+        // one drop per entry on large corpora.
+        let mut lfh: Vec<u8> = std::mem::take(&mut self.lfh_scratch);
+        lfh.clear();
+        lfh.reserve(30 + name_bytes.len() + 32);
         lfh.write_u32::<LittleEndian>(SIG_LFH)?;
         let vn = if needs_zip64 { e.version_needed.max(45) } else { e.version_needed.max(20) };
         lfh.write_u16::<LittleEndian>(vn)?; // version needed to extract
@@ -225,6 +235,9 @@ impl<W: Write + Seek> ZipWriter<W> {
         self.inner.write_all(&lfh)?;
         self.inner.write_all(&e.body)?;
         self.pos += lfh.len() as u64 + comp_size;
+        // Put the scratch buffer back so its capacity persists for
+        // the next entry.
+        self.lfh_scratch = lfh;
 
         self.entries.push(CentralEntry {
             name: name_bytes.to_vec(),

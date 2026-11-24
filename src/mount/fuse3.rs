@@ -167,12 +167,12 @@ impl Filesystem for TzipFs {
         &mut self,
         _req: &Request,
         ino: u64,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -181,11 +181,35 @@ impl Filesystem for TzipFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        // We only act on the size field (truncate). Chmod / chown /
-        // timestamp changes are accepted as no-ops so tools like
-        // `install -m`, `touch`, and `cp -p` don't error — but we
-        // don't actually persist them (tzip's writer emits a fixed
-        // mode and uses now() for mtime).
+        // chmod: persist via vfs.chmod, which also CoWs an archive-backed
+        // file so the mode change makes it through commit.
+        if let Some(new_mode) = mode {
+            if let Err(e) = self.vfs.chmod(ino, new_mode) {
+                reply.error(errno_for(&e));
+                return;
+            }
+        }
+        // mtime: translate TimeOrNow to Unix seconds. UID/GID/ctime are
+        // intentionally accepted silently (no persistence yet) so tools
+        // like `install -m` / `cp -p` don't error on them.
+        if let Some(t) = mtime {
+            let secs = match t {
+                fuser::TimeOrNow::Now => {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0)
+                }
+                fuser::TimeOrNow::SpecificTime(st) => st
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            };
+            if let Err(e) = self.vfs.set_mtime(ino, secs) {
+                reply.error(errno_for(&e));
+                return;
+            }
+        }
         if let Some(new_size) = size {
             if let Err(e) = self.vfs.truncate(ino, new_size) {
                 eprintln!("tzip mount: truncate ino={} err: {:#}", ino, e);
@@ -196,6 +220,22 @@ impl Filesystem for TzipFs {
         match self.vfs.getattr(ino) {
             Some(attr) => reply.attr(&TTL, &to_file_attr(attr, self.vfs.is_writable())),
             None => reply.error(libc::ENOENT),
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        match self.vfs.rename(parent, name.as_bytes(), new_parent, new_name.as_bytes()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno_for(&e)),
         }
     }
 
@@ -453,13 +493,29 @@ impl Filesystem for TzipFs {
 
 fn to_file_attr(a: Attr, writable: bool) -> FileAttr {
     let time = unix_to_system(a.mtime_unix);
+    let default_perm = |is_dir: bool| -> u16 {
+        match (is_dir, writable) {
+            (true, true) => 0o755,
+            (true, false) => 0o555,
+            (false, true) => 0o644,
+            (false, false) => 0o444,
+        }
+    };
     let (kind, perm, nlink) = match a.kind {
         NodeKind::Dir => {
-            let p = if writable { 0o755 } else { 0o555 };
+            // Honour a chmod'd mode if the user set one; strip type
+            // bits + extras down to the standard rwx + setuid/setgid/sticky.
+            let p = a
+                .mode
+                .map(|m| (m & 0o7777) as u16)
+                .unwrap_or_else(|| default_perm(true));
             (FileType::Directory, p, 2)
         }
         NodeKind::File => {
-            let p = if writable { 0o644 } else { 0o444 };
+            let p = a
+                .mode
+                .map(|m| (m & 0o7777) as u16)
+                .unwrap_or_else(|| default_perm(false));
             (FileType::RegularFile, p, 1)
         }
     };
@@ -479,6 +535,28 @@ fn to_file_attr(a: Attr, writable: bool) -> FileAttr {
         rdev: 0,
         blksize: 4096,
         flags: 0,
+    }
+}
+
+/// Map a `VirtualFs` anyhow error to the closest POSIX errno for the
+/// FUSE reply. Scrapes the error message for the familiar `EEXIST` /
+/// `ENOENT` / `ENOTEMPTY` / `read-only` / `EISDIR` / `EINVAL` /
+/// `ENOTDIR` keywords tzip's VFS raises.
+fn errno_for(err: &anyhow::Error) -> i32 {
+    let msg = format!("{err:#}");
+    if msg.contains("read-only") {
+        libc::EROFS
+    } else if msg.contains("EEXIST") {
+        libc::EEXIST
+    } else if msg.contains("ENOTEMPTY") {
+        libc::ENOTEMPTY
+    } else if msg.contains("ENOENT") || msg.contains("EISDIR") || msg.contains("ENOTDIR") {
+        libc::ENOENT
+    } else if msg.contains("EINVAL") {
+        libc::EINVAL
+    } else {
+        eprintln!("tzip mount: op err: {:#}", err);
+        libc::EIO
     }
 }
 

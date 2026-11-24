@@ -1011,6 +1011,7 @@ fn encode_one(
         gp_bit1: out.gp_bit1,
         version_needed,
         mtime: raw.item.mtime,
+        external_attr: raw.item.external_attr,
     })
 }
 

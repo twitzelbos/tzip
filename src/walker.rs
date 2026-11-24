@@ -26,6 +26,11 @@ pub struct WorkItem {
     pub dirfd: Option<Arc<OwnedDirFd>>,
     /// Basename component within `dirfd`, when `dirfd` is set.
     pub basename: Option<std::ffi::OsString>,
+    /// Pre-computed `external_attr` value for the ZIP CDR. Bits 16..31
+    /// are the Unix st_mode (type + permissions); low bits can carry
+    /// DOS attribute flags. Zero asks the writer for its legacy
+    /// 0o100644 default.
+    pub external_attr: u32,
 }
 
 impl std::fmt::Debug for WorkItem {
@@ -158,7 +163,24 @@ fn build_item(path: &Path, name: &str, meta: &std::fs::Metadata) -> Result<WorkI
         mtime,
         dirfd: None,
         basename: None,
+        external_attr: external_attr_from_meta(meta),
     })
+}
+
+/// Build a ZIP `external_attr` word from a `std::fs::Metadata`. On Unix
+/// this is `mode << 16` (taking the full st_mode, type bits included —
+/// the reader masks those off). On Windows we leave it zero so the
+/// writer's legacy default (0o100644 for files) kicks in; proper DOS
+/// attribute encoding is a follow-up.
+#[cfg(unix)]
+fn external_attr_from_meta(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    (meta.mode() & 0o177777) << 16
+}
+
+#[cfg(not(unix))]
+fn external_attr_from_meta(_meta: &std::fs::Metadata) -> u32 {
+    0
 }
 
 fn archive_name(base_name: &str, rel: &Path) -> String {

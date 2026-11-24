@@ -35,6 +35,10 @@ pub struct Attr {
     pub size: u64,
     pub kind: NodeKind,
     pub mtime_unix: i64,
+    /// User-set mode bits via chmod, if any. `None` = platform adapter
+    /// should fall through to its default (0o444/0o555 read-only,
+    /// 0o644/0o755 writable).
+    pub mode: Option<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,6 +54,9 @@ enum Node {
         /// commit time to re-emit new directories.
         #[allow(dead_code)]
         path: String,
+        /// User-set mode bits via chmod. None = fall through to the
+        /// writable-default 0o755.
+        mode: Option<u32>,
     },
     File {
         source: FileSource,
@@ -60,7 +67,38 @@ enum Node {
         /// path inside the staging dir, and to tombstone removed
         /// archive entries.
         path: String,
+        /// User-set mode bits via chmod. None = fall through to the
+        /// writable-default 0o644.
+        mode: Option<u32>,
     },
+}
+
+impl Node {
+    fn path(&self) -> &str {
+        match self {
+            Node::Dir { path, .. } | Node::File { path, .. } => path,
+        }
+    }
+    fn mode(&self) -> Option<u32> {
+        match self {
+            Node::Dir { mode, .. } | Node::File { mode, .. } => *mode,
+        }
+    }
+    fn set_path(&mut self, new_path: String) {
+        match self {
+            Node::Dir { path, .. } | Node::File { path, .. } => *path = new_path,
+        }
+    }
+    fn set_mtime(&mut self, ts: i64) {
+        match self {
+            Node::Dir { mtime_unix, .. } | Node::File { mtime_unix, .. } => *mtime_unix = ts,
+        }
+    }
+    fn set_mode_bits(&mut self, m: u32) {
+        match self {
+            Node::Dir { mode, .. } | Node::File { mode, .. } => *mode = Some(m),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -340,6 +378,7 @@ impl VirtualFs {
             size: 0,
             mtime_unix: now,
             path: full_path.clone(),
+            mode: None,
         });
         st.dirty.insert(ino, Vec::new());
         st.children
@@ -351,6 +390,7 @@ impl VirtualFs {
             size: 0,
             kind: NodeKind::File,
             mtime_unix: now,
+            mode: None,
         })
     }
 
@@ -459,6 +499,7 @@ impl VirtualFs {
         st.nodes.push(Node::Dir {
             mtime_unix: now,
             path: full_path,
+            mode: None,
         });
         st.children.insert(ino, Vec::new());
         st.children
@@ -470,6 +511,7 @@ impl VirtualFs {
             size: 0,
             kind: NodeKind::Dir,
             mtime_unix: now,
+            mode: None,
         })
     }
 
@@ -497,6 +539,208 @@ impl VirtualFs {
         // optional; the rewritten archive will omit the dir if no
         // children live under it.
         Ok(())
+    }
+
+    /// Set the Unix mode bits for an inode. Persisted into the
+    /// archive's `external_attr` field on commit (version_made_by
+    /// already = 3 / Unix in the writer). Accepts the full permission
+    /// word; type bits and anything outside 0o7777 are stripped.
+    pub fn chmod(&self, ino: Inode, mode: u32) -> Result<()> {
+        self.require_writable()?;
+        let mut st = self.state.write().unwrap();
+        let node = st
+            .nodes
+            .get_mut((ino - 1) as usize)
+            .ok_or_else(|| anyhow::anyhow!("no such inode {}", ino))?;
+        node.set_mode_bits(mode & 0o7777);
+        // Changing mode on an archive-backed file also forces a
+        // rewrite of that entry — the mode lives in the CDR + LFH,
+        // so we can't just byte-copy the original any more. CoW
+        // promotes it.
+        let is_archive_file = matches!(
+            node,
+            Node::File { source: FileSource::Archive(_), .. }
+        );
+        drop(st);
+        if is_archive_file {
+            self.cow_to_dirty(ino)?;
+        }
+        Ok(())
+    }
+
+    /// Set the last-modified timestamp for an inode. Persisted into
+    /// the archive's DOS date/time fields on commit.
+    pub fn set_mtime(&self, ino: Inode, mtime_unix: i64) -> Result<()> {
+        self.require_writable()?;
+        let mut st = self.state.write().unwrap();
+        let node = st
+            .nodes
+            .get_mut((ino - 1) as usize)
+            .ok_or_else(|| anyhow::anyhow!("no such inode {}", ino))?;
+        node.set_mtime(mtime_unix);
+        // Same CoW story as chmod: the mtime lives in the LFH + CDR.
+        let is_archive_file = matches!(
+            node,
+            Node::File { source: FileSource::Archive(_), .. }
+        );
+        drop(st);
+        if is_archive_file {
+            self.cow_to_dirty(ino)?;
+        }
+        Ok(())
+    }
+
+    /// Rename the child `src_name` of `src_parent` to `dst_name` under
+    /// `dst_parent`. Fails with EEXIST if a sibling at the destination
+    /// already exists. Files CoW through dirty on rename so the new
+    /// path shows up on commit; directories traverse their subtree,
+    /// CoWing every archive-backed descendant file.
+    pub fn rename(
+        &self,
+        src_parent: Inode,
+        src_name: &[u8],
+        dst_parent: Inode,
+        dst_name: &[u8],
+    ) -> Result<()> {
+        self.require_writable()?;
+
+        // Find the child in src_parent.
+        let (child_ino, child_kind) = {
+            let st = self.state.read().unwrap();
+            let siblings = st
+                .children
+                .get(&src_parent)
+                .ok_or_else(|| anyhow::anyhow!("ENOENT: no src parent {}", src_parent))?;
+            let (_, ino, kind) = siblings
+                .iter()
+                .find(|(n, _, _)| n.as_slice() == src_name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ENOENT: {:?}", String::from_utf8_lossy(src_name))
+                })?
+                .clone();
+            (ino, kind)
+        };
+        // Prevent moving root.
+        if child_ino == ROOT_INO {
+            anyhow::bail!("EINVAL: cannot rename root");
+        }
+        // Prevent moving a dir into its own descendant.
+        if child_kind == NodeKind::Dir {
+            self.ensure_not_ancestor(child_ino, dst_parent)?;
+        }
+        // Forbid overwriting existing dst for v1.
+        {
+            let st = self.state.read().unwrap();
+            if let Some(siblings) = st.children.get(&dst_parent) {
+                if siblings.iter().any(|(n, _, _)| n.as_slice() == dst_name) {
+                    anyhow::bail!("EEXIST: {:?}", String::from_utf8_lossy(dst_name));
+                }
+            }
+        }
+        // Compute the new parent path.
+        let dst_parent_path = {
+            let st = self.state.read().unwrap();
+            let p = st
+                .nodes
+                .get((dst_parent - 1) as usize)
+                .ok_or_else(|| anyhow::anyhow!("ENOENT: no dst parent {}", dst_parent))?;
+            match p {
+                Node::Dir { path, .. } => path.clone(),
+                Node::File { .. } => anyhow::bail!("ENOTDIR: dst parent {}", dst_parent),
+            }
+        };
+        let new_name_str = std::str::from_utf8(dst_name)
+            .context("non-UTF-8 rename target name")?
+            .to_string();
+        let new_path = join_entry_path(&dst_parent_path, &new_name_str);
+
+        // Phase 1 — CoW any archive-backed file(s) that are affected.
+        // For a file rename: just the file itself. For a dir rename:
+        // every archive-backed file descendant.
+        let to_cow: Vec<Inode> = match child_kind {
+            NodeKind::File => {
+                let st = self.state.read().unwrap();
+                if let Some(Node::File { source: FileSource::Archive(_), .. }) =
+                    st.nodes.get((child_ino - 1) as usize)
+                {
+                    vec![child_ino]
+                } else {
+                    vec![]
+                }
+            }
+            NodeKind::Dir => self.collect_archive_backed_descendants(child_ino),
+        };
+        for ino in to_cow {
+            self.cow_to_dirty(ino)?;
+        }
+
+        // Phase 2 — update children maps + node paths under the write lock.
+        let mut st = self.state.write().unwrap();
+
+        // Remove from src_parent's children.
+        if let Some(siblings) = st.children.get_mut(&src_parent) {
+            siblings.retain(|(n, _, _)| n.as_slice() != src_name);
+        }
+        // Add to dst_parent's children.
+        st.children
+            .entry(dst_parent)
+            .or_default()
+            .push((dst_name.to_vec(), child_ino, child_kind));
+
+        // Update the renamed node's own path.
+        let old_root_path = {
+            let n = st.nodes.get((child_ino - 1) as usize).unwrap();
+            n.path().to_string()
+        };
+        if let Some(n) = st.nodes.get_mut((child_ino - 1) as usize) {
+            n.set_path(new_path.clone());
+        }
+
+        // For a dir: update every descendant's path by rewriting its
+        // `old_root_path` prefix to `new_path`.
+        if child_kind == NodeKind::Dir {
+            let descendants = collect_descendant_inos_locked(&st, child_ino);
+            for ino in descendants {
+                let Some(node) = st.nodes.get_mut((ino - 1) as usize) else { continue };
+                let old = node.path().to_string();
+                if let Some(rest) = old.strip_prefix(&old_root_path) {
+                    let new = format!("{}{}", new_path, rest);
+                    node.set_path(new);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Bail if `ancestor_candidate` is inside the subtree rooted at
+    /// `subtree_root`. Guards against `mv foo foo/bar`.
+    fn ensure_not_ancestor(&self, subtree_root: Inode, candidate: Inode) -> Result<()> {
+        if subtree_root == candidate {
+            anyhow::bail!("EINVAL: cannot rename a directory into itself");
+        }
+        let st = self.state.read().unwrap();
+        let descendants = collect_descendant_inos_locked(&st, subtree_root);
+        if descendants.contains(&candidate) {
+            anyhow::bail!("EINVAL: rename target is inside the source directory");
+        }
+        Ok(())
+    }
+
+    /// Walk `root`'s subtree and return inodes of every archive-backed
+    /// File descendant. Taken outside a lock so each one can CoW
+    /// without holding the write lock.
+    fn collect_archive_backed_descendants(&self, root: Inode) -> Vec<Inode> {
+        let st = self.state.read().unwrap();
+        let inos = collect_descendant_inos_locked(&st, root);
+        inos.into_iter()
+            .filter(|ino| {
+                matches!(
+                    st.nodes.get((*ino - 1) as usize),
+                    Some(Node::File { source: FileSource::Archive(_), .. })
+                )
+            })
+            .collect()
     }
 
     fn require_writable(&self) -> Result<()> {
@@ -565,15 +809,26 @@ impl VirtualFs {
         if !self.writable {
             return Ok(CommitSummary::default());
         }
-        let (dirty_paths_and_bodies, tombstones, archive_path) = {
+        let (dirty_specs, tombstones, archive_path) = {
             let st = self.state.read().unwrap();
-            let dirty: Vec<(String, Vec<u8>)> = st
+            let dirty: Vec<DirtyCommitSpec> = st
                 .dirty
                 .iter()
                 .filter_map(|(ino, body)| {
                     let node = st.nodes.get((*ino - 1) as usize)?;
-                    if let Node::File { path, .. } = node {
-                        Some((path.clone(), body.clone()))
+                    if let Node::File {
+                        path,
+                        mtime_unix,
+                        mode,
+                        ..
+                    } = node
+                    {
+                        Some(DirtyCommitSpec {
+                            path: path.clone(),
+                            body: body.clone(),
+                            mtime_unix: *mtime_unix,
+                            mode: *mode,
+                        })
                     } else {
                         None
                     }
@@ -582,23 +837,43 @@ impl VirtualFs {
             let tombstones: Vec<String> = st.tombstones.iter().cloned().collect();
             (dirty, tombstones, self.archive_path.clone())
         };
-        if dirty_paths_and_bodies.is_empty() && tombstones.is_empty() {
+        if dirty_specs.is_empty() && tombstones.is_empty() {
             return Ok(CommitSummary::default());
         }
 
         // Materialise dirty bodies to a staging tempdir so the update
-        // engine can consume them via its normal filesystem path.
+        // engine can consume them via its normal filesystem path. Set
+        // each tempfile's mode + mtime so the walker picks them up
+        // and the writer emits them as `external_attr` + DOS time.
         let staging = tempfile::tempdir().context("create commit staging tempdir")?;
-        let n_written = dirty_paths_and_bodies.len();
-        for (rel_path, body) in dirty_paths_and_bodies {
-            let dest = staging.path().join(&rel_path);
+        let n_written = dirty_specs.len();
+        for spec in dirty_specs {
+            let dest = staging.path().join(&spec.path);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!("create staging parent {}", parent.display())
                 })?;
             }
-            std::fs::write(&dest, &body)
-                .with_context(|| format!("write staging body for {}", rel_path))?;
+            std::fs::write(&dest, &spec.body)
+                .with_context(|| format!("write staging body for {}", spec.path))?;
+
+            // Apply user-set permission bits (chmod from mount) if any.
+            // Masked to 0o7777 so we only touch the permission portion.
+            #[cfg(unix)]
+            if let Some(m) = spec.mode {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &dest,
+                    std::fs::Permissions::from_mode(m & 0o7777),
+                );
+            }
+            // Apply the entry's mtime so the walker's DOS mtime computation
+            // picks it up. We don't bother with atime.
+            if spec.mtime_unix > 0 {
+                let _ = set_mtime_seconds(&dest, spec.mtime_unix);
+            }
+            // Keep the compiler quiet about `spec.mode` on non-Unix.
+            let _ = spec.mode;
         }
 
         let n_tombstones = tombstones.len();
@@ -691,19 +966,37 @@ pub struct CommitSummary {
     pub tombstoned: usize,
 }
 
+/// BFS the children map, collecting every descendant inode of `root`
+/// (not including `root` itself). Caller must already hold the read
+/// lock on MutableState.
+fn collect_descendant_inos_locked(st: &MutableState, root: Inode) -> Vec<Inode> {
+    let mut out: Vec<Inode> = Vec::new();
+    let mut stack: Vec<Inode> = vec![root];
+    while let Some(current) = stack.pop() {
+        let Some(siblings) = st.children.get(&current) else { continue };
+        for (_, ino, _) in siblings {
+            out.push(*ino);
+            stack.push(*ino);
+        }
+    }
+    out
+}
+
 fn node_attr(ino: Inode, n: &Node) -> Attr {
     match n {
-        Node::Dir { mtime_unix, .. } => Attr {
+        Node::Dir { mtime_unix, mode, .. } => Attr {
             ino,
             size: 0,
             kind: NodeKind::Dir,
             mtime_unix: *mtime_unix,
+            mode: *mode,
         },
-        Node::File { size, mtime_unix, .. } => Attr {
+        Node::File { size, mtime_unix, mode, .. } => Attr {
             ino,
             size: *size,
             kind: NodeKind::File,
             mtime_unix: *mtime_unix,
+            mode: *mode,
         },
     }
 }
@@ -728,6 +1021,7 @@ fn build_tree(archive: &Archive) -> (Vec<Node>, HashMap<Inode, Vec<(Vec<u8>, Ino
     nodes.push(Node::Dir {
         mtime_unix: 0,
         path: String::new(),
+        mode: None,
     });
     children.insert(ROOT_INO, Vec::new());
 
@@ -754,6 +1048,7 @@ fn build_tree(archive: &Archive) -> (Vec<Node>, HashMap<Inode, Vec<(Vec<u8>, Ino
                         nodes.push(Node::Dir {
                             mtime_unix: dos_to_unix(entry.mtime),
                             path: running.clone(),
+                            mode: None,
                         });
                         children.insert(ino, Vec::new());
                         children
@@ -769,6 +1064,7 @@ fn build_tree(archive: &Archive) -> (Vec<Node>, HashMap<Inode, Vec<(Vec<u8>, Ino
                         size: entry.uncomp_size,
                         mtime_unix: dos_to_unix(entry.mtime),
                         path: running.clone(),
+                        mode: None,
                     });
                     children
                         .get_mut(&parent_ino)
@@ -783,6 +1079,7 @@ fn build_tree(archive: &Archive) -> (Vec<Node>, HashMap<Inode, Vec<(Vec<u8>, Ino
                     nodes.push(Node::Dir {
                         mtime_unix: 0,
                         path: running.clone(),
+                        mode: None,
                     });
                     children.insert(ino, Vec::new());
                     children
@@ -823,6 +1120,56 @@ fn civil_to_unix(y: i64, m: u32, d: u32) -> i64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe as i64 - 719_468;
     days * 86_400
+}
+
+/// Local record used by `commit()` — materialise a dirty entry's path,
+/// body, and VFS-side metadata (mtime + optional chmod) in a single
+/// pass under the state lock, then process outside.
+struct DirtyCommitSpec {
+    path: String,
+    body: Vec<u8>,
+    mtime_unix: i64,
+    mode: Option<u32>,
+}
+
+/// Set a file's mtime to `ts` Unix seconds. Preserves atime. On Unix
+/// we use `utimensat` directly to avoid a `filetime`-crate dep.
+#[cfg(unix)]
+fn set_mtime_seconds(path: &std::path::Path, ts: i64) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // UTIME_OMIT keeps atime untouched; the second slot sets mtime.
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: ts as libc::time_t,
+            tv_nsec: 0,
+        },
+    ];
+    // SAFETY: path is NUL-terminated, times is a 2-element array.
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            times.as_ptr(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn set_mtime_seconds(_path: &std::path::Path, _ts: i64) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn unix_now() -> i64 {

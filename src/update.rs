@@ -164,7 +164,14 @@ fn run_update_append(
         .context("seek to cd_offset")?;
 
     // 3. BufWriter + ZipWriter positioned at cd_offset. Rebuild the central
-    //    directory from the entries we parsed.
+    //    directory from the entries we parsed. fstatfs on the rw fd we
+    //    already hold — no second path walk.
+    #[cfg(unix)]
+    let out_info = {
+        use std::os::unix::io::AsRawFd;
+        platform::fs_info_fd(file.as_raw_fd()).ok()
+    };
+    #[cfg(not(unix))]
     let out_info = platform::fs_info(
         opts.archive
             .parent()
@@ -247,6 +254,14 @@ fn run_update_rebuild(
     let result = (|| -> Result<()> {
         let file = File::create(&tmp_path)
             .with_context(|| format!("create temp archive {}", tmp_path.display()))?;
+        // fstatfs on the fd we just opened — skips the path walk a
+        // path-based fs_info(parent) would do.
+        #[cfg(unix)]
+        let out_info = {
+            use std::os::unix::io::AsRawFd;
+            platform::fs_info_fd(file.as_raw_fd()).ok()
+        };
+        #[cfg(not(unix))]
         let out_info = platform::fs_info(
             opts.archive
                 .parent()

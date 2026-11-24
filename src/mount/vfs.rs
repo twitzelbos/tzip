@@ -959,6 +959,7 @@ impl VirtualFs {
             write_sha256: false,
             index_names: false,
             index_terms: Vec::new(),
+            facet: Vec::new(),
         })
     }
 }

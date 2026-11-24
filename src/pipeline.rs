@@ -124,6 +124,7 @@ pub(crate) fn encode_item(
     want_md5: bool,
     want_sha256: bool,
     index_terms_match: bool,
+    want_facet_body: bool,
 ) -> Result<EncodedEntry> {
     encode_one(
         raw,
@@ -135,6 +136,7 @@ pub(crate) fn encode_item(
         want_md5,
         want_sha256,
         index_terms_match,
+        want_facet_body,
     )
 }
 
@@ -711,6 +713,7 @@ pub fn run(opts: Options) -> Result<()> {
     // of them and tokenises the plaintext when it does.
     let index_terms_globs: std::sync::Arc<Vec<String>> =
         std::sync::Arc::new(opts.index_terms.clone());
+    let want_facet = !opts.facet.is_empty();
     // Auto parallel-block DEFLATE when a single large file dominates the
     // workload. In streaming mode we don't know the count up front, so we
     // gate on the batched total. If unset (streaming), the CPU worker will
@@ -737,6 +740,11 @@ pub fn run(opts: Options) -> Result<()> {
                     && index_terms_globs
                         .iter()
                         .any(|g| crate::walker::is_excluded(&raw.item.name_in_archive, std::slice::from_ref(g)));
+                // Only ship plaintext up to the main thread when
+                // facet extraction is on AND the name matched the
+                // term-index glob (bodies on this glob are assumed
+                // JSON for facet purposes).
+                let want_facet_body = want_facet && index_terms_match;
                 let entry = encode_one(
                     raw,
                     method,
@@ -747,6 +755,7 @@ pub fn run(opts: Options) -> Result<()> {
                     want_md5,
                     want_sha256,
                     index_terms_match,
+                    want_facet_body,
                 )?;
                 if let Some(t) = &tui_handle {
                     let elapsed = started.elapsed().as_secs_f64();
@@ -786,6 +795,14 @@ pub fn run(opts: Options) -> Result<()> {
     // builder with the final CDR-order entry index as the posting
     // identifier.
     let mut term_builder = crate::termidx::TermIndexBuilder::new();
+    // Phase 3 facet builders. One per `--facet` path. Workers ship
+    // plaintext up via `EncodedEntry.facet_body`; this loop feeds
+    // every requested facet from every matching entry.
+    let mut facet_builders: Vec<crate::facets::FacetBuilder> = opts
+        .facet
+        .iter()
+        .map(|spec| crate::facets::FacetBuilder::new(spec))
+        .collect::<Result<Vec<_>>>()?;
     if opts.sort {
         use std::collections::HashMap;
         let mut pending: HashMap<u64, EncodedEntry> = HashMap::new();
@@ -806,6 +823,11 @@ pub fn run(opts: Options) -> Result<()> {
                 if let Some(tokens) = e.index_terms.take() {
                     let cdr_pos = (wrote_files - 1) as u32;
                     term_builder.add_prepared(cdr_pos, tokens);
+                }
+                if let Some(body) = e.facet_body.take() {
+                    for fb in &mut facet_builders {
+                        fb.add_body(&body);
+                    }
                 }
                 zw.write_entry(e)?;
                 progress.inc(plain_size);
@@ -829,10 +851,52 @@ pub fn run(opts: Options) -> Result<()> {
                 let cdr_pos = (wrote_files - 1) as u32;
                 term_builder.add_prepared(cdr_pos, tokens);
             }
+            if let Some(body) = entry.facet_body.take() {
+                for fb in &mut facet_builders {
+                    fb.add_body(&body);
+                }
+            }
             zw.write_entry(entry)?;
             progress.inc(plain_size);
             progress.set_msg(msg);
         }
+    }
+
+    // --facet: emit one `.tzip/facets.v1/<leaf>` entry per facet.
+    // These are STORE-method entries (never encrypted or compressed)
+    // so `Archive::try_load_facet_indices` can read them directly.
+    for fb in facet_builders.drain(..) {
+        let name = crate::facets::entry_name_for(fb.field_name());
+        let payload = fb.finish()?;
+        if payload.is_empty() {
+            continue;
+        }
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&payload);
+        let crc = hasher.finalize();
+        let body_len = payload.len() as u64;
+        let e = crate::zipwriter::EncodedEntry {
+            index: u64::MAX,
+            name: name.clone(),
+            body: payload,
+            uncompressed_size: body_len,
+            crc32: crc,
+            method_on_wire: 0,
+            inner_method: 0,
+            encrypted: false,
+            gp_bit1: false,
+            version_needed: 20,
+            mtime: (0, 0),
+            external_attr: 0o100644u32 << 16,
+            md5_digest: None,
+            sha256_digest: None,
+            index_terms: None,
+            facet_body: None,
+        };
+        if opts.index_names {
+            indexed_names.push(name);
+        }
+        zw.write_entry(e)?;
     }
 
     // --index-terms: emit the `.tzip/terms.v1` entry if we collected
@@ -861,6 +925,7 @@ pub fn run(opts: Options) -> Result<()> {
                 md5_digest: None,
                 sha256_digest: None,
                 index_terms: None,
+                facet_body: None,
             };
             if opts.index_names {
                 indexed_names.push(e.name.clone());
@@ -893,6 +958,7 @@ pub fn run(opts: Options) -> Result<()> {
             md5_digest: None,
             sha256_digest: None,
             index_terms: None,
+            facet_body: None,
         };
         // Fix up size / crc for the synthetic entry.
         let mut hasher = crc32fast::Hasher::new();
@@ -1152,6 +1218,7 @@ fn encode_one(
     want_md5: bool,
     want_sha256: bool,
     index_terms_match: bool,
+    want_facet_body: bool,
 ) -> Result<EncodedEntry> {
     let RawItem { index, item, bytes } = raw;
     let uncompressed_size = bytes.len() as u64;
@@ -1186,6 +1253,15 @@ fn encode_one(
         let mut set = std::collections::HashSet::new();
         crate::termidx::tokenize(&bytes[..], &mut set);
         Some(set.into_iter().collect())
+    } else {
+        None
+    };
+    // Snapshot plaintext for facet accumulation on the main thread.
+    // Facet extraction is cross-entry (each facet accumulates across
+    // every matching entry) and runs best serially, so the worker
+    // just hands plaintext over.
+    let facet_body: Option<Vec<u8>> = if want_facet_body {
+        Some(bytes[..].to_vec())
     } else {
         None
     };
@@ -1238,6 +1314,7 @@ fn encode_one(
         md5_digest,
         sha256_digest,
         index_terms,
+        facet_body,
     })
 }
 

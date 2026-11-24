@@ -123,6 +123,11 @@ pub struct Archive {
     /// uses it to narrow candidate entries for literal-token
     /// queries before running the regex scan.
     term_index: Option<crate::termidx::TermIndex>,
+    /// Parsed `.tzip/facets.v1/<leaf>` per-field facet indices,
+    /// keyed by `<leaf>` (the short name of the facet path).
+    /// `tzip aggregate --by <leaf> --count` reads these to emit
+    /// count-by-value tables without decoding any entry body.
+    facet_indices: std::collections::HashMap<String, crate::facets::Facet>,
 }
 
 impl Archive {
@@ -288,9 +293,11 @@ impl Archive {
             disk_count: 1,
             name_index: None,
             term_index: None,
+            facet_indices: std::collections::HashMap::new(),
         };
         arch.try_load_name_index();
         arch.try_load_term_index();
+        arch.try_load_facet_indices();
         Ok(arch)
     }
 
@@ -390,9 +397,11 @@ impl Archive {
             disk_count,
             name_index: None,
             term_index: None,
+            facet_indices: std::collections::HashMap::new(),
         };
         arch.try_load_name_index();
         arch.try_load_term_index();
+        arch.try_load_facet_indices();
         Ok(arch)
     }
 
@@ -455,6 +464,40 @@ impl Archive {
             .and_then(|_| self.source.read_exact(&mut body))
             .ok()?;
         Some(body)
+    }
+
+    /// Try to load every `.tzip/facets.v1/<leaf>` entry as a Facet
+    /// and stash by leaf. Silent-fallback on parse errors (reader
+    /// still works, just without that facet).
+    fn try_load_facet_indices(&mut self) {
+        // Snapshot indices first — we need both `self.entries` immutable
+        // and `self.source` mutable to read each body.
+        let targets: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| crate::facets::is_facet_entry_name(&self.entries[i].name))
+            .collect();
+        for i in targets {
+            let name = self.entries[i].name.clone();
+            let body = match self.read_index_body(&name) {
+                Some(b) => b,
+                None => continue,
+            };
+            if let Ok(f) = crate::facets::Facet::parse(&body) {
+                self.facet_indices.insert(f.field.clone(), f);
+            }
+        }
+    }
+
+    /// Available facet field names (the leaf part of each
+    /// `.tzip/facets.v1/<leaf>`), in alphabetic order.
+    pub fn facet_fields(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.facet_indices.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Get a specific facet by field name (short / leaf name).
+    pub fn facet(&self, field: &str) -> Option<&crate::facets::Facet> {
+        self.facet_indices.get(field)
     }
 
     /// Entry indices that could contain every literal token in

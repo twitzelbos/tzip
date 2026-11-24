@@ -120,6 +120,14 @@ pub enum Cmd {
     /// in parallel workers, same model as `tzip x`).
     #[command(alias = "h")]
     Hash(HashArgs),
+
+    /// Aggregate over a per-field facet index built by
+    /// `tzip create --facet '.field'`. Emits a sorted count-by-value
+    /// table in milliseconds, no body decode — the archive is the
+    /// database. `tzip aggregate --fields archive.zip` lists the
+    /// available facets.
+    #[command(alias = "agg")]
+    Aggregate(AggregateArgs),
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -249,6 +257,18 @@ pub struct CreateArgs {
     /// tokens fall back to full linear scan.
     #[arg(long, value_name = "GLOB")]
     pub index_terms: Vec<String>,
+
+    /// Build a per-field facet index over JSON entries whose name
+    /// matches `--index-terms` (repeatable). Spec is a jq-style
+    /// dot-path, e.g. `.status_code` or `.event.kind`. Stored as
+    /// `.tzip/facets.v1/<leaf>` inside the archive. Later
+    /// `tzip aggregate --by <leaf> --count archive.zip` returns a
+    /// sorted count-by-value table in milliseconds, with no body
+    /// decode. String / number / bool values are counted as-is;
+    /// missing or non-scalar fields fall into a `__missing__`
+    /// bucket so totals always equal entry counts.
+    #[arg(long, value_name = "PATH")]
+    pub facet: Vec<String>,
 }
 
 // ── Update ─────────────────────────────────────────────────────────────────
@@ -719,6 +739,10 @@ pub struct Options {
     /// Globs of entries to tokenize + index with a hashed inverted
     /// term index in `.tzip/terms.v1`. Empty = skip.
     pub index_terms: Vec<String>,
+    /// jq-style field paths to accumulate facet counts for. Each
+    /// becomes a `.tzip/facets.v1/<leaf>` entry. Only JSON entries
+    /// matching `index_terms` glob contribute.
+    pub facet: Vec<String>,
 }
 
 /// Which reader op is running and what it needs.
@@ -885,6 +909,7 @@ impl CreateArgs {
             write_sha256: self.write_sha256,
             index_names: self.index_names,
             index_terms: self.index_terms,
+            facet: self.facet,
         })
     }
 }
@@ -961,6 +986,7 @@ impl UpdateArgs {
             // we skip index emission on update.
             index_names: false,
             index_terms: Vec::new(),
+            facet: Vec::new(),
         })
     }
 }
@@ -1263,4 +1289,65 @@ pub struct HashArgs {
     pub quiet: bool,
     #[arg(short = 'v', long)]
     pub verbose: bool,
+}
+
+// ── Aggregate ─────────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+pub struct AggregateArgs {
+    /// Archive. Local path, `http(s)://` URL, or `s3://bucket/key.zip` URL.
+    pub archive: String,
+
+    /// Field (leaf name) to aggregate by. Matches the leaf of the
+    /// path used at create time (`--facet '.event.kind'` → use
+    /// `--by kind`). Required unless `--fields` is set.
+    #[arg(long, value_name = "FIELD")]
+    pub by: Option<String>,
+
+    /// List the facet fields available in this archive, one per
+    /// line, and exit. Mutually exclusive with `--by`.
+    #[arg(long, conflicts_with = "by")]
+    pub fields: bool,
+
+    /// Limit output to the top N values by count. 0 = all.
+    #[arg(long, default_value_t = 0usize)]
+    pub top: usize,
+
+    /// Emit as JSON (one object per line: `{"value": ..., "count": N}`)
+    /// instead of the default tabular layout.
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AggregateOptions {
+    pub archive: String,
+    pub by: Option<String>,
+    pub fields: bool,
+    pub top: usize,
+    pub json: bool,
+    pub quiet: bool,
+    pub verbose: bool,
+}
+
+impl AggregateArgs {
+    pub fn into_options(self) -> Result<AggregateOptions> {
+        if self.by.is_none() && !self.fields {
+            bail!("tzip aggregate: pass --by FIELD or --fields");
+        }
+        Ok(AggregateOptions {
+            archive: self.archive,
+            by: self.by,
+            fields: self.fields,
+            top: self.top,
+            json: self.json,
+            quiet: self.quiet,
+            verbose: self.verbose,
+        })
+    }
 }

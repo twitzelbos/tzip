@@ -75,6 +75,14 @@ pub struct EncodedEntry {
     /// `TermIndexBuilder` at CDR-emit time so posting-list entry
     /// indices match the final CDR order.
     pub index_terms: Option<Vec<Vec<u8>>>,
+    /// Owned copy of the plaintext body, populated by the CPU worker
+    /// when the entry name matches `--index-terms` glob AND any
+    /// `--facet` path was requested. Workers can't do facet
+    /// extraction themselves — each facet is a cross-entry
+    /// accumulator — so we ship the bytes to the main thread for
+    /// aggregation. `None` otherwise; no overhead when facets are
+    /// off.
+    pub facet_body: Option<Vec<u8>>,
 }
 
 pub struct ZipWriter<W: Write + Seek> {
@@ -218,6 +226,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             md5_digest,
             sha256_digest,
             index_terms: _,
+            facet_body: _,
         } = e;
         let name_bytes = name.into_bytes();
         let comp_size = body.len() as u64;

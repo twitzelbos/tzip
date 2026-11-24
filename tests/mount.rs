@@ -343,3 +343,235 @@ fn mount_http_source() {
 fn _touch() -> usize {
     std::io::empty().read(&mut [0u8; 1]).unwrap_or(0)
 }
+
+// ── Writable mounts (H2) ───────────────────────────────────────────────────
+
+/// Explicitly drop a MountGuard and wait a beat for commit to settle
+/// — the commit call fires synchronously during Drop as part of the
+/// tzip mount process's normal unmount path, but the parent-side
+/// `wait()` returns before the filesystem sees the atomic rename.
+fn drop_mount_and_settle(guard: MountGuard) {
+    drop(guard);
+    thread::sleep(Duration::from_millis(50));
+}
+
+/// List the entries of an archive on disk via `tzip ls`, used to
+/// assert what landed after an unmount commit.
+fn ls_entries(archive: &Path) -> Vec<String> {
+    let out = Command::new(tzip_bin())
+        .args(["ls", archive.to_str().unwrap()])
+        .output()
+        .expect("spawn tzip ls");
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut names: Vec<String> = Vec::new();
+    for line in s.lines() {
+        // Skip header / separator / footer lines; CDR rows end in the entry name.
+        if line.starts_with("Length")
+            || line.starts_with("---")
+            || line.trim().is_empty()
+            || line.contains("files")
+        {
+            continue;
+        }
+        if let Some(name) = line.rsplit(' ').next() {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names
+}
+
+#[test]
+fn mount_write_creates_new_file_committed_on_unmount() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    // Create a file under the mount; verify it's immediately visible.
+    let new_path = mp.join("corpus/new_file.txt");
+    fs::write(&new_path, b"written through the mount\n").unwrap();
+    assert_eq!(fs::read(&new_path).unwrap(), b"written through the mount\n");
+
+    drop_mount_and_settle(guard);
+
+    // Archive must now contain the new entry.
+    let names = ls_entries(&archive);
+    assert!(
+        names.iter().any(|n| n == "corpus/new_file.txt"),
+        "new_file.txt not in archive after unmount; entries: {names:?}"
+    );
+
+    // And the extracted body matches.
+    let out_dir = tmp.path().join("extracted");
+    fs::create_dir_all(&out_dir).unwrap();
+    let out = Command::new(tzip_bin())
+        .args(["x", archive.to_str().unwrap(), "--to", out_dir.to_str().unwrap(), "-q"])
+        .output()
+        .expect("spawn tzip x");
+    assert!(out.status.success(), "tzip x failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        fs::read(out_dir.join("corpus/new_file.txt")).unwrap(),
+        b"written through the mount\n"
+    );
+}
+
+#[test]
+fn mount_write_overwrites_existing_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    fs::write(mp.join("corpus/a.txt"), b"REPLACED CONTENT\n").unwrap();
+    assert_eq!(fs::read(mp.join("corpus/a.txt")).unwrap(), b"REPLACED CONTENT\n");
+
+    drop_mount_and_settle(guard);
+
+    // After commit the archive's copy of a.txt must be the new body.
+    let out_dir = tmp.path().join("extracted");
+    fs::create_dir_all(&out_dir).unwrap();
+    let out = Command::new(tzip_bin())
+        .args(["x", archive.to_str().unwrap(), "--to", out_dir.to_str().unwrap(), "-q"])
+        .output()
+        .expect("spawn tzip x");
+    assert!(out.status.success(), "tzip x failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::read(out_dir.join("corpus/a.txt")).unwrap(), b"REPLACED CONTENT\n");
+    // The untouched sibling is still there and still the original.
+    assert_eq!(
+        fs::read(out_dir.join("corpus/b.txt")).unwrap(),
+        b"hello b, second file\n"
+    );
+}
+
+#[test]
+fn mount_write_unlink_removes_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    fs::remove_file(mp.join("corpus/b.txt")).unwrap();
+    assert!(!mp.join("corpus/b.txt").exists());
+
+    drop_mount_and_settle(guard);
+
+    let names = ls_entries(&archive);
+    assert!(!names.iter().any(|n| n == "corpus/b.txt"), "b.txt still in archive: {names:?}");
+    assert!(names.iter().any(|n| n == "corpus/a.txt"), "a.txt missing: {names:?}");
+}
+
+#[test]
+fn mount_write_truncate_to_smaller_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    // b.txt = "hello b, second file\n" (21 bytes). Truncate to 7.
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(mp.join("corpus/b.txt"))
+        .unwrap();
+    f.set_len(7).unwrap();
+    drop(f);
+    assert_eq!(fs::read(mp.join("corpus/b.txt")).unwrap(), b"hello b");
+
+    drop_mount_and_settle(guard);
+
+    let out_dir = tmp.path().join("extracted");
+    fs::create_dir_all(&out_dir).unwrap();
+    Command::new(tzip_bin())
+        .args(["x", archive.to_str().unwrap(), "--to", out_dir.to_str().unwrap(), "-q"])
+        .status()
+        .unwrap();
+    assert_eq!(fs::read(out_dir.join("corpus/b.txt")).unwrap(), b"hello b");
+}
+
+#[test]
+fn mount_write_mkdir_then_create_file_in_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    fs::create_dir(mp.join("corpus/new_dir")).unwrap();
+    fs::write(mp.join("corpus/new_dir/nested.txt"), b"inside new dir\n").unwrap();
+
+    drop_mount_and_settle(guard);
+
+    let names = ls_entries(&archive);
+    assert!(
+        names.iter().any(|n| n == "corpus/new_dir/nested.txt"),
+        "nested.txt not in archive: {names:?}"
+    );
+}
+
+#[test]
+fn mount_without_write_flag_rejects_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let _guard = mount(archive.to_str().unwrap(), &mp, &[]);
+
+    // Default mount is read-only — write attempts should fail with EROFS.
+    let err = fs::write(mp.join("corpus/new.txt"), b"nope\n")
+        .expect_err("write to read-only mount must fail");
+    assert!(
+        err.raw_os_error() == Some(libc::EROFS) || err.raw_os_error() == Some(libc::EACCES),
+        "expected EROFS/EACCES on read-only mount; got {err:?}"
+    );
+}
+
+#[test]
+fn mount_write_multiple_edits_in_one_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    // All at once: new file + overwrite existing + unlink + mkdir.
+    fs::write(mp.join("corpus/brand_new.txt"), b"fresh\n").unwrap();
+    fs::write(mp.join("corpus/a.txt"), b"a is replaced\n").unwrap();
+    fs::remove_file(mp.join("corpus/nested/c.txt")).unwrap();
+    fs::create_dir(mp.join("corpus/extra_dir")).unwrap();
+
+    drop_mount_and_settle(guard);
+
+    let names = ls_entries(&archive);
+    assert!(names.iter().any(|n| n == "corpus/brand_new.txt"));
+    assert!(names.iter().any(|n| n == "corpus/a.txt"));
+    assert!(!names.iter().any(|n| n == "corpus/nested/c.txt"), "c.txt not deleted: {names:?}");
+
+    let out_dir = tmp.path().join("extracted");
+    fs::create_dir_all(&out_dir).unwrap();
+    Command::new(tzip_bin())
+        .args(["x", archive.to_str().unwrap(), "--to", out_dir.to_str().unwrap(), "-q"])
+        .status()
+        .unwrap();
+    assert_eq!(fs::read(out_dir.join("corpus/brand_new.txt")).unwrap(), b"fresh\n");
+    assert_eq!(fs::read(out_dir.join("corpus/a.txt")).unwrap(), b"a is replaced\n");
+    assert!(!out_dir.join("corpus/nested/c.txt").exists());
+}

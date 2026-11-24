@@ -419,6 +419,13 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     let verbose = opts.verbose;
     let extracted = AtomicUsize::new(0);
 
+    // Precompute the mode a freshly-created file will land with so
+    // workers can skip `fchmod` whenever the archived mode already
+    // matches. Reading the umask is a per-process syscall pair that
+    // isn't thread-safe (umask is process-global); doing it once on
+    // the main thread avoids all that.
+    let default_mode = created_file_default_mode();
+
     // Translate the disk count from `open_archive` into a worker-side
     // layout hint. Local-path workers take this hint and collapse to a
     // single `File::open`; remote (http/s3) workers ignore it. Saves a
@@ -464,7 +471,7 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
                         // just to call `set_modified` was the dominant
                         // per-entry cost.
                         let f = buf.into_inner().context("unwrap extract buffer")?;
-                        apply_metadata(&f, &re);
+                        apply_metadata(&f, &re, default_mode);
                         Ok(())
                     })();
                     match write_result {
@@ -530,13 +537,41 @@ fn stream_entry<W: Write>(
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
+/// What mode a newly-created regular file will land with on this
+/// process. Read the current umask by temporarily setting it to 0
+/// and restoring; the window is a single syscall pair on the main
+/// thread before any worker spawns, so no one else is racing. On
+/// non-unix hosts there's no umask — return 0 so the comparison in
+/// `apply_metadata` never short-circuits.
+#[cfg(unix)]
+fn created_file_default_mode() -> u32 {
+    // SAFETY: libc::umask is always safe to call; the only risk is the
+    // brief process-global umask=0 window, which we close immediately
+    // and before any file-creating thread exists.
+    let prev = unsafe {
+        let zero = libc::umask(0);
+        libc::umask(zero);
+        zero
+    };
+    0o666 & !(prev as u32)
+}
+
+#[cfg(not(unix))]
+fn created_file_default_mode() -> u32 {
+    0
+}
+
 /// Apply the entry's permission bits and mtime via the already-open
-/// `File` handle. Fuses what used to be two helpers (`apply_unix_mode`
-/// + `apply_entry_mtime`) so we don't pay a second `open`+`close` per
-/// entry — one `fchmod` + one `futimens`, both on the fd we already
-/// have. Best-effort: failures are silently ignored. The extract
-/// itself has already succeeded by the time we're here.
-fn apply_metadata(f: &File, re: &ReadEntry) {
+/// `File` handle. One `fchmod` + one `futimens`, both on the fd we
+/// already have, with the `fchmod` elided when the archived mode
+/// matches what `File::create` already produced (common case: text
+/// files at mode 0o644). Best-effort: failures are silently ignored.
+/// The extract itself has already succeeded by the time we're here.
+///
+/// `default_mode` is the mode newly-created files would receive under
+/// the current process umask, precomputed on the main thread before
+/// workers spawn so we avoid a per-thread umask() dance.
+fn apply_metadata(f: &File, re: &ReadEntry, _default_mode: u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -546,7 +581,7 @@ fn apply_metadata(f: &File, re: &ReadEntry) {
             // the archive didn't carry Unix perms, so we leave the
             // default from `File::create`.
             let perm_bits = mode & 0o7777;
-            if perm_bits != 0 {
+            if perm_bits != 0 && perm_bits != _default_mode {
                 let _ = f.set_permissions(std::fs::Permissions::from_mode(perm_bits));
             }
         }

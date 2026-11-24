@@ -48,8 +48,20 @@ pub fn run_update(opts: Options) -> Result<()> {
     // Recover from a prior interrupted append-mode update, if any.
     attempt_recover_undo(&opts.archive)?;
 
-    let mut arch = Archive::open(&opts.archive)
-        .with_context(|| format!("open archive {} for update", opts.archive.display()))?;
+    // Try to open the archive rw so the append-mode branch (below)
+    // can reuse the handle. Multi-disk and read-only inputs fall back
+    // to `Archive::open` + rebuild mode — `rw_handle` goes `None` on
+    // either and we force `can_append = false` to match.
+    let (mut arch, rw_handle): (Archive, Option<std::fs::File>) =
+        match Archive::open_rw(&opts.archive) {
+            Ok((a, f)) => (a, Some(f)),
+            Err(_) => {
+                let a = Archive::open(&opts.archive).with_context(|| {
+                    format!("open archive {} for update", opts.archive.display())
+                })?;
+                (a, None)
+            }
+        };
 
     // Walk new input paths (batch; we need the full list for collision
     // detection and sort-mode ordering).
@@ -109,8 +121,11 @@ pub fn run_update(opts: Options) -> Result<()> {
         return Ok(());
     }
 
-    let can_append =
-        !opts.atomic && opts.delete.is_empty() && !has_replace && !opts.sort;
+    let can_append = !opts.atomic
+        && opts.delete.is_empty()
+        && !has_replace
+        && !opts.sort
+        && rw_handle.is_some();
 
     if !opts.quiet {
         let mode = if can_append { "append" } else { "rebuild" };
@@ -128,7 +143,7 @@ pub fn run_update(opts: Options) -> Result<()> {
     }
 
     if can_append {
-        run_update_append(&opts, arch, new_items)
+        run_update_append(&opts, arch, new_items, rw_handle.unwrap())
     } else {
         run_update_rebuild(&opts, arch, kept, new_items)
     }
@@ -140,6 +155,7 @@ fn run_update_append(
     opts: &Options,
     mut arch: Archive,
     new_items: Vec<WorkItem>,
+    mut file: std::fs::File,
 ) -> Result<()> {
     let undo_path = undo_path_for(&opts.archive);
 
@@ -152,12 +168,8 @@ fn run_update_append(
     write_undo_file(&undo_path, orig_file_size, cd_offset, &tail)
         .with_context(|| format!("write undo file {}", undo_path.display()))?;
 
-    // 2. Reopen the archive read+write, truncate at cd_offset.
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&opts.archive)
-        .with_context(|| format!("reopen archive {} rw", opts.archive.display()))?;
+    // 2. Truncate the archive at cd_offset on the rw fd we were handed
+    //    (same open as the one Archive parsed from, dup'd at open time).
     file.set_len(cd_offset)
         .context("truncate archive at cd_offset")?;
     file.seek(SeekFrom::Start(cd_offset))

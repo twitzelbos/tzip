@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -476,29 +476,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     recur(pattern.as_bytes(), text.as_bytes())
 }
 
-fn dos_to_unix((date, time): (u16, u16)) -> i64 {
-    let year = 1980 + ((date >> 9) & 0x7F) as i64;
-    let month = ((date >> 5) & 0x0F) as u32;
-    let day = (date & 0x1F) as u32;
-    let hour = ((time >> 11) & 0x1F) as i64;
-    let minute = ((time >> 5) & 0x3F) as i64;
-    let sec = ((time & 0x1F) << 1) as i64;
-    let month = month.max(1);
-    let day = day.max(1);
-    civil_to_unix(year, month, day) + hour * 3600 + minute * 60 + sec
-}
-
-fn civil_to_unix(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let m = m as u64;
-    let d = d as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe as i64 - 719_468;
-    days * 86_400
-}
+use crate::dos_time::dos_to_unix;
 
 fn unix_now() -> i64 {
     std::time::SystemTime::now()

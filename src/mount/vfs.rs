@@ -1098,29 +1098,7 @@ fn build_tree(archive: &Archive) -> (Vec<Node>, HashMap<Inode, Vec<(Vec<u8>, Ino
     (nodes, children)
 }
 
-fn dos_to_unix((date, time): (u16, u16)) -> i64 {
-    let year = 1980 + ((date >> 9) & 0x7F) as i64;
-    let month = ((date >> 5) & 0x0F) as u32;
-    let day = (date & 0x1F) as u32;
-    let hour = ((time >> 11) & 0x1F) as i64;
-    let minute = ((time >> 5) & 0x3F) as i64;
-    let sec = ((time & 0x1F) << 1) as i64;
-    let month = month.max(1);
-    let day = day.max(1);
-    civil_to_unix(year, month, day) + hour * 3600 + minute * 60 + sec
-}
-
-fn civil_to_unix(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let m = m as u64;
-    let d = d as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe as i64 - 719_468;
-    days * 86_400
-}
+use crate::dos_time::dos_to_unix;
 
 /// Local record used by `commit()` — materialise a dirty entry's path,
 /// body, and VFS-side metadata (mtime + optional chmod) in a single
@@ -1132,44 +1110,17 @@ struct DirtyCommitSpec {
     mode: Option<u32>,
 }
 
-/// Set a file's mtime to `ts` Unix seconds. Preserves atime. On Unix
-/// we use `utimensat` directly to avoid a `filetime`-crate dep.
-#[cfg(unix)]
+/// Set a file's mtime to `ts` Unix seconds via `File::set_modified`.
+/// Portable across Unix + Windows; opens the file read-write to get
+/// a handle without truncating.
 fn set_mtime_seconds(path: &std::path::Path, ts: i64) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // UTIME_OMIT keeps atime untouched; the second slot sets mtime.
-    let times = [
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-        libc::timespec {
-            tv_sec: ts as libc::time_t,
-            tv_nsec: 0,
-        },
-    ];
-    // SAFETY: path is NUL-terminated, times is a 2-element array.
-    let rc = unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            times.as_ptr(),
-            0,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    if ts <= 0 {
+        return Ok(());
     }
-}
-
-#[cfg(not(unix))]
-fn set_mtime_seconds(_path: &std::path::Path, _ts: i64) -> std::io::Result<()> {
-    Ok(())
+    let when: SystemTime = UNIX_EPOCH + Duration::from_secs(ts as u64);
+    let f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.set_modified(when)
 }
 
 fn unix_now() -> i64 {

@@ -468,76 +468,21 @@ fn apply_unix_mode(_dest: &Path, _re: &ReadEntry) {
     // the platform on "how to restore attributes" — doing nothing is fine.
 }
 
-/// Restore the entry's modify time from its DOS date/time on the
-/// extracted file via `utimensat`. Best-effort — failures are
-/// silently ignored (the extract itself already succeeded).
-#[cfg(unix)]
+/// Restore the entry's modify time on the extracted file. Uses
+/// `std::fs::File::set_modified` — portable across Unix + Windows
+/// without pulling in a crate. Best-effort — failures are silently
+/// ignored; the extract itself already succeeded.
 fn apply_entry_mtime(dest: &Path, re: &ReadEntry) {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let ts = dos_mtime_to_unix(re.mtime);
+    use std::time::{Duration, UNIX_EPOCH};
+    let ts = crate::dos_time::dos_to_unix(re.mtime);
     if ts <= 0 {
         return;
     }
-    let Ok(c) = CString::new(dest.as_os_str().as_bytes()) else {
-        return;
-    };
-    // UTIME_OMIT in the atime slot; specific mtime in the mtime slot.
-    let times = [
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-        libc::timespec {
-            tv_sec: ts as libc::time_t,
-            tv_nsec: 0,
-        },
-    ];
-    // SAFETY: path is NUL-terminated and valid; times is a 2-element
-    // array of timespec.
-    unsafe {
-        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0);
+    let st = UNIX_EPOCH + Duration::from_secs(ts as u64);
+    // OpenOptions::write(true) gets us a handle without truncating.
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dest) {
+        let _ = f.set_modified(st);
     }
-}
-
-#[cfg(not(unix))]
-fn apply_entry_mtime(_dest: &Path, _re: &ReadEntry) {
-    // No portable `utimensat` on Windows via std/libc here; leave the
-    // "just-created" mtime. Follow-up: wire `SetFileTime` through
-    // winapi for the Windows path.
-}
-
-/// Convert a ZIP DOS (date, time) tuple to Unix seconds.
-fn dos_mtime_to_unix((date, time): (u16, u16)) -> i64 {
-    // DOS date = (year-1980) << 9 | month << 5 | day
-    // DOS time = hour << 11 | minute << 5 | sec/2
-    let year = 1980 + ((date >> 9) & 0x7F) as i64;
-    let month = ((date >> 5) & 0x0F) as u32;
-    let day = (date & 0x1F) as u32;
-    let hour = ((time >> 11) & 0x1F) as i64;
-    let minute = ((time >> 5) & 0x3F) as i64;
-    let sec = ((time & 0x1F) << 1) as i64;
-    if year < 1970 {
-        return 0;
-    }
-    let month = month.max(1);
-    let day = day.max(1);
-    civil_to_unix_reader(year, month, day) + hour * 3600 + minute * 60 + sec
-}
-
-/// Howard Hinnant days_from_civil, returning Unix seconds at UTC
-/// midnight. Duplicated from other modules to keep reader.rs
-/// self-contained.
-fn civil_to_unix_reader(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let m = m as u64;
-    let d = d as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe as i64 - 719_468;
-    days * 86_400
 }
 
 fn find_entry_index(arch: &Archive, name: &str) -> Result<usize> {

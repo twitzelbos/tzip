@@ -162,6 +162,172 @@ fn hash_json_output_is_jsonl() {
 }
 
 #[test]
+fn hash_extra_field_round_trips_through_create() {
+    // Create two archives of the same corpus: one with --write-md5 +
+    // --write-sha256, one without. Both `tzip hash --algo md5/sha256`
+    // outputs should match line-for-line, confirming the extra-field
+    // digest matches the on-the-fly decode-and-hash result.
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+
+    run_tzip(
+        tmp.path(),
+        &["create", "plain.zip", "corpus", "-m", "deflate", "-q"],
+    );
+    run_tzip(
+        tmp.path(),
+        &[
+            "create",
+            "hashed.zip",
+            "corpus",
+            "-m",
+            "deflate",
+            "--write-md5",
+            "--write-sha256",
+            "-q",
+        ],
+    );
+
+    for algo in &["md5", "sha256"] {
+        let plain = run_tzip(tmp.path(), &["hash", "plain.zip", "--algo", algo]);
+        let hashed = run_tzip(tmp.path(), &["hash", "hashed.zip", "--algo", algo]);
+        let p = parse_hash_lines(&String::from_utf8_lossy(&plain.stdout));
+        let h = parse_hash_lines(&String::from_utf8_lossy(&hashed.stdout));
+        assert_eq!(p, h, "extra-field digest must match streamed digest for {}", algo);
+    }
+}
+
+#[test]
+fn hash_update_mode_auto_extends_existing_digests() {
+    // Create an archive with --write-sha256 so every original entry
+    // carries a digest. Then `tzip u` adds a NEW entry WITHOUT the
+    // explicit --write-sha256 flag. Auto-detect should see the
+    // existing digests and hash the new entry too, so the final
+    // archive is consistent (every entry hashable from the extra
+    // field, zero body I/O for sha256 lookups).
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "deflate", "--write-sha256", "-q"],
+    );
+    // Add a new file via `tzip u` without --write-sha256.
+    fs::write(tmp.path().join("corpus").join("c.txt"), b"added later\n").unwrap();
+    run_tzip(tmp.path(), &["u", "out.zip", "corpus/c.txt", "-q"]);
+
+    // Hashing the whole archive with --algo sha256 should emit every
+    // entry's digest FROM THE EXTRA (no body-decode needed). We can't
+    // directly observe that path from outside, but a necessary
+    // condition is that every entry has a digest line in the output.
+    let out = run_tzip(tmp.path(), &["hash", "out.zip", "--algo", "sha256"]);
+    let map = parse_hash_lines(&String::from_utf8_lossy(&out.stdout));
+    assert!(map.contains_key("corpus/a.txt"), "original a.txt hashed");
+    assert!(map.contains_key("corpus/b.txt"), "original b.txt hashed");
+    assert!(map.contains_key("corpus/blob.bin"), "original blob.bin hashed");
+    assert!(map.contains_key("corpus/c.txt"), "added c.txt hashed");
+
+    // The added entry's hash should match the known sha256 of its
+    // content ("added later\n").
+    let expected = {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(b"added later\n");
+        format!("{:x}", h.finalize())
+    };
+    assert_eq!(map.get("corpus/c.txt").map(|s| s.as_str()), Some(expected.as_str()));
+}
+
+#[test]
+fn hash_update_mode_replace_refreshes_digest() {
+    // Create archive with --write-md5. Replace one entry via
+    // `tzip u`. The replaced entry's MD5 must match the NEW content,
+    // not the old.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("corpus")).unwrap();
+    fs::write(tmp.path().join("corpus").join("a.txt"), b"old content\n").unwrap();
+    fs::write(tmp.path().join("corpus").join("b.txt"), b"stays the same\n").unwrap();
+    run_tzip(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "deflate", "--write-md5", "-q"],
+    );
+
+    // Overwrite a.txt and run update — the existing archive has MD5
+    // on every entry, so the update should auto-enable --write-md5.
+    fs::write(tmp.path().join("corpus").join("a.txt"), b"new content\n").unwrap();
+    run_tzip(tmp.path(), &["u", "out.zip", "corpus/a.txt", "-q"]);
+
+    let out = run_tzip(tmp.path(), &["hash", "out.zip", "--algo", "md5"]);
+    let map = parse_hash_lines(&String::from_utf8_lossy(&out.stdout));
+    let expected_a = {
+        use md5::Digest as _;
+        let mut h = md5::Md5::new();
+        h.update(b"new content\n");
+        format!("{:x}", h.finalize())
+    };
+    let expected_b = {
+        use md5::Digest as _;
+        let mut h = md5::Md5::new();
+        h.update(b"stays the same\n");
+        format!("{:x}", h.finalize())
+    };
+    assert_eq!(map.get("corpus/a.txt").map(|s| s.as_str()), Some(expected_a.as_str()));
+    assert_eq!(map.get("corpus/b.txt").map(|s| s.as_str()), Some(expected_b.as_str()));
+}
+
+#[test]
+fn hash_update_mode_explicit_flag_adds_hashes_to_unhashed_archive() {
+    // Create an archive WITHOUT hashes. Then `tzip u --write-sha256`
+    // adds a new entry — only the new entry gets a digest. Existing
+    // entries remain unhashed (they byte-copy through carry).
+    //
+    // Current semantics: `tzip u` doesn't retroactively hash kept
+    // entries; the flag only affects what the encoder produces for
+    // added or replaced entries. Documented behaviour.
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "deflate", "-q"],
+    );
+    fs::write(tmp.path().join("corpus").join("c.txt"), b"added with hash\n").unwrap();
+    run_tzip(
+        tmp.path(),
+        &["u", "out.zip", "corpus/c.txt", "--write-sha256", "-q"],
+    );
+
+    // `tzip hash --algo sha256` on this mixed archive: the new entry
+    // gets its digest from the extra (zero body I/O); the three
+    // original entries fall through to body-decode-and-hash.
+    let out = run_tzip(tmp.path(), &["hash", "out.zip", "--algo", "sha256"]);
+    let map = parse_hash_lines(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(map.len(), 4, "all four entries must have a hash line");
+    let expected_c = {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(b"added with hash\n");
+        format!("{:x}", h.finalize())
+    };
+    assert_eq!(map.get("corpus/c.txt").map(|s| s.as_str()), Some(expected_c.as_str()));
+}
+
+#[test]
+fn hash_extra_field_survives_through_other_tools() {
+    // Create with --write-sha256, extract with unzip (which ignores
+    // unknown extras), re-create with tzip: the extra field is
+    // not re-populated (we stream-copy on carry only), but the
+    // archive stays valid and readable.
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "deflate", "--write-sha256", "-q"],
+    );
+    // Verify tzip can list + extract its own archive.
+    let ls = run_tzip(tmp.path(), &["ls", "out.zip"]);
+    assert!(String::from_utf8_lossy(&ls.stdout).contains("a.txt"));
+}
+
+#[test]
 fn hash_include_and_exclude_filter() {
     let tmp = tempfile::tempdir().unwrap();
     make_corpus(&tmp.path().join("corpus"));

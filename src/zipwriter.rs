@@ -26,6 +26,14 @@ pub const SIG_EOCD64_LOC: u32 = 0x0706_4b50;
 
 pub const METHOD_AES: u16 = 99;
 pub const AES_EXTRA_ID: u16 = 0x9901;
+/// tzip-native extra field carrying a plaintext digest. Layout:
+/// `[algo: u8] [digest: N bytes]`, where algo=1=MD5 (16 bytes) /
+/// algo=2=SHA-256 (32 bytes). The 4-byte id+size prefix is standard
+/// APPNOTE extra framing. Picked outside the well-known ID range
+/// (APPNOTE section 4.6) so other tools ignore it cleanly.
+pub const TZIP_HASH_EXTRA_ID: u16 = 0x7A68;
+pub const TZIP_HASH_ALGO_MD5: u8 = 1;
+pub const TZIP_HASH_ALGO_SHA256: u8 = 2;
 
 /// Per-entry info produced by the workers, consumed by the writer.
 pub struct EncodedEntry {
@@ -53,6 +61,13 @@ pub struct EncodedEntry {
     /// (type + permission). Zero means "use the writer's default"
     /// (0o100644 for files, 0o040755 for dirs — picked below).
     pub external_attr: u32,
+    /// Plaintext MD5 digest, when `--write-md5` was requested. The
+    /// writer stashes it in a `TZIP_HASH_EXTRA_ID` extra on both the
+    /// LFH and CDR so later `tzip hash --algo md5` reads can skip
+    /// body decode entirely.
+    pub md5_digest: Option<[u8; 16]>,
+    /// Same as `md5_digest` for SHA-256.
+    pub sha256_digest: Option<[u8; 32]>,
 }
 
 pub struct ZipWriter<W: Write + Seek> {
@@ -83,6 +98,8 @@ struct CentralEntry {
     lfh_offset: u64,
     mtime: (u16, u16),
     external_attr: u32,
+    md5_digest: Option<[u8; 16]>,
+    sha256_digest: Option<[u8; 32]>,
 }
 
 impl<W: Write + Seek> ZipWriter<W> {
@@ -124,6 +141,11 @@ impl<W: Write + Seek> ZipWriter<W> {
             mtime: re.mtime,
             // Preserve the on-disk external_attr for byte-copy carries.
             external_attr: re.external_attr,
+            // Carry any stored plaintext digests forward unchanged — the
+            // byte-copy path doesn't touch the body, so the hashes are
+            // still valid for the preserved entry.
+            md5_digest: re.md5_digest,
+            sha256_digest: re.sha256_digest,
         });
     }
 
@@ -186,6 +208,8 @@ impl<W: Write + Seek> ZipWriter<W> {
             uncompressed_size: uncomp_size,
             mtime,
             external_attr,
+            md5_digest,
+            sha256_digest,
         } = e;
         let name_bytes = name.into_bytes();
         let comp_size = body.len() as u64;
@@ -228,9 +252,13 @@ impl<W: Write + Seek> ZipWriter<W> {
             lfh.write_u32::<LittleEndian>(uncomp_size as u32)?;
         }
         lfh.write_u16::<LittleEndian>(name_bytes.len() as u16)?;
-        // Extra field length = zip64 (0 or 20) + AES (0 or 11)
+        // Extra field length = zip64 (0 or 20) + AES (0 or 11) + tzip-hash (0/21/37/58)
+        let hash_md5_len = if e.md5_digest.is_some() { 4 + 1 + 16 } else { 0 };
+        let hash_sha_len = if e.sha256_digest.is_some() { 4 + 1 + 32 } else { 0 };
         let extra_len = (if needs_zip64 { 4 + 16 } else { 0 })
-            + (if encrypted { 4 + 7 } else { 0 });
+            + (if encrypted { 4 + 7 } else { 0 })
+            + hash_md5_len
+            + hash_sha_len;
         lfh.write_u16::<LittleEndian>(extra_len as u16)?;
         lfh.extend_from_slice(&name_bytes);
         if needs_zip64 {
@@ -246,6 +274,18 @@ impl<W: Write + Seek> ZipWriter<W> {
             lfh.extend_from_slice(b"AE"); // vendor ID
             lfh.write_u8(0x03)?; // 0x01=128, 0x02=192, 0x03=256
             lfh.write_u16::<LittleEndian>(inner_method)?;
+        }
+        if let Some(md5) = &e.md5_digest {
+            lfh.write_u16::<LittleEndian>(TZIP_HASH_EXTRA_ID)?;
+            lfh.write_u16::<LittleEndian>(1 + 16)?;
+            lfh.write_u8(TZIP_HASH_ALGO_MD5)?;
+            lfh.extend_from_slice(md5);
+        }
+        if let Some(sha) = &e.sha256_digest {
+            lfh.write_u16::<LittleEndian>(TZIP_HASH_EXTRA_ID)?;
+            lfh.write_u16::<LittleEndian>(1 + 32)?;
+            lfh.write_u8(TZIP_HASH_ALGO_SHA256)?;
+            lfh.extend_from_slice(sha);
         }
 
         self.inner.write_all(&lfh)?;
@@ -268,6 +308,8 @@ impl<W: Write + Seek> ZipWriter<W> {
             lfh_offset,
             mtime,
             external_attr,
+            md5_digest,
+            sha256_digest,
         });
         Ok(())
     }
@@ -318,7 +360,9 @@ impl<W: Write + Seek> ZipWriter<W> {
                 }
             }
             let aes_len = if e.encrypted { 11 } else { 0 };
-            cdr.write_u16::<LittleEndian>((z64.len() + aes_len) as u16)?;
+            let hash_md5_len = if e.md5_digest.is_some() { 4 + 1 + 16 } else { 0 };
+            let hash_sha_len = if e.sha256_digest.is_some() { 4 + 1 + 32 } else { 0 };
+            cdr.write_u16::<LittleEndian>((z64.len() + aes_len + hash_md5_len + hash_sha_len) as u16)?;
             cdr.write_u16::<LittleEndian>(0)?; // file comment length
             cdr.write_u16::<LittleEndian>(0)?; // disk #
             cdr.write_u16::<LittleEndian>(0)?; // internal attr
@@ -347,6 +391,18 @@ impl<W: Write + Seek> ZipWriter<W> {
                 cdr.extend_from_slice(b"AE");
                 cdr.write_u8(0x03)?;
                 cdr.write_u16::<LittleEndian>(e.inner_method)?;
+            }
+            if let Some(md5) = &e.md5_digest {
+                cdr.write_u16::<LittleEndian>(TZIP_HASH_EXTRA_ID)?;
+                cdr.write_u16::<LittleEndian>(1 + 16)?;
+                cdr.write_u8(TZIP_HASH_ALGO_MD5)?;
+                cdr.extend_from_slice(md5);
+            }
+            if let Some(sha) = &e.sha256_digest {
+                cdr.write_u16::<LittleEndian>(TZIP_HASH_EXTRA_ID)?;
+                cdr.write_u16::<LittleEndian>(1 + 32)?;
+                cdr.write_u8(TZIP_HASH_ALGO_SHA256)?;
+                cdr.extend_from_slice(sha);
             }
             self.inner.write_all(&cdr)?;
             self.pos += cdr.len() as u64;

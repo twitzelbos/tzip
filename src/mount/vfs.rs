@@ -955,6 +955,8 @@ impl VirtualFs {
             update: true,
             delete,
             atomic: true,
+            write_md5: false,
+            write_sha256: false,
         })
     }
 }

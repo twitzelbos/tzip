@@ -48,7 +48,7 @@ pub fn run_update(opts: Options) -> Result<()> {
     // Recover from a prior interrupted append-mode update, if any.
     attempt_recover_undo(&opts.archive)?;
 
-    let arch = Archive::open(&opts.archive)
+    let mut arch = Archive::open(&opts.archive)
         .with_context(|| format!("open archive {} for update", opts.archive.display()))?;
 
     // Walk new input paths (batch; we need the full list for collision
@@ -85,12 +85,22 @@ pub fn run_update(opts: Options) -> Result<()> {
         new_items.retain(|it| seen.insert(it.name_in_archive.clone()));
     }
 
-    let kept: Vec<ReadEntry> = arch
-        .entries()
-        .iter()
-        .filter(|e| !delete_matches.contains(&e.name) && !new_names.contains(&e.name))
-        .cloned()
-        .collect();
+    // Populate LFH sizes on the Archive's own entries up front — one
+    // linear pass. The previous flow cloned first and then did a
+    // name-based `.position()` per kept entry at carry time, which
+    // was O(N²) over the archive on large sets. Now the cloned
+    // entries in `kept` already carry `lfh_total_size`, so
+    // `populate_lfh_size` collapses to a no-op.
+    let mut kept: Vec<ReadEntry> = Vec::new();
+    for idx in 0..arch.entries().len() {
+        let name = arch.entries()[idx].name.clone();
+        if delete_matches.contains(&name) || new_names.contains(&name) {
+            continue;
+        }
+        arch.lfh_total_size_of(idx)
+            .with_context(|| format!("probe LFH for carried entry {}", name))?;
+        kept.push(arch.entries()[idx].clone());
+    }
 
     if new_items.is_empty() && delete_matches.is_empty() {
         if !opts.quiet {

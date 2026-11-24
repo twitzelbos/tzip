@@ -59,6 +59,11 @@ pub struct ZipWriter<W: Write + Seek> {
     inner: W,
     entries: Vec<CentralEntry>,
     pos: u64,
+    /// Last position left behind on the source after a
+    /// `carry_existing_entry`. When the next carry targets the same
+    /// offset (CDR-order rebuild of a gap-free archive — the common
+    /// case) we can skip the per-entry lseek.
+    carry_src_pos: Option<u64>,
 }
 
 struct CentralEntry {
@@ -78,7 +83,7 @@ struct CentralEntry {
 
 impl<W: Write + Seek> ZipWriter<W> {
     pub fn new(inner: W) -> Self {
-        Self { inner, entries: Vec::new(), pos: 0 }
+        Self { inner, entries: Vec::new(), pos: 0, carry_src_pos: None }
     }
 
     /// Fresh writer positioned at `start_pos`. Used by update:
@@ -90,7 +95,7 @@ impl<W: Write + Seek> ZipWriter<W> {
     /// writing. `finish()` will treat `start_pos` + accumulated writes as
     /// `cd_offset`.
     pub fn new_at(inner: W, start_pos: u64) -> Self {
-        Self { inner, entries: Vec::new(), pos: start_pos }
+        Self { inner, entries: Vec::new(), pos: start_pos, carry_src_pos: None }
     }
 
     /// Record a central-directory entry for a body that is already on disk
@@ -122,7 +127,7 @@ impl<W: Write + Seek> ZipWriter<W> {
     /// current `pos`, then record its central entry at the new offset.
     /// Used by rebuild mode. `src` must be seekable and `re.lfh_total_size`
     /// must be populated (via `Archive::lfh_total_size_of`).
-    pub fn carry_existing_entry<R: Read + Seek + ?Sized>(
+        pub fn carry_existing_entry<R: Read + Seek + ?Sized>(
         &mut self,
         src: &mut R,
         re: &ReadEntry,
@@ -134,8 +139,14 @@ impl<W: Write + Seek> ZipWriter<W> {
             );
         }
         let new_offset = self.pos;
-        src.seek(SeekFrom::Start(re.lfh_offset))
-            .with_context(|| format!("seek to LFH of {}", re.name))?;
+        // In CDR order (the common case for a tzip-produced archive
+        // with no gaps), consecutive carries land back-to-back on the
+        // source and the fd is already at `re.lfh_offset`. Skip the
+        // lseek when the previous carry left us exactly there.
+        if self.carry_src_pos != Some(re.lfh_offset) {
+            src.seek(SeekFrom::Start(re.lfh_offset))
+                .with_context(|| format!("seek to LFH of {}", re.name))?;
+        }
         let total = re.lfh_total_size as u64 + re.comp_size;
         let mut remaining = total;
         let mut buf = [0u8; 256 * 1024];
@@ -149,6 +160,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             remaining -= want as u64;
         }
         self.pos += total;
+        self.carry_src_pos = Some(re.lfh_offset + total);
         self.record_existing(re, new_offset);
         Ok(())
     }

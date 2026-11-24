@@ -234,40 +234,4 @@ fn dos_time_from_meta(meta: &std::fs::Metadata) -> (u16, u16) {
     unix_to_dos(mtime)
 }
 
-pub(crate) fn unix_to_dos(unix: i64) -> (u16, u16) {
-    // Convert Unix time to DOS (localtime not required for correctness; use UTC).
-    // MS-DOS epoch is 1980-01-01. If we're before that, clamp.
-    // Days since 1970-01-01
-    let (secs, is_neg) = if unix < 0 { (0i64, true) } else { (unix, false) };
-    let _ = is_neg;
-    let days = secs / 86_400;
-    let sec_of_day = (secs % 86_400) as u32;
-    // Convert days-since-1970 to y/m/d via civil_from_days (Howard Hinnant).
-    let (y, m, d) = civil_from_days(days);
-    let year = y as i32;
-    if year < 1980 {
-        return (((1 << 9) | (1 << 5)) as u16, 0); // 1980-01-01 00:00:00
-    }
-    let dos_date =
-        (((year - 1980) as u16) << 9) | ((m as u16) << 5) | (d as u16);
-    let hour = sec_of_day / 3600;
-    let minute = (sec_of_day / 60) % 60;
-    let sec2 = (sec_of_day % 60) / 2;
-    let dos_time = ((hour as u16) << 11) | ((minute as u16) << 5) | (sec2 as u16);
-    (dos_date, dos_time)
-}
-
-/// Convert days since 1970-01-01 to (year, month, day) using Howard Hinnant's algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
+pub(crate) use crate::dos_time::unix_to_dos;

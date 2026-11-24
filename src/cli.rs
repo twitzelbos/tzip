@@ -1004,19 +1004,7 @@ fn parse_iso_date(raw: Option<&str>, flag: &str) -> Result<Option<i64>> {
     Ok(Some(civil_to_unix(y, m, d)))
 }
 
-/// Howard Hinnant's days_from_civil, returning a Unix timestamp at
-/// UTC midnight on (y, m, d).
-fn civil_to_unix(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let m = m as u64;
-    let d = d as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe as i64 - 719_468;
-    days * 86_400
-}
+use crate::dos_time::civil_to_unix;
 
 impl MountArgs {
     pub fn into_action(self) -> Result<crate::mount::MountAction> {

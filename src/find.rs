@@ -161,29 +161,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     recur(pattern.as_bytes(), text.as_bytes())
 }
 
-fn dos_to_unix((date, time): (u16, u16)) -> i64 {
-    let year = 1980 + ((date >> 9) & 0x7F) as i64;
-    let month = ((date >> 5) & 0x0F) as u32;
-    let day = (date & 0x1F) as u32;
-    let hour = ((time >> 11) & 0x1F) as i64;
-    let minute = ((time >> 5) & 0x3F) as i64;
-    let sec = ((time & 0x1F) << 1) as i64;
-    let month = month.max(1);
-    let day = day.max(1);
-    civil_to_unix(year, month, day) + hour * 3600 + minute * 60 + sec
-}
-
-fn civil_to_unix(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let m = m as u64;
-    let d = d as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe as i64 - 719_468;
-    days * 86_400
-}
+use crate::dos_time::dos_to_unix;
 
 /// Format a Unix timestamp as `YYYY-MM-DD HH:MM:SS` (UTC). Inverse of
 /// `civil_to_unix` + time-of-day; avoids pulling in `chrono` for one
@@ -201,19 +179,7 @@ fn iso_date(ts: i64) -> String {
 
 /// Inverse of Howard Hinnant's `days_from_civil` — days since 1970-01-01
 /// back to (y, m, d).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
+use crate::dos_time::civil_from_days;
 
 // ── Archive expansion ─────────────────────────────────────────────────────
 
@@ -269,7 +235,7 @@ mod tests {
 
     #[test]
     fn iso_date_roundtrips_civil_to_unix() {
-        let ts = civil_to_unix(2026, 11, 23);
+        let ts = crate::dos_time::civil_to_unix(2026, 11, 23);
         assert_eq!(iso_date(ts), "2026-11-23 00:00:00");
     }
 

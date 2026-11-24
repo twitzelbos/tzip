@@ -104,13 +104,16 @@ fn walk_recursive(
 
     let mut attrs: libc::attrlist = unsafe { mem::zeroed() };
     attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
-    // NB: MODTIME is deliberately omitted — variable-width attribute alignment
-    // in the getattrlistbulk output is fiddly and a partial parse was producing
-    // garbage DOS dates in a first pass. Archives from the bulk walker set
-    // mtime to the DOS epoch (1980-01-01). Users who need real per-file mtimes
-    // can pass `--classic-walk`. TODO: parse MODTIME with proper alignment.
-    attrs.commonattr =
-        libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE;
+    // Fields requested (bit order determines record layout):
+    //   ATTR_CMN_RETURNED_ATTRS — always first (meta-attr, 5 × u32)
+    //   ATTR_CMN_NAME           — attrreference_t (8 bytes + name blob)
+    //   ATTR_CMN_OBJTYPE        — fsobj_type_t (u32)
+    //   ATTR_CMN_MODTIME        — timespec (16 bytes, 8-byte aligned)
+    //   ATTR_FILE_TOTALSIZE     — u64 (8 bytes, 8-byte aligned)
+    attrs.commonattr = libc::ATTR_CMN_RETURNED_ATTRS
+        | libc::ATTR_CMN_NAME
+        | libc::ATTR_CMN_OBJTYPE
+        | libc::ATTR_CMN_MODTIME;
     attrs.fileattr = libc::ATTR_FILE_TOTALSIZE;
 
     // Sub-directories collected here so we can descend after finishing the
@@ -179,7 +182,26 @@ fn walk_recursive(
                 continue;
             };
 
-            // Field 4: ATTR_FILE_TOTALSIZE (u64) — only present when the
+            // Field 4: ATTR_CMN_MODTIME (timespec: tv_sec + tv_nsec,
+            // both the natural word width — on 64-bit macOS that's two
+            // u64s packed into 16 bytes, 8-byte aligned). The alignment
+            // bump matters: on a parent-dir record we land here at an
+            // odd 4 past the previous field's end.
+            let mtime_sec: i64 = if returned_common & libc::ATTR_CMN_MODTIME != 0 {
+                // NB: getattrlistbulk packs MODTIME's timespec at 4-byte
+                // alignment (observed empirically on macOS 15.4). The
+                // 8-byte-aligned reading that `struct timespec`'s natural
+                // layout would suggest reads into the next entry's record.
+                let sec = i64::from_ne_bytes(buf[p..p + 8].try_into().unwrap());
+                // Skip tv_nsec (another 8 bytes); tzip's DOS encoding is
+                // 2-second resolution, so sub-second doesn't matter.
+                p += 16;
+                sec
+            } else {
+                0
+            };
+
+            // Field 5: ATTR_FILE_TOTALSIZE (u64) — only present when the
             // entry is a regular file. Aligned to 8 within the buffer.
             let size = if objtype == VREG && (returned_file & libc::ATTR_FILE_TOTALSIZE) != 0 {
                 if p % 8 != 0 {
@@ -189,7 +211,6 @@ fn walk_recursive(
             } else {
                 0
             };
-            let mtime_sec: i64 = 0; // see comment on attrs.commonattr above
 
             // Advance to next record regardless of what we do with this one.
             offset = entry_end;
@@ -313,34 +334,7 @@ fn dos_time_from_meta(meta: &std::fs::Metadata) -> (u16, u16) {
 }
 
 pub(crate) fn dos_time_from_unix(unix: i64) -> (u16, u16) {
-    let secs = if unix < 0 { 0 } else { unix };
-    let days = secs / 86_400;
-    let sec_of_day = (secs % 86_400) as u32;
-    let (y, m, d) = civil_from_days(days);
-    let year = y as i32;
-    if year < 1980 {
-        return (((1 << 9) | (1 << 5)) as u16, 0);
-    }
-    let dos_date = (((year - 1980) as u16) << 9) | ((m as u16) << 5) | (d as u16);
-    let hour = sec_of_day / 3600;
-    let minute = (sec_of_day / 60) % 60;
-    let sec2 = (sec_of_day % 60) / 2;
-    let dos_time = ((hour as u16) << 11) | ((minute as u16) << 5) | (sec2 as u16);
-    (dos_date, dos_time)
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    crate::dos_time::unix_to_dos(unix)
 }
 
 // Unused but kept for potential future openat-relative walks.

@@ -82,23 +82,27 @@ final class TzipFSExtension: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         var errPtr: UnsafeMutablePointer<CChar>? = nil
         let urlCstr = archiveURL.cString(using: .utf8)!
         let pwCstr = password?.cString(using: .utf8)
+        // Dispatch to the writable or read-only Rust constructor based on
+        // the `write` mount option. The RW path rejects remote URLs on
+        // its own (commit needs atomic rename on a real path).
+        let openFn = parsed.write ? tzip_open_volume_rw : tzip_open_volume
         let rc = urlCstr.withUnsafeBufferPointer { urlBuf -> Int32 in
             if let pw = pwCstr {
                 return pw.withUnsafeBufferPointer { pwBuf in
-                    tzip_open_volume(urlBuf.baseAddress!,
-                                     pwBuf.baseAddress,
-                                     UInt32(parsed.cacheMb),
-                                     parsed.verbose ? 1 : 0,
-                                     &handle,
-                                     &errPtr)
+                    openFn(urlBuf.baseAddress!,
+                           pwBuf.baseAddress,
+                           UInt32(parsed.cacheMb),
+                           parsed.verbose ? 1 : 0,
+                           &handle,
+                           &errPtr)
                 }
             } else {
-                return tzip_open_volume(urlBuf.baseAddress!,
-                                        nil,
-                                        UInt32(parsed.cacheMb),
-                                        parsed.verbose ? 1 : 0,
-                                        &handle,
-                                        &errPtr)
+                return openFn(urlBuf.baseAddress!,
+                              nil,
+                              UInt32(parsed.cacheMb),
+                              parsed.verbose ? 1 : 0,
+                              &handle,
+                              &errPtr)
             }
         }
         if rc != 0 {
@@ -141,6 +145,9 @@ private struct ParsedOptions {
     var cacheMb: Int = 256
     var allowOther: Bool = false
     var verbose: Bool = false
+    /// Open the volume read-write. Only honored for local archives —
+    /// the Rust side rejects remote URLs with a loud error.
+    var write: Bool = false
 }
 
 private func parseMountOptions(_ opts: [String]) -> ParsedOptions {
@@ -164,6 +171,8 @@ private func parseMountOptions(_ opts: [String]) -> ParsedOptions {
                 out.allowOther = true
             case "verbose":
                 out.verbose = true
+            case "write":
+                out.write = true
             default:
                 break
             }

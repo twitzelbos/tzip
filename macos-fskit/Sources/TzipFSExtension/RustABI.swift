@@ -48,11 +48,24 @@ func tzip_open_volume(
     _ out_err: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
 ) -> Int32
 
+@_silgen_name("tzip_open_volume_rw")
+func tzip_open_volume_rw(
+    _ archive_url: UnsafePointer<CChar>,
+    _ password: UnsafePointer<CChar>?,
+    _ cache_mb: UInt32,
+    _ verbose: UInt8,
+    _ out_handle: UnsafeMutablePointer<TzipVfsHandle>,
+    _ out_err: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
 @_silgen_name("tzip_close_volume")
 func tzip_close_volume(_ handle: TzipVfsHandle)
 
 @_silgen_name("tzip_root_ino")
 func tzip_root_ino() -> UInt64
+
+@_silgen_name("tzip_is_writable")
+func tzip_is_writable(_ handle: TzipVfsHandle) -> UInt8
 
 @_silgen_name("tzip_getattr")
 func tzip_getattr(
@@ -87,6 +100,65 @@ func tzip_read(
     _ size: UInt32,
     _ out_buf: UnsafeMutablePointer<UInt8>,
     _ written: UnsafeMutablePointer<Int>
+) -> Int32
+
+@_silgen_name("tzip_write")
+func tzip_write(
+    _ handle: TzipVfsHandle,
+    _ ino: UInt64,
+    _ offset: UInt64,
+    _ data: UnsafePointer<UInt8>,
+    _ data_len: Int,
+    _ written: UnsafeMutablePointer<Int>
+) -> Int32
+
+@_silgen_name("tzip_create")
+func tzip_create(
+    _ handle: TzipVfsHandle,
+    _ parent_ino: UInt64,
+    _ name: UnsafePointer<UInt8>,
+    _ name_len: Int,
+    _ out_attr: UnsafeMutablePointer<CAttr>
+) -> Int32
+
+@_silgen_name("tzip_mkdir")
+func tzip_mkdir(
+    _ handle: TzipVfsHandle,
+    _ parent_ino: UInt64,
+    _ name: UnsafePointer<UInt8>,
+    _ name_len: Int,
+    _ out_attr: UnsafeMutablePointer<CAttr>
+) -> Int32
+
+@_silgen_name("tzip_unlink")
+func tzip_unlink(
+    _ handle: TzipVfsHandle,
+    _ parent_ino: UInt64,
+    _ name: UnsafePointer<UInt8>,
+    _ name_len: Int
+) -> Int32
+
+@_silgen_name("tzip_rmdir")
+func tzip_rmdir(
+    _ handle: TzipVfsHandle,
+    _ parent_ino: UInt64,
+    _ name: UnsafePointer<UInt8>,
+    _ name_len: Int
+) -> Int32
+
+@_silgen_name("tzip_truncate")
+func tzip_truncate(
+    _ handle: TzipVfsHandle,
+    _ ino: UInt64,
+    _ new_size: UInt64
+) -> Int32
+
+@_silgen_name("tzip_commit")
+func tzip_commit(
+    _ handle: TzipVfsHandle,
+    _ dirty_out: UnsafeMutablePointer<Int>,
+    _ tombstoned_out: UnsafeMutablePointer<Int>,
+    _ out_err: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
 ) -> Int32
 
 @_silgen_name("tzip_free_string")

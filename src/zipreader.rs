@@ -142,6 +142,50 @@ impl Archive {
             .with_context(|| format!("parse multi-disk archive {}", path.display()))
     }
 
+    /// Same as `open` but asks the kernel for read+write on the backing
+    /// file and hands back a second (dup'd) `File` for the caller to
+    /// write through — lets append-mode update avoid the drop-and-reopen
+    /// dance between parsing the CDR and truncating the archive at
+    /// `cd_offset`.
+    ///
+    /// Single-disk local archives only — multi-disk append is unsound
+    /// (truncating the last disk at the absolute cd_offset would not
+    /// land where the CDR actually begins in the concatenated space)
+    /// and we reject it up front. Callers that hit the error should
+    /// fall back to `Archive::open` + rebuild-mode.
+    pub fn open_rw(path: &Path) -> Result<(Self, File)> {
+        use std::fs::OpenOptions;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open {} rw", path.display()))?;
+        let file_size = file
+            .seek(SeekFrom::End(0))
+            .context("seek to end of archive")?;
+        if file_size < EOCD_MIN_SIZE {
+            bail!("archive is too small to be a ZIP ({} bytes)", file_size);
+        }
+        let (eocd_pos, eocd) = find_eocd(&mut file, file_size)
+            .with_context(|| format!("find EOCD on {}", path.display()))?;
+        if eocd.this_disk != 0 || eocd.cd_disk != 0 {
+            bail!(
+                "Archive::open_rw does not support multi-disk archives — \
+                 use Archive::open and rebuild mode"
+            );
+        }
+        // `try_clone` dup(2)'s the fd. The two fds share the file
+        // description (position is shared), which is fine here: Archive
+        // parses via the first fd and we explicitly seek the second fd
+        // before using it to write.
+        let rw_handle = file
+            .try_clone()
+            .context("dup archive fd for rw hand-off")?;
+        let arch = Self::finish_parse(Box::new(file), file_size, eocd_pos, eocd)
+            .with_context(|| format!("parse {}", path.display()))?;
+        Ok((arch, rw_handle))
+    }
+
     /// Open an archive against any `Read + Seek + Send` source. HTTP, S3,
     /// in-memory cursors — anything implementing `ReadSeek`. The source
     /// must be single-disk; multi-disk archives come through `open`

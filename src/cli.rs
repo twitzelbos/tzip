@@ -216,6 +216,19 @@ pub struct CreateArgs {
 
     #[arg(long)]
     pub streaming: bool,
+
+    /// Compute and stash MD5 of every entry's plaintext in a tzip-native
+    /// extra field, so later `tzip hash --algo md5` reads can skip the
+    /// body-decode round-trip. Hashing fuses with the CRC pass so the
+    /// extra cost is roughly a single memcpy over each uncompressed
+    /// body. Other tools ignore the field per APPNOTE.
+    #[arg(long)]
+    pub write_md5: bool,
+
+    /// Same as `--write-md5` but for SHA-256. Can be combined with
+    /// `--write-md5`; both digests land in the same entry.
+    #[arg(long)]
+    pub write_sha256: bool,
 }
 
 // ── Update ─────────────────────────────────────────────────────────────────
@@ -663,6 +676,11 @@ pub struct Options {
     pub update: bool,
     pub delete: Vec<String>,
     pub atomic: bool,
+    /// When set, encode_one computes MD5 of the plaintext alongside
+    /// CRC-32 and the writer stashes it in a tzip-native extra field.
+    pub write_md5: bool,
+    /// Same as `write_md5` for SHA-256.
+    pub write_sha256: bool,
 }
 
 /// Which reader op is running and what it needs.
@@ -825,6 +843,8 @@ impl CreateArgs {
             update: false,
             delete: Vec::new(),
             atomic: false,
+            write_md5: self.write_md5,
+            write_sha256: self.write_sha256,
         })
     }
 }
@@ -888,6 +908,8 @@ impl UpdateArgs {
             update: true,
             delete: self.delete,
             atomic: self.atomic,
+            write_md5: false,
+            write_sha256: false,
         })
     }
 }

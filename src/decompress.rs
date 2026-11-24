@@ -91,10 +91,7 @@ pub fn decompress<R: Read, W: Write>(
 ) -> Result<u64> {
     match method {
         ReadMethod::Store => copy_exact(src, dst, uncomp_size).context("store copy"),
-        ReadMethod::Deflate => {
-            let mut dec = flate2::read::DeflateDecoder::new(src);
-            std::io::copy(&mut dec, dst).context("deflate decompress")
-        }
+        ReadMethod::Deflate => decompress_deflate(src, uncomp_size, dst),
         ReadMethod::Bzip2 => {
             let mut dec = bzip2::read::BzDecoder::new(src);
             std::io::copy(&mut dec, dst).context("bzip2 decompress")
@@ -221,6 +218,53 @@ mod tests {
         assert_eq!(n as usize, payload.len());
         assert_eq!(out, payload);
     }
+}
+
+/// Entries above this uncompressed size fall back to the streaming
+/// `flate2` (miniz_oxide) decoder so we don't hold ~2× the body size
+/// in per-worker RAM. libdeflater is one-shot: it wants the whole
+/// compressed buffer AND the whole output buffer at once.
+///
+/// 64 MiB covers essentially every real ZIP entry; the ones that
+/// don't fit were I/O-bound anyway.
+const DEFLATE_ONESHOT_LIMIT: u64 = 64 * 1024 * 1024;
+
+fn decompress_deflate<R: Read, W: Write>(
+    mut src: R,
+    uncomp_size: u64,
+    dst: &mut W,
+) -> Result<u64> {
+    // Streaming fallback: large entries, or unknown-size cases.
+    if uncomp_size == 0 || uncomp_size > DEFLATE_ONESHOT_LIMIT {
+        let mut dec = flate2::read::DeflateDecoder::new(src);
+        return std::io::copy(&mut dec, dst).context("deflate decompress (streaming)");
+    }
+
+    // Hot path: read the whole compressed body, let libdeflater
+    // expand into a pre-sized buffer in one call. libdeflate is a
+    // SIMD-accelerated native implementation — ~2-3× faster than
+    // flate2's miniz_oxide for typical entries.
+    let mut input: Vec<u8> = Vec::new();
+    src.read_to_end(&mut input)
+        .context("read deflate body into one-shot buffer")?;
+    let mut out: Vec<u8> = Vec::with_capacity(uncomp_size as usize);
+    // SAFETY: libdeflater writes exactly `n` bytes; we truncate to
+    // `n` before exposing the buffer. `u8` has no drop, so leaving
+    // the tail uninitialized can't cause UB on an early return.
+    unsafe { out.set_len(uncomp_size as usize); }
+    let mut dec = libdeflater::Decompressor::new();
+    let n = dec
+        .deflate_decompress(&input, &mut out)
+        .map_err(|e| anyhow!("deflate decompress: {:?}", e))?;
+    if n != uncomp_size as usize {
+        // Spec-wise this shouldn't happen — CDR's uncompressed size
+        // is authoritative. If it does we trust what libdeflate
+        // actually produced.
+        out.truncate(n);
+    }
+    dst.write_all(&out)
+        .context("write deflate output")?;
+    Ok(n as u64)
 }
 
 fn copy_exact<R: Read, W: Write>(mut src: R, dst: &mut W, mut remaining: u64) -> Result<u64> {

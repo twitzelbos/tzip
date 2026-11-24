@@ -456,12 +456,20 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
                     let write_result = (|| -> Result<()> {
                         let f = File::create(&dest)
                             .with_context(|| format!("create {}", dest.display()))?;
-                        let mut buf = BufWriter::new(f);
+                        // 64 KiB buffer: most zip entries are small enough
+                        // that one or two writev syscalls per file is
+                        // enough to drain. The default 8 KiB costs ~6
+                        // syscalls on a 50 KiB entry.
+                        let mut buf = BufWriter::with_capacity(64 * 1024, f);
                         stream_entry_to(&mut *source, &re, password.as_deref(), &mut buf)?;
                         buf.flush().context("flush extract buffer")?;
-                        drop(buf);
-                        apply_unix_mode(&dest, &re);
-                        apply_entry_mtime(&dest, &re);
+                        // Hold the handle open for the metadata ops so we
+                        // avoid a second `open`+`close` per entry. On APFS
+                        // each path-based `open` is ~0.5-1 ms; re-opening
+                        // just to call `set_modified` was the dominant
+                        // per-entry cost.
+                        let f = buf.into_inner().context("unwrap extract buffer")?;
+                        apply_metadata(&f, &re);
                         Ok(())
                     })();
                     match write_result {
@@ -527,46 +535,35 @@ fn stream_entry<W: Write>(
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-/// If the archive was produced on a Unix host and carries sane mode
-/// bits in `external_attr`, apply them with `chmod`. Permission-only
-/// (we don't flip ownership, and we don't try to restore anything
-/// outside the standard rwx + setuid/setgid/sticky bits — a malicious
-/// archive can't set arbitrary bits this way). Non-Unix hosts or
-/// entries with a zero mode get left at the default from `File::create`.
-#[cfg(unix)]
-fn apply_unix_mode(dest: &Path, re: &ReadEntry) {
-    use std::os::unix::fs::PermissionsExt;
-    let Some(mode) = re.unix_mode() else { return };
-    // Keep only the file-permission bits we're comfortable restoring:
-    // setuid/setgid/sticky + rwxrwxrwx (0o7777). Type bits (S_IFREG etc.)
-    // are dropped; the file is already a regular file we created.
-    let perm_bits = mode & 0o7777;
-    if perm_bits == 0 {
-        return;
+/// Apply the entry's permission bits and mtime via the already-open
+/// `File` handle. Fuses what used to be two helpers (`apply_unix_mode`
+/// + `apply_entry_mtime`) so we don't pay a second `open`+`close` per
+/// entry — one `fchmod` + one `futimens`, both on the fd we already
+/// have. Best-effort: failures are silently ignored. The extract
+/// itself has already succeeded by the time we're here.
+fn apply_metadata(f: &File, re: &ReadEntry) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(mode) = re.unix_mode() {
+            // Only the file-permission bits (setuid/setgid/sticky +
+            // rwxrwxrwx); type bits are dropped. A zero mode means
+            // the archive didn't carry Unix perms, so we leave the
+            // default from `File::create`.
+            let perm_bits = mode & 0o7777;
+            if perm_bits != 0 {
+                let _ = f.set_permissions(std::fs::Permissions::from_mode(perm_bits));
+            }
+        }
     }
-    let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(perm_bits));
-}
+    // Windows: the DOS external_attr bits are a different beast; leave
+    // whatever ACL File::create produced. The ZIP spec defers to the
+    // platform on "how to restore attributes" — doing nothing is fine.
 
-#[cfg(not(unix))]
-fn apply_unix_mode(_dest: &Path, _re: &ReadEntry) {
-    // On Windows the external_attr DOS bits are a different beast; leave
-    // the default ACL that File::create produced. The ZIP spec defers to
-    // the platform on "how to restore attributes" — doing nothing is fine.
-}
-
-/// Restore the entry's modify time on the extracted file. Uses
-/// `std::fs::File::set_modified` — portable across Unix + Windows
-/// without pulling in a crate. Best-effort — failures are silently
-/// ignored; the extract itself already succeeded.
-fn apply_entry_mtime(dest: &Path, re: &ReadEntry) {
-    use std::time::{Duration, UNIX_EPOCH};
     let ts = crate::dos_time::dos_to_unix(re.mtime);
-    if ts <= 0 {
-        return;
-    }
-    let st = UNIX_EPOCH + Duration::from_secs(ts as u64);
-    // OpenOptions::write(true) gets us a handle without truncating.
-    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dest) {
+    if ts > 0 {
+        use std::time::{Duration, UNIX_EPOCH};
+        let st = UNIX_EPOCH + Duration::from_secs(ts as u64);
         let _ = f.set_modified(st);
     }
 }

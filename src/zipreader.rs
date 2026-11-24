@@ -243,8 +243,17 @@ impl Archive {
         source
             .seek(SeekFrom::Start(cd_offset))
             .with_context(|| format!("seek to central directory at {}", cd_offset))?;
-        let mut cdr_bytes = vec![0u8; cd_size as usize];
-        source.read_exact(&mut cdr_bytes).context("read central directory")?;
+        // Pre-sized Vec + `read_to_end` through a `Take` — fills the
+        // buffer in one shot without the zero-memset that `vec![0u8; N]`
+        // would pay on top. On a multi-MB CDR the memset was pure waste.
+        let mut cdr_bytes: Vec<u8> = Vec::with_capacity(cd_size as usize);
+        (&mut *source)
+            .take(cd_size)
+            .read_to_end(&mut cdr_bytes)
+            .context("read central directory")?;
+        if cdr_bytes.len() != cd_size as usize {
+            bail!("short CDR read: got {} wanted {}", cdr_bytes.len(), cd_size);
+        }
 
         let entries = parse_central_directory(&cdr_bytes, entry_count)?;
 
@@ -318,10 +327,14 @@ impl Archive {
         source
             .seek(SeekFrom::Start(cd_offset))
             .with_context(|| format!("seek to multi-disk CDR at absolute offset {}", cd_offset))?;
-        let mut cdr_bytes = vec![0u8; cd_size as usize];
-        source
-            .read_exact(&mut cdr_bytes)
+        let mut cdr_bytes: Vec<u8> = Vec::with_capacity(cd_size as usize);
+        (&mut *source)
+            .take(cd_size)
+            .read_to_end(&mut cdr_bytes)
             .context("read central directory across stitched disks")?;
+        if cdr_bytes.len() != cd_size as usize {
+            bail!("short multi-disk CDR read: got {} wanted {}", cdr_bytes.len(), cd_size);
+        }
         let mut entries = parse_central_directory(&cdr_bytes, eocd.entry_count as u64)?;
 
         // Transform (disk, offset) pairs → absolute offsets.
@@ -404,8 +417,14 @@ impl Archive {
         self.source
             .seek(SeekFrom::Start(self.cd_offset))
             .context("seek to cd_offset for tail copy")?;
-        let mut buf = vec![0u8; self.tail_size as usize];
-        self.source.read_exact(&mut buf).context("read tail bytes")?;
+        let mut buf: Vec<u8> = Vec::with_capacity(self.tail_size as usize);
+        (&mut *self.source)
+            .take(self.tail_size)
+            .read_to_end(&mut buf)
+            .context("read tail bytes")?;
+        if buf.len() != self.tail_size as usize {
+            bail!("short tail read: got {} wanted {}", buf.len(), self.tail_size);
+        }
         Ok(buf)
     }
 
@@ -692,13 +711,19 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
 /// read of the bytes — the raw `name_bytes` is preserved separately so
 /// round-trip into a rewritten CDR is byte-exact regardless.
 fn decode_name(bytes: &[u8], gp_flags: u16) -> String {
+    // Fast path: assume valid UTF-8 (the common case for every file
+    // written by a modern tool). Only fall through to the lossy
+    // decoder / CP437 table when the fast path rejects. Previously
+    // the UTF-8-flagged branch always went through
+    // `String::from_utf8_lossy(..).into_owned()`, which runs a
+    // state machine even for valid inputs — then allocates.
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
     if gp_flags & (1 << 11) != 0 {
         return String::from_utf8_lossy(bytes).into_owned();
     }
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => cp437_to_string(bytes),
-    }
+    cp437_to_string(bytes)
 }
 
 /// Best-effort CP437 → UTF-8. Printable ASCII passes through; high bytes

@@ -77,7 +77,13 @@ pub fn run_update(opts: Options) -> Result<()> {
         })?
     };
 
-    // Compute delete + replace sets.
+    // Compute delete + replace sets. `delete_matches` only owns the
+    // names that actually matched a `--delete` glob — a small subset
+    // on realistic workloads, not the whole archive. `new_names` is
+    // sized to new_items. `old_names` was previously a full-archive
+    // String-clone just to compute `has_replace`; now it's a
+    // borrowed `HashSet<&str>` scoped to this one check and dropped
+    // before we take `&mut arch` later.
     let delete_matches: HashSet<String> = arch
         .entries()
         .iter()
@@ -88,8 +94,18 @@ pub fn run_update(opts: Options) -> Result<()> {
         .iter()
         .map(|it| it.name_in_archive.clone())
         .collect();
-    let old_names: HashSet<String> = arch.entries().iter().map(|e| e.name.clone()).collect();
-    let has_replace = new_names.iter().any(|n| old_names.contains(n));
+    // Compute both `has_replace` and the replace count the mode-log
+    // uses later, while we have the `HashSet<&str>` snapshot built.
+    // Scope the borrow so it's dropped before any `&mut arch` work.
+    let (has_replace, n_rep) = {
+        let old_names: HashSet<&str> =
+            arch.entries().iter().map(|e| e.name.as_str()).collect();
+        let n_rep = new_names
+            .iter()
+            .filter(|n| old_names.contains(n.as_str()))
+            .count();
+        (n_rep > 0, n_rep)
+    };
 
     // Deduplicate within new_items (first wins) to match create-mode behaviour.
     {
@@ -106,7 +122,7 @@ pub fn run_update(opts: Options) -> Result<()> {
     let mut kept: Vec<ReadEntry> = Vec::new();
     for idx in 0..arch.entries().len() {
         let name = arch.entries()[idx].name.clone();
-        if delete_matches.contains(&name) || new_names.contains(&name) {
+        if delete_matches.contains(name.as_str()) || new_names.contains(name.as_str()) {
             continue;
         }
         arch.lfh_total_size_of(idx)
@@ -131,7 +147,6 @@ pub fn run_update(opts: Options) -> Result<()> {
         let mode = if can_append { "append" } else { "rebuild" };
         let n_add = new_items.len();
         let n_del = delete_matches.len();
-        let n_rep = new_names.iter().filter(|n| old_names.contains(*n)).count();
         eprintln!(
             "tzip: update mode = {} (add {}, replace {}, delete {}, keep {})",
             mode,

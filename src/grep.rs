@@ -105,13 +105,21 @@ fn process_archive(
     // Phase 1: parse CDR, filter entries, populate lfh_total_size.
     let mut driver = open_archive(url)
         .with_context(|| format!("open archive {}", url))?;
+    // Narrow the global `(url, name)` skip set to the entries we'd
+    // actually probe on THIS archive, as a `HashSet<&str>` keyed by
+    // name alone. Lets the hot `.contains(...)` check be zero-alloc —
+    // the old `skip.contains(&(url.to_string(), name.clone()))`
+    // allocated two Strings per candidate.
+    let url_skip: HashSet<&str> = skip
+        .iter()
+        .filter_map(|(u, n)| (u == url).then(|| n.as_str()))
+        .collect();
     // Collect candidate indices first so we can mutably probe LFH sizes
     // without holding an immutable borrow of driver.entries().
     let candidates: Vec<usize> = (0..driver.entries().len())
         .filter(|&idx| {
             let re = &driver.entries()[idx];
-            entry_passes_filters(re, &opts)
-                && !skip.contains(&(url.to_string(), re.name.clone()))
+            entry_passes_filters(re, &opts) && !url_skip.contains(re.name.as_str())
         })
         .collect();
     let mut filtered: Vec<ReadEntry> = Vec::with_capacity(candidates.len());

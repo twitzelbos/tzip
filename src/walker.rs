@@ -184,13 +184,31 @@ fn external_attr_from_meta(_meta: &std::fs::Metadata) -> u32 {
 }
 
 fn archive_name(base_name: &str, rel: &Path) -> String {
-    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    // `to_string_lossy()` returns a `Cow`; it borrows on valid UTF-8
+    // and only allocates on invalid sequences. Only convert `\` → `/`
+    // on Windows; on Unix the backslash is a legal filename byte, and
+    // the previous unconditional `.replace('\\', "/")` always
+    // allocated a fresh String per walked entry.
+    let rel_cow = rel.to_string_lossy();
+    #[cfg(windows)]
+    let rel_str: std::borrow::Cow<'_, str> = if rel_cow.contains('\\') {
+        std::borrow::Cow::Owned(rel_cow.replace('\\', "/"))
+    } else {
+        rel_cow
+    };
+    #[cfg(not(windows))]
+    let rel_str = rel_cow;
+    let rel_trim = rel_str.trim_start_matches('/');
     if base_name.is_empty() {
-        rel_str.trim_start_matches('/').to_string()
-    } else if rel_str.is_empty() {
+        rel_trim.to_string()
+    } else if rel_trim.is_empty() {
         base_name.to_string()
     } else {
-        format!("{}/{}", base_name, rel_str.trim_start_matches('/'))
+        let mut out = String::with_capacity(base_name.len() + 1 + rel_trim.len());
+        out.push_str(base_name);
+        out.push('/');
+        out.push_str(rel_trim);
+        out
     }
 }
 

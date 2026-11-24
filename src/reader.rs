@@ -79,26 +79,6 @@ pub(crate) fn open_source_for_with_hint(
     }
 }
 
-/// Probe a local archive's layout (single vs multi-disk) once. Used
-/// by callers that will then fan-out workers via
-/// `open_source_for_with_hint(..., Some(layout))`, saving an EOCD
-/// scan per worker. `None` on any probe error — workers fall back to
-/// the self-probing path.
-pub(crate) fn probe_local_layout(spec: &str) -> Option<LocalLayout> {
-    if spec.starts_with("http://") || spec.starts_with("https://") || spec.starts_with("s3://") {
-        return None;
-    }
-    let path = Path::new(spec);
-    let mut probe = std::fs::File::open(path).ok()?;
-    let file_size = probe.seek(SeekFrom::End(0)).ok()?;
-    let n = crate::zipreader::probe_total_disks(&mut probe, file_size).ok()?;
-    Some(if n >= 2 {
-        LocalLayout::MultiDisk(n)
-    } else {
-        LocalLayout::SingleDisk
-    })
-}
-
 fn local_source_for(
     path: &Path,
     hint: Option<LocalLayout>,
@@ -385,6 +365,10 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
         arch.lfh_total_size_of(idx)?;
         selected.push(arch.entries()[idx].clone());
     }
+    // Grab the disk count off `arch` before dropping so workers below
+    // can skip an extra EOCD scan — the Archive we already opened knows
+    // exactly how many disks are in play.
+    let disk_count = arch.disk_count();
     drop(arch);
     p("lfh_probe_phase_A", t);
 
@@ -435,10 +419,21 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     let verbose = opts.verbose;
     let extracted = AtomicUsize::new(0);
 
-    // Probe the archive's physical layout once on the main thread so
-    // workers skip the per-worker EOCD scan. The common case (local
-    // single-disk) collapses to a single `File::open` in the worker.
-    let layout_hint = probe_local_layout(&spec);
+    // Translate the disk count from `open_archive` into a worker-side
+    // layout hint. Local-path workers take this hint and collapse to a
+    // single `File::open`; remote (http/s3) workers ignore it. Saves a
+    // second EOCD tail-scan on the main thread vs probing the layout
+    // independently.
+    let layout_hint = if spec.starts_with("http://")
+        || spec.starts_with("https://")
+        || spec.starts_with("s3://")
+    {
+        None
+    } else if disk_count >= 2 {
+        Some(LocalLayout::MultiDisk(disk_count))
+    } else {
+        Some(LocalLayout::SingleDisk)
+    };
 
     let t_fanout = std::time::Instant::now();
     std::thread::scope(|scope| -> Result<()> {

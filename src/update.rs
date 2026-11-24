@@ -695,8 +695,9 @@ pub fn attempt_recover_undo(archive: &Path) -> Result<()> {
             .with_context(|| format!("remove stale undo {}", undo.display()))?;
         return Ok(());
     }
-    // Crash recovery: restore the tail.
-    restore_from_undo(archive, &undo)?;
+    // Crash recovery: restore the tail. Hand the header down so we
+    // don't open+reparse the undo file a second time.
+    restore_from_undo_with_hdr(archive, &undo, &hdr)?;
     eprintln!(
         "tzip: recovered {} from interrupted update (undo size = {} bytes)",
         archive.display(),
@@ -705,8 +706,15 @@ pub fn attempt_recover_undo(archive: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Legacy entry: used by the in-process error recovery path in
+/// `run_update_append`, which doesn't have an `UndoHeader` in scope.
+/// Reads the header, then delegates.
 fn restore_from_undo(archive: &Path, undo: &Path) -> Result<()> {
     let hdr = read_undo_header(undo)?;
+    restore_from_undo_with_hdr(archive, undo, &hdr)
+}
+
+fn restore_from_undo_with_hdr(archive: &Path, undo: &Path, hdr: &UndoHeader) -> Result<()> {
     let mut undo_file = File::open(undo)?;
     undo_file
         .seek(SeekFrom::Start(hdr.tail_offset))
@@ -737,63 +745,9 @@ fn restore_from_undo(archive: &Path, undo: &Path) -> Result<()> {
 
 /// Parse the central-directory bytes we snapshotted for the undo file,
 /// so we can reconstruct the existing-entries list without reopening
-/// the archive. Shares the CDR parser with `zipreader`.
-fn reparse_entries_from_tail(tail: &[u8], cd_offset: u64) -> Result<Vec<ReadEntry>> {
-    // Delegate: zipreader has the full parser. We write a thin adapter
-    // via an in-memory archive snapshot. For append mode the tail is
-    // self-contained (CDR + EOCD + optional ZIP64 trailer), so we just
-    // run the EOCD-locating logic over `tail` to find the CDR region,
-    // then parse it.
-    //
-    // Rather than exposing the internal parser, we make a scratch file,
-    // dump the tail at `cd_offset`, open it with `Archive::open`, and
-    // hand back `entries()`. `cd_offset` is preserved so lfh_offsets
-    // remain correct relative to the real archive.
-    use tempfile_like_scratch::ScratchArchive;
-    let scratch = ScratchArchive::build(cd_offset, tail)?;
-    let arch = Archive::open(scratch.path())?;
-    Ok(arch.entries().to_vec())
-}
-
-/// Tiny in-crate shim: creates a scratch file with `cd_offset` zero bytes
-/// followed by the tail, so `Archive::open` sees a well-formed archive at
-/// the right offset.
-mod tempfile_like_scratch {
-    use anyhow::{Context, Result};
-    use std::io::Write;
-    use std::path::{Path, PathBuf};
-
-    pub struct ScratchArchive(PathBuf);
-
-    impl ScratchArchive {
-        pub fn build(cd_offset: u64, tail: &[u8]) -> Result<Self> {
-            let dir = std::env::temp_dir();
-            let pid = std::process::id();
-            let seq = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let path = dir.join(format!("tzip-recover-{}-{}.zip", pid, seq));
-            let mut f = std::fs::File::create(&path)
-                .with_context(|| format!("create recover scratch {}", path.display()))?;
-            // Punch a sparse hole up to cd_offset (every FS we care about
-            // supports sparse files; worst case this is a real zero write).
-            f.set_len(cd_offset).context("size scratch")?;
-            use std::io::{Seek, SeekFrom};
-            f.seek(SeekFrom::Start(cd_offset))?;
-            f.write_all(tail)?;
-            f.sync_all()?;
-            Ok(Self(path))
-        }
-        pub fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for ScratchArchive {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
+/// the archive. Shares the CDR parser with `zipreader`, directly from
+/// the in-memory tail — no scratch file, no fsync, no second open.
+fn reparse_entries_from_tail(tail: &[u8], _cd_offset: u64) -> Result<Vec<ReadEntry>> {
+    crate::zipreader::parse_entries_from_tail(tail)
 }
 

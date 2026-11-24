@@ -39,6 +39,12 @@ pub enum Method {
     Lzma,
     Xz,
     Zstd,
+    /// PPMd variant Ir1 (ZIP method 98). Context-modelling entropy
+    /// coder — great ratio on text, CPU-bound on compression, needs
+    /// a few MB to a few hundred MB of model arena per entry (scales
+    /// with `--level`). Recipient needs a PPMd-aware unzipper
+    /// (7-Zip, WinZip, Info-ZIP builds with PPMd).
+    Ppmd,
 }
 
 // ── Top-level CLI ──────────────────────────────────────────────────────────

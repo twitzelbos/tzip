@@ -239,13 +239,38 @@ All write-side methods compose orthogonally with AES-256.
 | `lzma` | 14 | r+w | `xz2` (LZMA1) | Better ratio than DEFLATE; ZIP consumers need LZMA support |
 | `xz` | 95 | r+w | `xz2` (LZMA2) | Same LZMA2 as `.7z`, but per-file inside a ZIP |
 | `zstd` | 93 | r+w | `zstd` | Great ratio + speed. Recipient needs zstd-aware unzipper |
-| `ppmd` | 98 | r | `compcol` | PPMd variant Ir1 (context-modelling entropy coder). Rare in the wild but valid per APPNOTE |
+| `ppmd` | 98 | r+w | `compcol` (r) / `ppmd-rust` (w) | PPMd variant Ir1 (context-modelling entropy coder). Great ratio on text and source code; slow, CPU-bound, needs 4-192 MB model arena per concurrent entry (scales with `--level`). Recipient needs a PPMd-aware unzipper (7-Zip, WinZip, Info-ZIP builds with PPMd) |
 
-Shrink / Reduce / Implode are read-only — modern tooling (Info-ZIP,
-libarchive, miniz, `zip` crate) all dropped encoder support decades
-ago and there is no reason to produce new archives in these formats.
-tzip still opens them so a 1990-era PKZIP 1.x archive is readable.
-See [Reading archives](#reading-archives) for the subcommands.
+Shrink / Reduce / Implode / Deflate64 are read-only — modern tooling
+(Info-ZIP, libarchive, miniz, `zip` crate) all dropped encoder support
+decades ago and there's no reason to produce new archives in those
+formats. tzip still opens them so a 1990-era PKZIP 1.x archive is
+readable. See [Reading archives](#reading-archives) for the subcommands.
+
+#### When to pick PPMd
+
+PPMd (method 98) is tzip's highest-ratio write-side method on text
+corpora: in a 250 MiB word-list benchmark it landed at **23% of the
+original** (deflate was 30.5%, zstd 30.8%, bzip2 34%). It's
+noticeably slower than DEFLATE — per-entry CPU-bound range coding —
+so pair it with `-m ppmd` for backup-style workloads where the
+write happens once and the ratio pays dividends on every read.
+
+The `--level` knob trades RAM + CPU for ratio by picking a PPMd
+`(model_order, memory_MB)` pair:
+
+| level | order | memory | notes |
+|---|---:|---:|---|
+| 1 | 4 | 4 MB | fast, tiny arena |
+| 3 | 6 | 16 MB | compcol / 7-Zip default |
+| 6 (default) | 12 | 96 MB | strong ratio, modest arena |
+| 9 | 16 | 192 MB | ratio to the hilt — full order, near-max arena |
+
+**RAM note**: the per-entry arena is allocated per concurrent
+compression worker. On an N-core machine building a ppmd archive at
+level 9, peak RAM is ~192 MB × N. `-j` caps that if it matters.
+AES, `--sort`, and every other tzip flag work with `-m ppmd`
+unchanged.
 
 ### Compatibility matrix (method + AES-256 → who can read it)
 

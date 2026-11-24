@@ -506,6 +506,8 @@ fn encode_items_into_writer<W: Write + Seek>(
                     password.as_deref(),
                     &mut scratch,
                     single_file_parallel,
+                    false, // update mode doesn't support --write-md5 yet
+                    false,
                 )?;
                 if enc_tx.send(entry).is_err() {
                     break;
@@ -630,6 +632,8 @@ fn encode_items_to_map(
                     password.as_deref(),
                     &mut scratch,
                     single_file_parallel,
+                    false, // update mode doesn't support --write-md5 yet
+                    false,
                 )?;
                 if enc_tx.send(entry).is_err() {
                     break;

@@ -86,18 +86,22 @@ pub fn walk_stream_bulk(
         }
 
         let base_name = crate::walker::archive_prefix_for_root(cli_root, basename_only);
-        walk_recursive(&root_canon, &base_name, exclude, &tx)?;
+        // Root: open by path (unavoidable — no parent dirfd yet).
+        let root_fd = OwnedDirFd::open(&root_canon)
+            .with_context(|| format!("open {}", root_canon.display()))?;
+        walk_recursive(root_fd, &root_canon, &base_name, exclude, &tx)?;
     }
     Ok(())
 }
 
 fn walk_recursive(
+    dirfd: OwnedDirFd,
     dir: &Path,
     archive_prefix: &str,
     exclude: &[String],
     tx: &Sender<WorkItem>,
 ) -> Result<()> {
-    let dirfd = Arc::new(OwnedDirFd::open(dir).with_context(|| format!("open {}", dir.display()))?);
+    let dirfd = Arc::new(dirfd);
 
     // 64 KiB fits several hundred entries with our attribute layout.
     let mut buf = vec![0u8; 64 * 1024];
@@ -118,8 +122,11 @@ fn walk_recursive(
 
     // Sub-directories collected here so we can descend after finishing the
     // current directory (avoids holding many dirfds open simultaneously in
-    // deep trees).
-    let mut subdirs: Vec<PathBuf> = Vec::new();
+    // deep trees). Carry both the basename (for `openat` against the
+    // current dirfd — skips the per-call path walk) and the full path
+    // (for the archive-name prefix and error context in the recursive
+    // call).
+    let mut subdirs: Vec<(OsString, PathBuf)> = Vec::new();
 
     loop {
         let n = unsafe {
@@ -251,7 +258,7 @@ fn walk_recursive(
                     }
                 }
                 VDIR => {
-                    subdirs.push(dir.join(&name));
+                    subdirs.push((name.clone(), dir.join(&name)));
                 }
                 VLNK => {
                     // symlinks: skip (matches jwalk's `follow_links(false)`)
@@ -268,17 +275,25 @@ fn walk_recursive(
     // which is exactly what we want for `openat` downstream.
 
     // Recurse into subdirs after finishing this directory's stream so we
-    // don't stack too many open dirfds.
-    for sub in subdirs {
-        let sub_name = sub.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    // don't stack too many open dirfds. Open each subdir via
+    // `openat(parent_dirfd, basename)` — bypasses the kernel's
+    // path-component walk from the mount point down.
+    for (sub_name_os, sub_path) in subdirs {
+        let sub_name = sub_name_os.to_string_lossy();
         let child_prefix = if archive_prefix.is_empty() {
-            sub_name
+            sub_name.clone().into_owned()
         } else if sub_name.is_empty() {
             archive_prefix.to_string()
         } else {
-            format!("{}/{}", archive_prefix, sub_name)
+            let mut s = String::with_capacity(archive_prefix.len() + 1 + sub_name.len());
+            s.push_str(archive_prefix);
+            s.push('/');
+            s.push_str(&sub_name);
+            s
         };
-        walk_recursive(&sub, &child_prefix, exclude, tx)?;
+        let sub_fd = OwnedDirFd::open_at(dirfd.as_raw(), &sub_name_os)
+            .with_context(|| format!("open {}", sub_path.display()))?;
+        walk_recursive(sub_fd, &sub_path, &child_prefix, exclude, tx)?;
     }
     Ok(())
 }

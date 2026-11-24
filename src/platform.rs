@@ -32,6 +32,23 @@ impl OwnedDirFd {
         Ok(Self { fd })
     }
 
+    /// Open a subdirectory `name` relative to the directory `parent`
+    /// via `openat(2)` — skips the kernel's path-component walk from
+    /// the mount point down to `parent`. Used by `bulk_walker` to
+    /// descend without re-resolving every ancestor per subdir.
+    pub fn open_at(parent: std::os::unix::io::RawFd, name: &std::ffi::OsStr) -> io::Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name has NUL"))?;
+        let fd = unsafe {
+            libc::openat(parent, c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC, 0)
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
     pub fn as_raw(&self) -> std::os::unix::io::RawFd {
         self.fd
     }

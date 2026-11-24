@@ -333,11 +333,11 @@ fn run_update_rebuild(
                         let e = encoded
                             .remove(&i)
                             .ok_or_else(|| anyhow!("missing encoded entry at index {}", i))?;
-                        let name = e.name.clone();
                         let plain = e.uncompressed_size;
-                        zw.write_entry(&e)?;
+                        let msg = format!("added {}", e.name);
+                        zw.write_entry(e)?;
                         progress.inc(plain);
-                        progress.set_msg(format!("added {}", name));
+                        progress.set_msg(msg);
                     }
                 }
             }
@@ -505,14 +505,16 @@ fn encode_items_into_writer<W: Write + Seek>(
     let mut wrote = 0u64;
     while let Ok(entry) = enc_rx.recv() {
         wrote += 1;
-        let name = entry.name.clone();
         let plain = entry.uncompressed_size;
-        zw.write_entry(&entry)?;
-        progress.inc(plain);
-        progress.set_msg(format!("{}/{} — {}", wrote, total_files, name));
+        // Build the strings that borrow `entry.name` BEFORE handing
+        // ownership to `write_entry` — avoids a `name.clone()` per entry.
+        let msg = format!("{}/{} — {}", wrote, total_files, entry.name);
         if opts.verbose {
-            eprintln!("added {}", name);
+            eprintln!("added {}", entry.name);
         }
+        zw.write_entry(entry)?;
+        progress.inc(plain);
+        progress.set_msg(msg);
     }
 
     feeder

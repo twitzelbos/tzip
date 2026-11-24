@@ -742,30 +742,34 @@ pub fn run(opts: Options) -> Result<()> {
             pending.insert(entry.index, entry);
             while let Some(e) = pending.remove(&next_idx) {
                 wrote_files += 1;
-                let name = e.name.clone();
                 let plain_size = e.uncompressed_size;
-                zw.write_entry(&e)?;
                 let total = discovered_files.load(AtomicOrdering::Relaxed).max(wrote_files);
-                progress.inc(plain_size);
-                progress.set_msg(format!("{}/{} files — {}", wrote_files, total, name));
+                // Format the progress label and (optional) verbose
+                // output while we still have a reference into `e`.
+                // `write_entry` then consumes `e`, so a per-entry
+                // `name.clone()` is no longer needed.
+                let msg = format!("{}/{} files — {}", wrote_files, total, e.name);
                 if opts.verbose {
-                    eprintln!("added {}", name);
+                    eprintln!("added {}", e.name);
                 }
+                zw.write_entry(e)?;
+                progress.inc(plain_size);
+                progress.set_msg(msg);
                 next_idx += 1;
             }
         }
     } else {
         while let Ok(entry) = enc_rx.recv() {
             wrote_files += 1;
-            let name = entry.name.clone();
             let plain_size = entry.uncompressed_size;
-            zw.write_entry(&entry)?;
             let total = discovered_files.load(AtomicOrdering::Relaxed).max(wrote_files);
-            progress.inc(plain_size);
-            progress.set_msg(format!("{}/{} files — {}", wrote_files, total, name));
+            let msg = format!("{}/{} files — {}", wrote_files, total, entry.name);
             if opts.verbose {
-                eprintln!("added {}", name);
+                eprintln!("added {}", entry.name);
             }
+            zw.write_entry(entry)?;
+            progress.inc(plain_size);
+            progress.set_msg(msg);
         }
     }
 

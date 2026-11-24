@@ -51,6 +51,25 @@ impl HttpSource {
         })
     }
 
+    /// Construct an `HttpSource` with a caller-supplied content length,
+    /// skipping the HEAD / Range-0-0 probe. Used by extract / grep inner
+    /// workers: the main thread has already opened the archive, so the
+    /// length is known and every worker's own probe would be a wasted
+    /// round-trip. Range-request support is assumed; if the first body
+    /// fetch comes back 200-not-206 we'll fail there with the same
+    /// error the probe path would have.
+    pub fn open_with_len(url: &str, len: u64) -> Result<Self> {
+        let agent = build_agent();
+        Ok(Self {
+            url: url.to_string(),
+            agent,
+            len,
+            pos: 0,
+            cache_start: 0,
+            cache: Vec::new(),
+        })
+    }
+
     fn fetch(&mut self, start: u64, min_len: u64) -> io::Result<()> {
         if start >= self.len {
             self.cache_start = start;

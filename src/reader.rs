@@ -40,14 +40,29 @@ pub(crate) fn open_archive(spec: &str) -> Result<Archive> {
     }
 }
 
-/// Caller-known layout hint. When the caller has already probed the
-/// archive once (e.g. `tzip x`'s main thread opened it to read the
-/// CDR), it can pass the result here so worker-spawn paths don't
-/// re-scan the EOCD N times. `None` = unknown, probe.
+/// Caller-known source hint. When the caller has already opened and
+/// parsed the archive on the main thread, it already knows the disk
+/// layout (local) or total byte length (remote). Passing that down to
+/// per-worker `open_source_for_with_hint` lets each worker skip its own
+/// EOCD scan (local) or length-probe HEAD/Range-0-0 round-trip
+/// (HTTP/S3). `None` = unknown, probe.
 #[derive(Clone, Copy)]
-pub(crate) enum LocalLayout {
-    SingleDisk,
-    MultiDisk(usize),
+pub(crate) enum SourceHint {
+    LocalSingleDisk,
+    LocalMultiDisk(usize),
+    RemoteKnownLen(u64),
+}
+
+/// Build a hint from an already-opened `Archive`. Workers spawned
+/// after this point reuse the probe the main thread already did.
+pub(crate) fn hint_from_archive(spec: &str, arch: &Archive) -> Option<SourceHint> {
+    if spec.starts_with("http://") || spec.starts_with("https://") || spec.starts_with("s3://") {
+        Some(SourceHint::RemoteKnownLen(arch.file_size()))
+    } else if arch.disk_count() >= 2 {
+        Some(SourceHint::LocalMultiDisk(arch.disk_count()))
+    } else {
+        Some(SourceHint::LocalSingleDisk)
+    }
 }
 
 /// Open a raw `Read + Seek + Send` backing source for `spec` without
@@ -58,21 +73,28 @@ pub(crate) fn open_source_for(spec: &str) -> Result<Box<dyn crate::sources::Read
     open_source_for_with_hint(spec, None)
 }
 
-/// Same as `open_source_for` but with an optional pre-probed layout
-/// hint, avoiding a second EOCD scan per worker when the caller
-/// already knows the layout (parallel extract hoists the probe to
-/// the main thread, then hands `Some(layout)` to each worker).
+/// Same as `open_source_for` but with an optional pre-probed hint,
+/// avoiding a second EOCD scan (local) or length-probe HEAD/GET
+/// (remote) per worker when the caller already knows the archive's
+/// shape. Extract/grep hoist the probe to the main thread and hand
+/// `Some(hint)` to each worker.
 pub(crate) fn open_source_for_with_hint(
     spec: &str,
-    hint: Option<LocalLayout>,
+    hint: Option<SourceHint>,
 ) -> Result<Box<dyn crate::sources::ReadSeek>> {
     if let Some(rest) = spec.strip_prefix("s3://") {
-        let src = S3Source::open(rest)
-            .with_context(|| format!("open S3 source s3://{}", rest))?;
+        let src = match hint {
+            Some(SourceHint::RemoteKnownLen(len)) => S3Source::open_with_len(rest, len),
+            _ => S3Source::open(rest),
+        }
+        .with_context(|| format!("open S3 source s3://{}", rest))?;
         Ok(Box::new(src))
     } else if spec.starts_with("http://") || spec.starts_with("https://") {
-        let src = HttpSource::open(spec)
-            .with_context(|| format!("open HTTP source {}", spec))?;
+        let src = match hint {
+            Some(SourceHint::RemoteKnownLen(len)) => HttpSource::open_with_len(spec, len),
+            _ => HttpSource::open(spec),
+        }
+        .with_context(|| format!("open HTTP source {}", spec))?;
         Ok(Box::new(src))
     } else {
         local_source_for(Path::new(spec), hint)
@@ -81,55 +103,45 @@ pub(crate) fn open_source_for_with_hint(
 
 fn local_source_for(
     path: &Path,
-    hint: Option<LocalLayout>,
+    hint: Option<SourceHint>,
 ) -> Result<Box<dyn crate::sources::ReadSeek>> {
     use crate::sources::multidisk::MultiDiskSource;
 
     // Fast path: caller told us the layout. Skip the EOCD scan.
-    if let Some(layout) = hint {
-        return match layout {
-            LocalLayout::SingleDisk => {
-                let f = std::fs::File::open(path)
-                    .with_context(|| format!("open {}", path.display()))?;
-                Ok(Box::new(f))
-            }
-            LocalLayout::MultiDisk(n) => {
-                let md = MultiDiskSource::open(path, n).with_context(|| {
-                    format!("open multi-disk source for {}", path.display())
-                })?;
-                Ok(Box::new(md))
-            }
-        };
-    }
-
-    // No hint — scan EOCD once to decide. Same as the pre-hint
-    // behaviour; kept for callers that don't pre-probe (`tzip grep`
-    // inner workers, FSKit reader, etc.).
-    let mut probe = std::fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    let file_size = match probe.seek(SeekFrom::End(0)) {
-        Ok(n) => n,
-        Err(_) => {
-            drop(probe);
+    match hint {
+        Some(SourceHint::LocalSingleDisk) => {
             let f = std::fs::File::open(path)
-                .with_context(|| format!("re-open {}", path.display()))?;
+                .with_context(|| format!("open {}", path.display()))?;
             return Ok(Box::new(f));
         }
-    };
+        Some(SourceHint::LocalMultiDisk(n)) => {
+            let md = MultiDiskSource::open(path, n)
+                .with_context(|| format!("open multi-disk source for {}", path.display()))?;
+            return Ok(Box::new(md));
+        }
+        // RemoteKnownLen reached here only if a bad call site passed
+        // a remote hint to a local path; fall through and probe.
+        Some(SourceHint::RemoteKnownLen(_)) | None => {}
+    }
+
+    // No hint — scan EOCD once to decide. Keep the probe fd in-hand
+    // for the single-disk outcome so this still costs a single open
+    // overall (the old flow dropped and reopened).
+    let mut probe = std::fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let file_size = probe
+        .seek(SeekFrom::End(0))
+        .with_context(|| format!("seek to end of {}", path.display()))?;
     let total_disks = crate::zipreader::probe_total_disks(&mut probe, file_size).ok();
-    drop(probe);
 
     match total_disks {
         Some(n) if n >= 2 => {
+            drop(probe);
             let md = MultiDiskSource::open(path, n)
                 .with_context(|| format!("open multi-disk source for {}", path.display()))?;
             Ok(Box::new(md))
         }
-        _ => {
-            let f = std::fs::File::open(path)
-                .with_context(|| format!("re-open {}", path.display()))?;
-            Ok(Box::new(f))
-        }
+        _ => Ok(Box::new(probe)),
     }
 }
 
@@ -365,10 +377,11 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
         arch.lfh_total_size_of(idx)?;
         selected.push(arch.entries()[idx].clone());
     }
-    // Grab the disk count off `arch` before dropping so workers below
-    // can skip an extra EOCD scan — the Archive we already opened knows
-    // exactly how many disks are in play.
-    let disk_count = arch.disk_count();
+    // Build a worker-side source hint from `arch` before dropping it —
+    // disk count for local archives, total byte length for HTTP/S3.
+    // Workers then skip their EOCD scan (local) or length-probe
+    // HEAD/Range-0-0 round-trip (remote).
+    let worker_hint = hint_from_archive(&opts.archive, &arch);
     drop(arch);
     p("lfh_probe_phase_A", t);
 
@@ -426,21 +439,6 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     // the main thread avoids all that.
     let default_mode = created_file_default_mode();
 
-    // Translate the disk count from `open_archive` into a worker-side
-    // layout hint. Local-path workers take this hint and collapse to a
-    // single `File::open`; remote (http/s3) workers ignore it. Saves a
-    // second EOCD tail-scan on the main thread vs probing the layout
-    // independently.
-    let layout_hint = if spec.starts_with("http://")
-        || spec.starts_with("https://")
-        || spec.starts_with("s3://")
-    {
-        None
-    } else if disk_count >= 2 {
-        Some(LocalLayout::MultiDisk(disk_count))
-    } else {
-        Some(LocalLayout::SingleDisk)
-    };
 
     let t_fanout = std::time::Instant::now();
     std::thread::scope(|scope| -> Result<()> {
@@ -452,7 +450,7 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
             let spec = spec.clone();
             let extracted = &extracted;
             let handle = scope.spawn(move || -> Result<()> {
-                let mut source = open_source_for_with_hint(&spec, layout_hint)
+                let mut source = open_source_for_with_hint(&spec, worker_hint)
                     .with_context(|| format!("open worker source for {}", spec))?;
                 while let Ok((re, dest)) = rx.recv() {
                     let write_result = (|| -> Result<()> {

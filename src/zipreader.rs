@@ -99,6 +99,12 @@ pub struct Archive {
     /// Archive-level comment lifted from the EOCD trailer. Decoded as
     /// CP437 (ZIP's default), which passes modern UTF-8 through unchanged.
     archive_comment: String,
+    /// Total number of physical disks in the archive. 1 for every
+    /// single-stream archive; `n ≥ 2` for a multi-disk spanned archive
+    /// stitched via `MultiDiskSource`. Callers that want to spin up
+    /// parallel readers against the same archive can use this instead
+    /// of re-probing the EOCD themselves.
+    disk_count: usize,
 }
 
 impl Archive {
@@ -107,28 +113,27 @@ impl Archive {
     /// stitches sibling `.z01`..`.z(N-1)` disks into one concatenated
     /// source. The caller never needs to know how many disks there are.
     pub fn open(path: &Path) -> Result<Self> {
-        // Peek the probe disk's EOCD once to decide single vs multi.
-        let mut probe = File::open(path)
+        // Open once, probe the EOCD, and continue parsing from the
+        // same handle on the common single-disk path — no second open,
+        // no second tail-scan. Only the multi-disk branch has to drop
+        // the probe and rebuild the source as a `MultiDiskSource`.
+        let mut file = File::open(path)
             .with_context(|| format!("open {}", path.display()))?;
-        let probe_size = probe
+        let file_size = file
             .seek(SeekFrom::End(0))
-            .context("seek to end of archive probe")?;
-        if probe_size < EOCD_MIN_SIZE {
-            bail!("archive is too small to be a ZIP ({} bytes)", probe_size);
+            .context("seek to end of archive")?;
+        if file_size < EOCD_MIN_SIZE {
+            bail!("archive is too small to be a ZIP ({} bytes)", file_size);
         }
-        let (_eocd_pos, eocd) = find_eocd(&mut probe, probe_size)
+        let (eocd_pos, eocd) = find_eocd(&mut file, file_size)
             .with_context(|| format!("find EOCD on {}", path.display()))?;
-        drop(probe);
 
         if eocd.this_disk == 0 && eocd.cd_disk == 0 {
-            // Single-disk — standard path.
-            let file = File::open(path)
-                .with_context(|| format!("re-open {}", path.display()))?;
-            return Self::open_source(Box::new(file))
+            return Self::finish_parse(Box::new(file), file_size, eocd_pos, eocd)
                 .with_context(|| format!("parse {}", path.display()));
         }
 
-        // Multi-disk.
+        drop(file);
         let total_disks = (eocd.this_disk as usize) + 1;
         let md = crate::sources::multidisk::MultiDiskSource::open(path, total_disks)
             .with_context(|| format!("open multi-disk archive {}", path.display()))?;
@@ -161,6 +166,21 @@ impl Archive {
             );
         }
 
+        Self::finish_parse(source, file_size, eocd_pos, eocd)
+    }
+
+    /// Shared tail of `open` and `open_source`: given a source whose EOCD
+    /// has already been located (same seek position on the probe caller),
+    /// read the CDR, parse every entry, and assemble the `Archive`. Keeps
+    /// the probe out of `open`'s hot path — the local single-disk case
+    /// now opens the file exactly once. Only used for single-disk; the
+    /// multi-disk branch flows through `open_source_multidisk`.
+    fn finish_parse(
+        mut source: Box<dyn ReadSeek>,
+        file_size: u64,
+        eocd_pos: u64,
+        eocd: Eocd,
+    ) -> Result<Self> {
         let (entry_count, cd_size, cd_offset) = if eocd.needs_zip64() {
             let z64 = find_eocd64(&mut *source, eocd_pos)
                 .context("archive looks like ZIP64 but no EOCD64 could be found")?;
@@ -194,6 +214,7 @@ impl Archive {
             cd_size,
             tail_size,
             archive_comment,
+            disk_count: 1,
         })
     }
 
@@ -277,6 +298,7 @@ impl Archive {
 
         let tail_size = file_size - cd_offset;
         let archive_comment = decode_name(&eocd.comment_bytes, 0);
+        let disk_count = disk_starts.len();
         Ok(Self {
             source,
             entries,
@@ -285,7 +307,16 @@ impl Archive {
             cd_size,
             tail_size,
             archive_comment,
+            disk_count,
         })
+    }
+
+    /// Number of physical disks this archive is spanned across. 1 for a
+    /// standard single-file ZIP; `n ≥ 2` only for multi-disk archives
+    /// opened through `Archive::open`. Lets extract/grep skip a
+    /// redundant EOCD probe when fanning out worker sources.
+    pub fn disk_count(&self) -> usize {
+        self.disk_count
     }
 
     pub fn entries(&self) -> &[ReadEntry] {

@@ -575,3 +575,157 @@ fn mount_write_multiple_edits_in_one_session() {
     assert_eq!(fs::read(out_dir.join("corpus/a.txt")).unwrap(), b"a is replaced\n");
     assert!(!out_dir.join("corpus/nested/c.txt").exists());
 }
+
+// ── H2 follow-ups (chmod / utime / rename) ────────────────────────────────
+
+#[test]
+fn mount_write_chmod_persists_on_commit() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    // chmod an existing entry to 0o700.
+    fs::set_permissions(mp.join("corpus/a.txt"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    drop_mount_and_settle(guard);
+
+    let out_dir = tmp.path().join("extracted");
+    fs::create_dir_all(&out_dir).unwrap();
+    Command::new(tzip_bin())
+        .args(["x", archive.to_str().unwrap(), "--to", out_dir.to_str().unwrap(), "-q"])
+        .status()
+        .unwrap();
+    let got_mode = fs::metadata(out_dir.join("corpus/a.txt"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(got_mode, 0o700, "expected 0o700 after mount+chmod+commit+extract, got {:o}", got_mode);
+}
+
+#[test]
+fn mount_write_utime_persists_on_commit() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    // Set mtime to 2000-01-01 00:00:00 UTC = 946684800. ZIP's DOS time
+    // resolution is 2 seconds, so pick an even second.
+    let target_secs: i64 = 946_684_800;
+    let target = UNIX_EPOCH + std::time::Duration::from_secs(target_secs as u64);
+    // utimensat via filetime would be nicer, but we can shell out to touch.
+    let st = Command::new("touch")
+        .args(["-d", "2000-01-01 00:00:00 UTC"])
+        .arg(mp.join("corpus/a.txt"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let _ = target;
+
+    drop_mount_and_settle(guard);
+
+    let out_dir = tmp.path().join("extracted");
+    fs::create_dir_all(&out_dir).unwrap();
+    Command::new(tzip_bin())
+        .args(["x", archive.to_str().unwrap(), "--to", out_dir.to_str().unwrap(), "-q"])
+        .status()
+        .unwrap();
+    let got_mtime = fs::metadata(out_dir.join("corpus/a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let got_secs = got_mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Allow +/- 2 seconds for DOS time granularity.
+    assert!(
+        (got_secs - target_secs).abs() <= 2,
+        "mtime round-trip off: got {got_secs}, want ~{target_secs}"
+    );
+}
+
+#[test]
+fn mount_write_rename_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    // Rename a.txt → renamed.txt in the same directory.
+    fs::rename(mp.join("corpus/a.txt"), mp.join("corpus/renamed.txt")).unwrap();
+    assert!(!mp.join("corpus/a.txt").exists());
+    assert!(mp.join("corpus/renamed.txt").exists());
+
+    drop_mount_and_settle(guard);
+
+    let names = ls_entries(&archive);
+    assert!(!names.iter().any(|n| n == "corpus/a.txt"), "a.txt still present: {names:?}");
+    assert!(names.iter().any(|n| n == "corpus/renamed.txt"), "renamed.txt missing: {names:?}");
+
+    let out_dir = tmp.path().join("extracted");
+    fs::create_dir_all(&out_dir).unwrap();
+    Command::new(tzip_bin())
+        .args(["x", archive.to_str().unwrap(), "--to", out_dir.to_str().unwrap(), "-q"])
+        .status()
+        .unwrap();
+    assert_eq!(fs::read(out_dir.join("corpus/renamed.txt")).unwrap(), b"hello a\n");
+}
+
+#[test]
+fn mount_write_rename_across_directories() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    // Move corpus/a.txt → corpus/nested/a.txt.
+    fs::rename(mp.join("corpus/a.txt"), mp.join("corpus/nested/a.txt")).unwrap();
+
+    drop_mount_and_settle(guard);
+
+    let names = ls_entries(&archive);
+    assert!(!names.iter().any(|n| n == "corpus/a.txt"));
+    assert!(names.iter().any(|n| n == "corpus/nested/a.txt"));
+}
+
+#[test]
+fn mount_write_rename_directory_subtree() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip_create(tmp.path(), &["create", "out.zip", "corpus", "-q"]);
+    let archive = tmp.path().join("out.zip");
+
+    let mp = tmp.path().join("mnt");
+    let guard = mount(archive.to_str().unwrap(), &mp, &["--write"]);
+
+    // Rename corpus/nested → corpus/renamed. Should move c.txt and
+    // deep/d.txt along with the directory.
+    fs::rename(mp.join("corpus/nested"), mp.join("corpus/renamed")).unwrap();
+
+    drop_mount_and_settle(guard);
+
+    let names = ls_entries(&archive);
+    assert!(!names.iter().any(|n| n.starts_with("corpus/nested/")),
+            "nested/ not fully renamed: {names:?}");
+    assert!(names.iter().any(|n| n == "corpus/renamed/c.txt"),
+            "renamed/c.txt missing: {names:?}");
+    assert!(names.iter().any(|n| n == "corpus/renamed/deep/d.txt"),
+            "renamed/deep/d.txt missing: {names:?}");
+}

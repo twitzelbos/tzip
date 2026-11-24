@@ -732,6 +732,7 @@ impl RawApfsSource {
                 mtime: (((1 << 9) | (1 << 5)) as u16, 0),
                 dirfd: None,
                 basename: None,
+                external_attr: 0,
             });
             count.fetch_add(1, AtomicOrdering::Relaxed);
             Ok(())
@@ -839,6 +840,7 @@ impl RawApfsSource {
                     mtime: dos_epoch,
                     dirfd: None,
                     basename: None,
+                    external_attr: 0,
                 })
                 .is_err()
             {
@@ -1255,6 +1257,7 @@ impl RawApfsSource {
                             mtime: (0, 0),
                             dirfd: None,
                             basename: None,
+                            external_attr: 0,
                         },
                     );
                     slot.sent = true;
@@ -1296,6 +1299,7 @@ impl RawApfsSource {
                         mtime: (0, 0),
                         dirfd: None,
                         basename: None,
+                        external_attr: 0,
                     },
                 );
                 slot.sent = true;
@@ -1333,6 +1337,7 @@ impl RawApfsSource {
                             mtime: (0, 0),
                             dirfd: None,
                             basename: None,
+                            external_attr: 0,
                         },
                     );
                     slot.sent = true;

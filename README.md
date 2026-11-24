@@ -770,10 +770,16 @@ Semantics (same on both platforms):
 - **A crash before unmount loses the pending changes** but never
   corrupts the archive — the original is only overwritten by a
   fully-formed replacement.
-- **Not supported yet in this cut**: rename, chmod/chown, setting
-  explicit mtime, symbolic links, hard links. `touch`, `cp -p`,
-  and `install -m` won't error on either platform (the setattr
-  calls accept the metadata silently) but the values don't persist.
+- **Supported ops**: create, write, unlink, mkdir, rmdir, truncate,
+  **rename** (files, dirs including whole-subtree moves, cross-
+  directory), **chmod** (persisted via `external_attr`), and
+  **setting mtime** (persisted via DOS date/time). `touch`,
+  `cp -p`, `install -m`, and `mv` all do the right thing and
+  round-trip through commit.
+- **Still not supported**: chown (UID/GID — ZIP has extra fields
+  for this but tzip ignores them for now), symbolic links, hard
+  links. `chown` is accepted silently so `cp -p` doesn't error,
+  but the ownership change doesn't persist.
 - **Local archives only.** `--write` on an `http://`, `https://`,
   or `s3://` archive is ignored and the mount stays read-only
   (noted in the mount-startup banner — FSKit also fails loudly at

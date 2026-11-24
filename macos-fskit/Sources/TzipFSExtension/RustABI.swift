@@ -153,6 +153,31 @@ func tzip_truncate(
     _ new_size: UInt64
 ) -> Int32
 
+@_silgen_name("tzip_chmod")
+func tzip_chmod(
+    _ handle: TzipVfsHandle,
+    _ ino: UInt64,
+    _ mode: UInt32
+) -> Int32
+
+@_silgen_name("tzip_set_mtime")
+func tzip_set_mtime(
+    _ handle: TzipVfsHandle,
+    _ ino: UInt64,
+    _ mtime_unix: Int64
+) -> Int32
+
+@_silgen_name("tzip_rename")
+func tzip_rename(
+    _ handle: TzipVfsHandle,
+    _ src_parent_ino: UInt64,
+    _ src_name: UnsafePointer<UInt8>,
+    _ src_name_len: Int,
+    _ dst_parent_ino: UInt64,
+    _ dst_name: UnsafePointer<UInt8>,
+    _ dst_name_len: Int
+) -> Int32
+
 @_silgen_name("tzip_commit")
 func tzip_commit(
     _ handle: TzipVfsHandle,

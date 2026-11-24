@@ -49,6 +49,10 @@ pub struct EncodedEntry {
     pub version_needed: u16,
     /// DOS (date, time) tuple
     pub mtime: (u16, u16),
+    /// External file attributes. High 16 bits are the Unix mode bits
+    /// (type + permission). Zero means "use the writer's default"
+    /// (0o100644 for files, 0o040755 for dirs — picked below).
+    pub external_attr: u32,
 }
 
 pub struct ZipWriter<W: Write + Seek> {
@@ -69,6 +73,7 @@ struct CentralEntry {
     uncomp_size: u64,
     lfh_offset: u64,
     mtime: (u16, u16),
+    external_attr: u32,
 }
 
 impl<W: Write + Seek> ZipWriter<W> {
@@ -108,6 +113,8 @@ impl<W: Write + Seek> ZipWriter<W> {
             uncomp_size: re.uncomp_size,
             lfh_offset,
             mtime: re.mtime,
+            // Preserve the on-disk external_attr for byte-copy carries.
+            external_attr: re.external_attr,
         });
     }
 
@@ -219,6 +226,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             uncomp_size,
             lfh_offset,
             mtime: e.mtime,
+            external_attr: e.external_attr,
         });
         Ok(())
     }
@@ -273,8 +281,17 @@ impl<W: Write + Seek> ZipWriter<W> {
             cdr.write_u16::<LittleEndian>(0)?; // file comment length
             cdr.write_u16::<LittleEndian>(0)?; // disk #
             cdr.write_u16::<LittleEndian>(0)?; // internal attr
-            // external attr: high 16 bits = Unix st_mode (0o100644 = regular file rw-r--r--)
-            cdr.write_u32::<LittleEndian>(0o100644 << 16)?;
+            // external attr: high 16 bits = Unix st_mode. Prefer the
+            // entry's own value (preserves source-file modes and chmods
+            // from writable mounts); fall back to the legacy default
+            // 0o100644 for callers that haven't plumbed the field
+            // through yet.
+            let ext_attr = if e.external_attr != 0 {
+                e.external_attr
+            } else {
+                0o100644u32 << 16
+            };
+            cdr.write_u32::<LittleEndian>(ext_attr)?;
             if needs_z64_offset {
                 cdr.write_u32::<LittleEndian>(0xFFFF_FFFF)?;
             } else {

@@ -201,12 +201,27 @@ final class TzipFSVolume: FSVolume,
             reply(nil, posixError(EINVAL))
             return
         }
-        // Only the size field drives a real change — truncate. chmod /
-        // chown / timestamp changes are accepted silently to keep
-        // `touch`, `cp -p`, and `install -m` from erroring; they just
-        // don't persist (the writer emits a fixed mode and now() mtime).
+        // Persist size (truncate), mode (chmod), and modify time.
+        // UID / GID and ctime are accepted silently (no persistence
+        // in this cut) so tools that set them don't error.
         if newAttributes.isValid(.size) {
             let rc = tzip_truncate(handle, it.ino, newAttributes.size)
+            if rc != 0 {
+                reply(nil, posixError(errnoFromTzipCode(rc)))
+                return
+            }
+        }
+        if newAttributes.isValid(.mode) {
+            let rc = tzip_chmod(handle, it.ino, newAttributes.mode)
+            if rc != 0 {
+                reply(nil, posixError(errnoFromTzipCode(rc)))
+                return
+            }
+        }
+        if newAttributes.isValid(.modifyTime) {
+            let ts = newAttributes.modifyTime
+            let secs = Int64(ts.tv_sec)
+            let rc = tzip_set_mtime(handle, it.ino, secs)
             if rc != 0 {
                 reply(nil, posixError(errnoFromTzipCode(rc)))
                 return
@@ -281,9 +296,39 @@ final class TzipFSVolume: FSVolume,
                     inDirectory destinationDirectory: FSItem,
                     overItem existingItem: FSItem?,
                     replyHandler reply: @escaping (FSFileName?, Error?) -> Void) {
-        // Deferred: rename needs VFS-level support (not yet added to
-        // either Linux or macOS write paths). Matches the Linux cut.
-        reply(nil, posixError(EROFS))
+        guard writable else {
+            reply(nil, posixError(EROFS))
+            return
+        }
+        guard let srcDir = sourceDirectory as? TzipFSItem,
+              let dstDir = destinationDirectory as? TzipFSItem else {
+            reply(nil, posixError(EINVAL))
+            return
+        }
+        // Overwrite-on-rename isn't supported in this cut (matches the
+        // Linux FUSE3 side). Surface EEXIST if the caller asked for it.
+        if existingItem != nil {
+            reply(nil, posixError(EEXIST))
+            return
+        }
+        let srcData = sourceName.data
+        let dstData = destinationName.data
+        let rc: Int32 = srcData.withUnsafeBytes { srcBuf in
+            dstData.withUnsafeBytes { dstBuf in
+                guard let sp = srcBuf.bindMemory(to: UInt8.self).baseAddress,
+                      let dp = dstBuf.bindMemory(to: UInt8.self).baseAddress else {
+                    return Int32(EINVAL)
+                }
+                return tzip_rename(handle,
+                                   srcDir.ino, sp, srcData.count,
+                                   dstDir.ino, dp, dstData.count)
+            }
+        }
+        if rc != 0 {
+            reply(nil, posixError(errnoFromTzipCode(rc)))
+            return
+        }
+        reply(destinationName, nil)
     }
 
     func removeItem(_ item: FSItem,

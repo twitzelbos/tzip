@@ -69,6 +69,7 @@ pub fn walk_stream_bulk(
                 continue;
             }
             let mtime = dos_time_from_meta(&meta);
+            let ext_attr = external_attr_from_meta_bulk(&meta);
             let item = WorkItem {
                 path: root_canon.clone(),
                 name_in_archive: name,
@@ -76,6 +77,7 @@ pub fn walk_stream_bulk(
                 mtime,
                 dirfd: None,
                 basename: None,
+                external_attr: ext_attr,
             };
             if tx.send(item).is_err() {
                 return Ok(());
@@ -210,6 +212,10 @@ fn walk_recursive(
                     }
                     let full_path = dir.join(&name);
                     let mtime = dos_time_from_unix(mtime_sec);
+                    // bulk_walker's getdirentries fast path only hands
+                    // us (size, mtime); we don't have the mode. Leave
+                    // external_attr = 0 so the writer's legacy default
+                    // kicks in (same behaviour as pre-H2-follow-ups).
                     let item = WorkItem {
                         path: full_path,
                         name_in_archive: archive_name,
@@ -217,6 +223,7 @@ fn walk_recursive(
                         mtime,
                         dirfd: Some(Arc::clone(&dirfd)),
                         basename: Some(name),
+                        external_attr: 0,
                     };
                     if tx.send(item).is_err() {
                         return Ok(());
@@ -278,6 +285,20 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
     }
     recur(pattern.as_bytes(), text.as_bytes())
+}
+
+/// Build ZIP `external_attr` from `std::fs::Metadata` on a Unix host.
+/// Called from the single-root short path only — the fast-path getdirentries
+/// walk doesn't have Metadata on hand and so leaves external_attr = 0.
+#[cfg(unix)]
+fn external_attr_from_meta_bulk(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    (meta.mode() & 0o177777) << 16
+}
+
+#[cfg(not(unix))]
+fn external_attr_from_meta_bulk(_meta: &std::fs::Metadata) -> u32 {
+    0
 }
 
 fn dos_time_from_meta(meta: &std::fs::Metadata) -> (u16, u16) {

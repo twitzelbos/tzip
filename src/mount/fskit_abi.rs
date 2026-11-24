@@ -475,6 +475,67 @@ pub unsafe extern "C" fn tzip_truncate(
     }
 }
 
+/// Set Unix mode bits on an inode. Persisted into the archive's
+/// `external_attr` field on commit.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_chmod(
+    handle: TzipVfsHandle,
+    ino: u64,
+    mode: u32,
+) -> c_int {
+    if handle.inner.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    match vfs.chmod(ino, mode) {
+        Ok(()) => TZIP_OK,
+        Err(e) => map_err_to_errno(&e),
+    }
+}
+
+/// Set the last-modified timestamp on an inode. Persisted into DOS
+/// date/time on commit.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_set_mtime(
+    handle: TzipVfsHandle,
+    ino: u64,
+    mtime_unix: i64,
+) -> c_int {
+    if handle.inner.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    match vfs.set_mtime(ino, mtime_unix) {
+        Ok(()) => TZIP_OK,
+        Err(e) => map_err_to_errno(&e),
+    }
+}
+
+/// Rename `src_name` under `src_parent_ino` to `dst_name` under
+/// `dst_parent_ino`. Returns -EEXIST if the destination exists; files
+/// CoW into the dirty journal on rename.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_rename(
+    handle: TzipVfsHandle,
+    src_parent_ino: u64,
+    src_name: *const u8,
+    src_name_len: usize,
+    dst_parent_ino: u64,
+    dst_name: *const u8,
+    dst_name_len: usize,
+) -> c_int {
+    if handle.inner.is_null() || src_name.is_null() || dst_name.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    let src = std::slice::from_raw_parts(src_name, src_name_len);
+    let dst = std::slice::from_raw_parts(dst_name, dst_name_len);
+    match vfs.rename(src_parent_ino, src, dst_parent_ino, dst) {
+        Ok(()) => TZIP_OK,
+        Err(e) => map_err_to_errno(&e),
+    }
+}
+
 /// Flush pending writes to the on-disk archive via the update engine.
 /// Writes the number of new/changed entries to `*dirty_out` and the
 /// number of deletions to `*tombstoned_out` on success. Safe to call

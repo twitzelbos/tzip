@@ -91,6 +91,87 @@ pub fn compress(
         Method::Lzma => lzma_for_zip(input, level).map(|d| CompressOut { data: d, gp_bit1: true }),
         Method::Xz => xz(input, level).map(|d| CompressOut { data: d, gp_bit1: false }),
         Method::Zstd => zstd(input, level).map(|d| CompressOut { data: d, gp_bit1: false }),
+        Method::Ppmd => ppmd(input, level).map(|d| CompressOut { data: d, gp_bit1: false }),
+    }
+}
+
+/// PPMd Ir1 (ZIP method 98) — encoder via `ppmd-rust`. Produces a
+/// 2-byte little-endian ZIP PPMd header followed by the raw PPMd8
+/// range-coded stream.
+///
+/// ZIP PPMd parameter header layout (per PKWARE APPNOTE §4.4.5.12,
+/// matches `compcol::ppmd::ZipDecoder`):
+///
+/// ```text
+/// bits 0..=3   model order - 1     (order 2..=16)
+/// bits 4..=11  memory size MB - 1  (1..=256 MB)
+/// bits 12..=15 restore method      (0 restart / 1 cut-off)
+/// ```
+///
+/// Level tiers trade model arena (and therefore compression time +
+/// RAM per concurrent entry) for ratio. Defaults land on a strong-but-
+/// sane middle; level 9 maxes the arena out to 192 MB and order to 16.
+fn ppmd(input: &[u8], level: u32) -> Result<Vec<u8>> {
+    use ppmd_rust::{Ppmd8Encoder, RestoreMethod};
+
+    let (order, mem_mb) = ppmd_params_for_level(level);
+    let restore = RestoreMethod::Restart;
+
+    // Pack the 2-byte header. The decoder stores `order - 1` and
+    // `mem_mb - 1`, so a declared order of 16 → nibble 15, max mem
+    // 256 → byte 255.
+    let header: u16 = ((order - 1) as u16 & 0xF)
+        | (((mem_mb - 1) as u16 & 0xFF) << 4)
+        | ((restore_code(restore) as u16 & 0xF) << 12);
+    let mut out: Vec<u8> = Vec::with_capacity(16 + input.len() / 4);
+    out.extend_from_slice(&header.to_le_bytes());
+
+    // Compress. `finish(true)` writes the PPMd end marker. ZIP carries
+    // uncomp_size out of band, so a decoder *could* stop on size
+    // alone — but 7-Zip's PPMd decoder validates the stream to its
+    // end and errors without the marker, so we always emit it. Costs
+    // a handful of bytes per entry.
+    let enc = Ppmd8Encoder::new(out, order, (mem_mb as u32) * 1024 * 1024, restore)
+        .map_err(|e| anyhow!("ppmd encoder init (order={order}, mem={mem_mb}MB): {e:?}"))?;
+    let mut enc = enc;
+    use std::io::Write as _;
+    enc.write_all(input)
+        .map_err(|e| anyhow!("ppmd write: {e:?}"))?;
+    let finished = enc
+        .finish(true)
+        .map_err(|e| anyhow!("ppmd finish: {e:?}"))?;
+    Ok(finished)
+}
+
+fn restore_code(m: ppmd_rust::RestoreMethod) -> u8 {
+    use ppmd_rust::RestoreMethod::*;
+    match m {
+        Restart => 0,
+        CutOff => 1,
+        // ZIP PPMd per APPNOTE + 7-Zip rejects the freeze variant
+        // ("Unsupported" in both compcol's decoder and 7-Zip's).
+        // We never request it via `ppmd_params_for_level`, so this
+        // arm is defensive.
+        _ => 1,
+    }
+}
+
+/// Map a tzip `--level` (1..=9) to `(model_order, memory_mb)`.
+/// Defaults (level 6) pick a strong-but-modest tier: good ratio on
+/// text, ~96 MB arena per concurrent entry. Level 9 maxes out the
+/// ZIP format's arena cap (256 MB) and order (16).
+fn ppmd_params_for_level(level: u32) -> (u32, u32) {
+    let l = level.clamp(1, 9);
+    match l {
+        1 => (4, 4),
+        2 => (5, 8),
+        3 => (6, 16),
+        4 => (8, 32),
+        5 => (10, 48),
+        6 => (12, 96),
+        7 => (14, 128),
+        8 => (15, 192),
+        _ => (16, 192),
     }
 }
 
@@ -170,6 +251,7 @@ pub fn method_id(method: Method) -> u16 {
         Method::Lzma => 14,
         Method::Zstd => 93,
         Method::Xz => 95,
+        Method::Ppmd => 98,
     }
 }
 
@@ -181,6 +263,8 @@ pub fn version_needed(method: Method) -> u16 {
         Method::Lzma => 63,
         Method::Zstd => 63,
         Method::Xz => 63,
+        // APPNOTE §4.4.3.2: method 98 (PPMd) needs v6.3 to extract.
+        Method::Ppmd => 63,
     }
 }
 

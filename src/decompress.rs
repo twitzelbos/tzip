@@ -78,6 +78,7 @@ impl ReadMethod {
             Method::Lzma => ReadMethod::Lzma,
             Method::Xz => ReadMethod::Xz,
             Method::Zstd => ReadMethod::Zstd,
+            Method::Ppmd => ReadMethod::Ppmd,
         }
     }
 }

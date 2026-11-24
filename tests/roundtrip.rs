@@ -227,6 +227,75 @@ fn roundtrip_zstd() {
 }
 
 #[test]
+fn roundtrip_ppmd_via_7z() {
+    // PPMd output must be readable by the ecosystem's reference
+    // decoder. 7-Zip's PPMd is strict about the end marker — if
+    // compress::ppmd ever regresses to `finish(false)` this test
+    // surfaces it.
+    roundtrip_via_7z("ppmd");
+}
+
+#[test]
+fn roundtrip_ppmd_self_extract() {
+    // Belt-and-braces: even without 7-Zip on PATH, make sure tzip
+    // can decompress its own PPMd output (we read via compcol,
+    // write via ppmd-rust — two different crates meeting at the
+    // ZIP method 98 wire format).
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("corpus");
+    make_corpus(&src);
+    let archive = tmp.path().join("ppmd.zip");
+    run_tzip(
+        tmp.path(),
+        &["create", "ppmd.zip", "corpus", "-m", "ppmd", "-q"],
+    );
+    let out = tmp.path().join("extracted");
+    fs::create_dir(&out).unwrap();
+    let st = Command::new(tzip_bin())
+        .args(["x", archive.to_str().unwrap(), "--to", out.to_str().unwrap(), "-q"])
+        .status()
+        .expect("spawn tzip x");
+    assert!(st.success(), "tzip x of PPMd archive failed");
+    diff_dirs(&src, &out.join("corpus"));
+}
+
+#[test]
+fn roundtrip_ppmd_level_tiers() {
+    // Cover the full --level range. Smaller input than make_corpus's
+    // random blob to keep runtime bounded on the higher orders.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("corpus");
+    fs::create_dir_all(&src).unwrap();
+    let text = "the quick brown fox jumps over the lazy dog\n"
+        .repeat(1000);
+    fs::write(src.join("lorem.txt"), text.as_bytes()).unwrap();
+
+    for level in [1u32, 3, 6, 9] {
+        let archive = tmp.path().join(format!("level-{level}.zip"));
+        run_tzip(
+            tmp.path(),
+            &[
+                "create",
+                archive.file_name().unwrap().to_str().unwrap(),
+                "corpus",
+                "-m", "ppmd",
+                "-x", &level.to_string(),
+                "-q",
+            ],
+        );
+        let out = tmp.path().join(format!("x-{level}"));
+        fs::create_dir(&out).unwrap();
+        let st = Command::new(tzip_bin())
+            .args(["x", archive.to_str().unwrap(), "--to", out.to_str().unwrap(), "-q"])
+            .status()
+            .expect("spawn tzip x");
+        assert!(st.success(), "level {level}: tzip x failed");
+        let got = fs::read(out.join("corpus/lorem.txt")).unwrap();
+        assert_eq!(got, text.as_bytes(), "level {level} round-trip mismatch");
+    }
+}
+
+#[test]
 fn roundtrip_seven_zip_solid() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("corpus");

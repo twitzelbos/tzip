@@ -98,6 +98,14 @@ pub enum Cmd {
     /// speed, output size, and compression ratio. External tools are
     /// detected on PATH and skipped when missing.
     Bench(BenchArgs),
+
+    /// Body-free CDR comparison of two archives. Reports entries
+    /// added in b, removed from a, and changed (same name, different
+    /// crc32 or size). Works on local paths, http(s):// URLs, and
+    /// s3://bucket/key URLs. Exit status: 0 = identical, 1 = differ,
+    /// 2 = error.
+    #[command(alias = "d")]
+    Diff(DiffArgs),
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -339,6 +347,38 @@ pub struct FindArgs {
     /// Emit entries as JSON lines instead of the default tabular format.
     #[arg(long, conflicts_with = "names_only")]
     pub json: bool,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DiffArgs {
+    /// Baseline archive. Local path, `http(s)://` URL, or
+    /// `s3://bucket/key.zip` URL.
+    pub a: String,
+    /// Comparison archive. Same source types as `a`.
+    pub b: String,
+
+    /// Only consider entries matching this glob (repeatable).
+    #[arg(long)]
+    pub include: Vec<String>,
+    /// Skip entries matching this glob (repeatable).
+    #[arg(long)]
+    pub exclude: Vec<String>,
+
+    /// Emit one `status entry` per line, nothing else.
+    #[arg(long)]
+    pub names_only: bool,
+    /// Emit entries as JSON lines instead of the default tabular format.
+    #[arg(long, conflicts_with = "names_only")]
+    pub json: bool,
+    /// Also report entries whose only difference is mtime (quiet by
+    /// default — mtime drift is noisy on repackaged archives).
+    #[arg(long)]
+    pub mtime: bool,
 
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -668,6 +708,19 @@ pub struct FindOptions {
 }
 
 #[derive(Clone, Debug)]
+pub struct DiffOptions {
+    pub a: String,
+    pub b: String,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub names_only: bool,
+    pub json: bool,
+    pub mtime: bool,
+    pub quiet: bool,
+    pub verbose: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct BenchOptions {
     pub corpus: Option<PathBuf>,
     pub iterations: usize,
@@ -849,6 +902,22 @@ impl CatArgs {
             quiet: self.quiet,
             verbose: self.verbose,
             op: ReaderOp::Cat { name: self.name },
+        })
+    }
+}
+
+impl DiffArgs {
+    pub fn into_options(self) -> Result<DiffOptions> {
+        Ok(DiffOptions {
+            a: self.a,
+            b: self.b,
+            include: self.include,
+            exclude: self.exclude,
+            names_only: self.names_only,
+            json: self.json,
+            mtime: self.mtime,
+            quiet: self.quiet,
+            verbose: self.verbose,
         })
     }
 }

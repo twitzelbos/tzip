@@ -403,6 +403,38 @@ pub fn probe_total_disks<S: Read + Seek + ?Sized>(file: &mut S, file_size: u64) 
     Ok((eocd.this_disk as usize) + 1)
 }
 
+/// Parse CDR entries directly from an in-memory archive tail
+/// (bytes starting at `cd_offset` — the CDR, then the EOCD, plus any
+/// optional ZIP64 trailer). Used by append-mode update's undo
+/// snapshot, which has the tail in hand already and shouldn't have
+/// to materialise a scratch file on disk, open it, re-scan the EOCD,
+/// and re-parse the CDR just to reconstruct the entry list.
+///
+/// Fails on multi-disk or ZIP64 tails — those paths flow through
+/// the rebuild branch of update, not append.
+pub fn parse_entries_from_tail(tail: &[u8]) -> Result<Vec<ReadEntry>> {
+    use std::io::Cursor;
+    let tail_len = tail.len() as u64;
+    if tail_len < EOCD_MIN_SIZE {
+        bail!("archive tail too small to be a ZIP ({} bytes)", tail_len);
+    }
+    let mut cur = Cursor::new(tail);
+    let (_eocd_pos, eocd) = find_eocd(&mut cur, tail_len).context("find EOCD in tail")?;
+    if eocd.needs_zip64() {
+        bail!("ZIP64 tail parse not supported via parse_entries_from_tail");
+    }
+    if eocd.this_disk != 0 || eocd.cd_disk != 0 {
+        bail!("multi-disk tail parse not supported via parse_entries_from_tail");
+    }
+    // Tail starts at cd_offset in the real archive, so the CDR lives
+    // at [0 .. cd_size] within `tail`.
+    let cd_size = eocd.cd_size as usize;
+    if cd_size > tail.len() {
+        bail!("tail shorter than declared CDR ({} < {})", tail.len(), cd_size);
+    }
+    parse_central_directory(&tail[..cd_size], eocd.entry_count as u64)
+}
+
 // ── EOCD ────────────────────────────────────────────────────────────────────
 
 struct Eocd {

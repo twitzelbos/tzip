@@ -229,6 +229,15 @@ pub struct CreateArgs {
     /// `--write-md5`; both digests land in the same entry.
     #[arg(long)]
     pub write_sha256: bool,
+
+    /// Write a minimal-perfect-hash index over entry names as a
+    /// `.tzip/names.v1` entry at the end of the archive. Lets
+    /// `tzip cat NAME` / `tzip x NAME` / entry-lookup paths run in
+    /// O(1) time regardless of archive size. ~3 bits per entry,
+    /// built in milliseconds per million names. Other tools see it
+    /// as a normal (small) ZIP entry and ignore it.
+    #[arg(long)]
+    pub index_names: bool,
 }
 
 // ── Update ─────────────────────────────────────────────────────────────────
@@ -693,6 +702,9 @@ pub struct Options {
     pub write_md5: bool,
     /// Same as `write_md5` for SHA-256.
     pub write_sha256: bool,
+    /// When set, pipeline writes a `.tzip/names.v1` entry at the end
+    /// of the archive carrying an MPH over all entry names.
+    pub index_names: bool,
 }
 
 /// Which reader op is running and what it needs.
@@ -857,6 +869,7 @@ impl CreateArgs {
             atomic: false,
             write_md5: self.write_md5,
             write_sha256: self.write_sha256,
+            index_names: self.index_names,
         })
     }
 }
@@ -927,6 +940,11 @@ impl UpdateArgs {
             // archive's existing format.
             write_md5: self.write_md5,
             write_sha256: self.write_sha256,
+            // `tzip u` on an archive that already has a `.tzip/names.v1`
+            // index invalidates it (new entries' indices shift). Phase 4
+            // of the roadmap handles segmented index updates; for now
+            // we skip index emission on update.
+            index_names: false,
         })
     }
 }

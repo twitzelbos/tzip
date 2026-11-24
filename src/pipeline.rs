@@ -762,6 +762,11 @@ pub fn run(opts: Options) -> Result<()> {
     profile(profile_on, "setup_until_loop", overall_start);
     let t_mainloop = std::time::Instant::now();
     let mut wrote_files = 0u64;
+    // Track names as entries land so we can build a `.tzip/names.v1`
+    // index entry once encoding finishes, when `--index-names` is on.
+    // Allocated even when the feature isn't requested — the Vec is
+    // empty in that case and the end-of-loop block is skipped.
+    let mut indexed_names: Vec<String> = Vec::new();
     if opts.sort {
         use std::collections::HashMap;
         let mut pending: HashMap<u64, EncodedEntry> = HashMap::new();
@@ -780,6 +785,9 @@ pub fn run(opts: Options) -> Result<()> {
                 if opts.verbose {
                     eprintln!("added {}", e.name);
                 }
+                if opts.index_names {
+                    indexed_names.push(e.name.clone());
+                }
                 zw.write_entry(e)?;
                 progress.inc(plain_size);
                 progress.set_msg(msg);
@@ -795,10 +803,48 @@ pub fn run(opts: Options) -> Result<()> {
             if opts.verbose {
                 eprintln!("added {}", entry.name);
             }
+            if opts.index_names {
+                indexed_names.push(entry.name.clone());
+            }
             zw.write_entry(entry)?;
             progress.inc(plain_size);
             progress.set_msg(msg);
         }
+    }
+
+    // --index-names: emit one synthetic STORE entry after all user
+    // entries carrying the MPH over the names we just wrote. Readers
+    // that know about `.tzip/names.v1` pick it up; readers that don't
+    // see a normal (small) ZIP entry.
+    if opts.index_names && !indexed_names.is_empty() {
+        let payload = crate::nameidx::build(
+            &indexed_names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        )?;
+        let name_idx_entry = crate::zipwriter::EncodedEntry {
+            index: u64::MAX,
+            name: crate::nameidx::INDEX_ENTRY_NAME.to_string(),
+            body: payload,
+            uncompressed_size: 0, // set below
+            crc32: 0,              // set below
+            method_on_wire: 0,     // Store
+            inner_method: 0,
+            encrypted: false,
+            gp_bit1: false,
+            version_needed: 20,
+            mtime: (0, 0),
+            external_attr: 0o100644u32 << 16,
+            md5_digest: None,
+            sha256_digest: None,
+        };
+        // Fix up size / crc for the synthetic entry.
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&name_idx_entry.body);
+        let crc = hasher.finalize();
+        let body_len = name_idx_entry.body.len() as u64;
+        let mut e = name_idx_entry;
+        e.uncompressed_size = body_len;
+        e.crc32 = crc;
+        zw.write_entry(e)?;
     }
 
     profile(profile_on, "main_write_loop", t_mainloop);

@@ -123,6 +123,7 @@ pub(crate) fn encode_item(
     single_file_parallel: bool,
     want_md5: bool,
     want_sha256: bool,
+    index_terms_match: bool,
 ) -> Result<EncodedEntry> {
     encode_one(
         raw,
@@ -133,6 +134,7 @@ pub(crate) fn encode_item(
         single_file_parallel,
         want_md5,
         want_sha256,
+        index_terms_match,
     )
 }
 
@@ -704,6 +706,11 @@ pub fn run(opts: Options) -> Result<()> {
     let level = opts.level;
     let want_md5 = opts.write_md5;
     let want_sha256 = opts.write_sha256;
+    // Share `--index-terms` globs across worker threads. Compiled once
+    // here; each worker checks per-entry whether the name matches any
+    // of them and tokenises the plaintext when it does.
+    let index_terms_globs: std::sync::Arc<Vec<String>> =
+        std::sync::Arc::new(opts.index_terms.clone());
     // Auto parallel-block DEFLATE when a single large file dominates the
     // workload. In streaming mode we don't know the count up front, so we
     // gate on the batched total. If unset (streaming), the CPU worker will
@@ -717,6 +724,7 @@ pub fn run(opts: Options) -> Result<()> {
         let enc_tx = enc_tx.clone();
         let password = password.clone();
         let tui_handle = tui_handle.clone();
+        let index_terms_globs = std::sync::Arc::clone(&index_terms_globs);
         cpu_handles.push(thread::spawn(move || -> Result<()> {
             let mut scratch = Scratch::new();
             while let Ok(raw) = raw_rx.recv() {
@@ -725,6 +733,10 @@ pub fn run(opts: Options) -> Result<()> {
                     t.worker_started(worker_id, raw.item.name_in_archive.clone(), raw_len as u64);
                 }
                 let started = std::time::Instant::now();
+                let index_terms_match = !index_terms_globs.is_empty()
+                    && index_terms_globs
+                        .iter()
+                        .any(|g| crate::walker::is_excluded(&raw.item.name_in_archive, std::slice::from_ref(g)));
                 let entry = encode_one(
                     raw,
                     method,
@@ -734,6 +746,7 @@ pub fn run(opts: Options) -> Result<()> {
                     single_file_parallel,
                     want_md5,
                     want_sha256,
+                    index_terms_match,
                 )?;
                 if let Some(t) = &tui_handle {
                     let elapsed = started.elapsed().as_secs_f64();
@@ -767,26 +780,32 @@ pub fn run(opts: Options) -> Result<()> {
     // Allocated even when the feature isn't requested — the Vec is
     // empty in that case and the end-of-loop block is skipped.
     let mut indexed_names: Vec<String> = Vec::new();
+    // Analogue for the Phase 2 `--index-terms` term index. Workers
+    // tokenised matching entries and attached the tokens to each
+    // `EncodedEntry.index_terms`; here we drain them into the
+    // builder with the final CDR-order entry index as the posting
+    // identifier.
+    let mut term_builder = crate::termidx::TermIndexBuilder::new();
     if opts.sort {
         use std::collections::HashMap;
         let mut pending: HashMap<u64, EncodedEntry> = HashMap::new();
         let mut next_idx: u64 = 0;
         while let Ok(entry) = enc_rx.recv() {
             pending.insert(entry.index, entry);
-            while let Some(e) = pending.remove(&next_idx) {
+            while let Some(mut e) = pending.remove(&next_idx) {
                 wrote_files += 1;
                 let plain_size = e.uncompressed_size;
                 let total = discovered_files.load(AtomicOrdering::Relaxed).max(wrote_files);
-                // Format the progress label and (optional) verbose
-                // output while we still have a reference into `e`.
-                // `write_entry` then consumes `e`, so a per-entry
-                // `name.clone()` is no longer needed.
                 let msg = format!("{}/{} files — {}", wrote_files, total, e.name);
                 if opts.verbose {
                     eprintln!("added {}", e.name);
                 }
                 if opts.index_names {
                     indexed_names.push(e.name.clone());
+                }
+                if let Some(tokens) = e.index_terms.take() {
+                    let cdr_pos = (wrote_files - 1) as u32;
+                    term_builder.add_prepared(cdr_pos, tokens);
                 }
                 zw.write_entry(e)?;
                 progress.inc(plain_size);
@@ -795,7 +814,7 @@ pub fn run(opts: Options) -> Result<()> {
             }
         }
     } else {
-        while let Ok(entry) = enc_rx.recv() {
+        while let Ok(mut entry) = enc_rx.recv() {
             wrote_files += 1;
             let plain_size = entry.uncompressed_size;
             let total = discovered_files.load(AtomicOrdering::Relaxed).max(wrote_files);
@@ -806,9 +825,47 @@ pub fn run(opts: Options) -> Result<()> {
             if opts.index_names {
                 indexed_names.push(entry.name.clone());
             }
+            if let Some(tokens) = entry.index_terms.take() {
+                let cdr_pos = (wrote_files - 1) as u32;
+                term_builder.add_prepared(cdr_pos, tokens);
+            }
             zw.write_entry(entry)?;
             progress.inc(plain_size);
             progress.set_msg(msg);
+        }
+    }
+
+    // --index-terms: emit the `.tzip/terms.v1` entry if we collected
+    // any tokens. Must happen BEFORE `.tzip/names.v1` so the latter's
+    // MPH covers `.tzip/terms.v1` too (if name-indexing is on).
+    if !opts.index_terms.is_empty() {
+        let payload = term_builder.finish()?;
+        if !payload.is_empty() {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&payload);
+            let crc = hasher.finalize();
+            let body_len = payload.len() as u64;
+            let e = crate::zipwriter::EncodedEntry {
+                index: u64::MAX,
+                name: crate::termidx::INDEX_ENTRY_NAME.to_string(),
+                body: payload,
+                uncompressed_size: body_len,
+                crc32: crc,
+                method_on_wire: 0,
+                inner_method: 0,
+                encrypted: false,
+                gp_bit1: false,
+                version_needed: 20,
+                mtime: (0, 0),
+                external_attr: 0o100644u32 << 16,
+                md5_digest: None,
+                sha256_digest: None,
+                index_terms: None,
+            };
+            if opts.index_names {
+                indexed_names.push(e.name.clone());
+            }
+            zw.write_entry(e)?;
         }
     }
 
@@ -835,6 +892,7 @@ pub fn run(opts: Options) -> Result<()> {
             external_attr: 0o100644u32 << 16,
             md5_digest: None,
             sha256_digest: None,
+            index_terms: None,
         };
         // Fix up size / crc for the synthetic entry.
         let mut hasher = crc32fast::Hasher::new();
@@ -1093,12 +1151,14 @@ fn encode_one(
     single_file_parallel: bool,
     want_md5: bool,
     want_sha256: bool,
+    index_terms_match: bool,
 ) -> Result<EncodedEntry> {
     let RawItem { index, item, bytes } = raw;
     let uncompressed_size = bytes.len() as u64;
 
     // Fused plaintext pass: CRC-32 + optional MD5 + optional SHA-256
-    // in one sweep so each digest is a near-free extension of the
+    // (+ optional term tokenization) in one sweep so each extra
+    // digest or token-collect step is a near-free extension of the
     // CRC pass we're already paying for. `bytes` is already moved
     // out of `raw`; borrow it for each pass.
     let mut crc_h = crc32fast::Hasher::new();
@@ -1119,6 +1179,13 @@ fn encode_one(
         h.update(&bytes[..]);
         let out: [u8; 32] = h.finalize().into();
         Some(out)
+    } else {
+        None
+    };
+    let index_terms: Option<Vec<Vec<u8>>> = if index_terms_match {
+        let mut set = std::collections::HashSet::new();
+        crate::termidx::tokenize(&bytes[..], &mut set);
+        Some(set.into_iter().collect())
     } else {
         None
     };
@@ -1170,6 +1237,7 @@ fn encode_one(
         external_attr: item.external_attr,
         md5_digest,
         sha256_digest,
+        index_terms,
     })
 }
 

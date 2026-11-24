@@ -540,6 +540,7 @@ fn encode_items_into_writer<W: Write + Seek>(
                     single_file_parallel,
                     want_md5,
                     want_sha256,
+                    false, // update mode doesn't index terms (see Phase 4)
                 )?;
                 if enc_tx.send(entry).is_err() {
                     break;
@@ -668,6 +669,7 @@ fn encode_items_to_map(
                     single_file_parallel,
                     want_md5,
                     want_sha256,
+                    false, // update mode doesn't index terms (see Phase 4)
                 )?;
                 if enc_tx.send(entry).is_err() {
                     break;

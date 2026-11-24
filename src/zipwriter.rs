@@ -68,6 +68,13 @@ pub struct EncodedEntry {
     pub md5_digest: Option<[u8; 16]>,
     /// Same as `md5_digest` for SHA-256.
     pub sha256_digest: Option<[u8; 32]>,
+    /// Unique lowercase ASCII tokens from this entry's plaintext,
+    /// collected by the CPU worker when `--index-terms` matched the
+    /// entry name. `None` when term-indexing isn't requested or the
+    /// name didn't match. The main write loop drains these into the
+    /// `TermIndexBuilder` at CDR-emit time so posting-list entry
+    /// indices match the final CDR order.
+    pub index_terms: Option<Vec<Vec<u8>>>,
 }
 
 pub struct ZipWriter<W: Write + Seek> {
@@ -210,6 +217,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             external_attr,
             md5_digest,
             sha256_digest,
+            index_terms: _,
         } = e;
         let name_bytes = name.into_bytes();
         let comp_size = body.len() as u64;

@@ -48,8 +48,13 @@ pub fn mount(opts: MountOptions) -> Result<()> {
         );
     }
 
+    // Canonicalize so the commit path still resolves correctly after
+    // commit() chdirs into its staging tempdir. A relative archive
+    // path (e.g. `tzip mount out.zip --write`) would otherwise look
+    // for the file relative to the staging tempdir on commit.
     let archive_path = if writable {
-        PathBuf::from(&opts.archive_spec)
+        std::fs::canonicalize(&opts.archive_spec)
+            .with_context(|| format!("canonicalize archive path {}", opts.archive_spec))?
     } else {
         PathBuf::new()
     };

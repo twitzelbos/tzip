@@ -602,8 +602,25 @@ impl VirtualFs {
         }
 
         let n_tombstones = tombstones.len();
-        let opts = self.commit_options(&archive_path, staging.path(), tombstones)?;
-        crate::pipeline::run(opts).context("commit via pipeline::run")?;
+
+        // Trick to get the walker's archive-entry naming right: cd into
+        // staging and pass `.` as the input path with basename_only=true.
+        // `archive_prefix_for_root(Path::new("."), true)` returns ""
+        // (file_name of "." is None), and `archive_name` then yields the
+        // relative path verbatim — which is exactly our archive entry
+        // name. Without this, walker prepends the staging dir's
+        // absolute path (sans leading /), so e.g. "corpus/new_file.txt"
+        // would land as "tmp/.tmpXXX/corpus/new_file.txt" in the archive.
+        let original_cwd =
+            std::env::current_dir().context("record cwd for commit chdir")?;
+        std::env::set_current_dir(staging.path()).with_context(|| {
+            format!("chdir into commit staging {}", staging.path().display())
+        })?;
+        let opts = self.commit_options(&archive_path, std::path::Path::new("."), tombstones)?;
+        let run_result = crate::pipeline::run(opts);
+        // Always restore cwd, even on error.
+        let _ = std::env::set_current_dir(&original_cwd);
+        run_result.context("commit via pipeline::run")?;
 
         if self.verbose {
             eprintln!(
@@ -656,7 +673,9 @@ impl VirtualFs {
             apfs_device: None,
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             io_uring: false,
-            basename_only: false,
+            // `true` so `archive_prefix_for_root(".", true)` returns "".
+            // See the chdir comment above for the full story.
+            basename_only: true,
             user_flags: UserSetFlags::default(),
             update: true,
             delete,

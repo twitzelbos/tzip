@@ -23,7 +23,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::sources::ReadSeek;
-use crate::zipwriter::{AES_EXTRA_ID, METHOD_AES, SIG_CDR, SIG_EOCD, SIG_EOCD64, SIG_EOCD64_LOC, SIG_LFH};
+use crate::zipwriter::{
+    AES_EXTRA_ID, METHOD_AES, SIG_CDR, SIG_EOCD, SIG_EOCD64, SIG_EOCD64_LOC, SIG_LFH,
+    TZIP_HASH_ALGO_MD5, TZIP_HASH_ALGO_SHA256, TZIP_HASH_EXTRA_ID,
+};
 
 const EOCD_SCAN_WINDOW: u64 = 64 * 1024;
 const EOCD_MIN_SIZE: u64 = 22;
@@ -70,6 +73,12 @@ pub struct ReadEntry {
     /// first call to `Archive::lfh_total_size_of`, which reads the LFH header
     /// bytes to learn `extra_len` (not derivable from the CDR).
     pub lfh_total_size: u32,
+    /// Plaintext MD5 digest lifted from the tzip-native extra field
+    /// (id = `TZIP_HASH_EXTRA_ID`, algo = 1). `None` when the archive
+    /// wasn't created with `--write-md5`.
+    pub md5_digest: Option<[u8; 16]>,
+    /// Same for SHA-256 (algo = 2).
+    pub sha256_digest: Option<[u8; 32]>,
 }
 
 impl ReadEntry {
@@ -577,9 +586,11 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
         let mut uncomp_size: u64 = uncomp_size_32 as u64;
         let mut lfh_offset: u64 = lfh_offset_32 as u64;
         let mut inner_method = method_on_wire;
+        let mut md5_digest: Option<[u8; 16]> = None;
+        let mut sha256_digest: Option<[u8; 32]> = None;
 
-        // Walk extras: look for ZIP64 (0x0001) and AES (0x9901). Unknown
-        // extras are skipped (we only need to round-trip to re-emit).
+        // Walk extras: ZIP64 (0x0001), AES (0x9901), tzip-hash (0x7A68).
+        // Unknown extras are skipped (we only need to round-trip to re-emit).
         let mut ex = 0usize;
         while ex + 4 <= extra.len() {
             let id = u16::from_le_bytes([extra[ex], extra[ex + 1]]);
@@ -610,6 +621,23 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
                 if sz >= 7 {
                     inner_method = u16::from_le_bytes([body[5], body[6]]);
                 }
+            } else if id == TZIP_HASH_EXTRA_ID && !body.is_empty() {
+                // tzip-native plaintext digest. Layout: [algo: u8] [digest].
+                // algo=1 → MD5 (16 bytes), algo=2 → SHA-256 (32 bytes).
+                // Multiple per entry are allowed (one for md5, one for sha256).
+                match body[0] {
+                    TZIP_HASH_ALGO_MD5 if body.len() >= 1 + 16 => {
+                        let mut buf = [0u8; 16];
+                        buf.copy_from_slice(&body[1..1 + 16]);
+                        md5_digest = Some(buf);
+                    }
+                    TZIP_HASH_ALGO_SHA256 if body.len() >= 1 + 32 => {
+                        let mut buf = [0u8; 32];
+                        buf.copy_from_slice(&body[1..1 + 32]);
+                        sha256_digest = Some(buf);
+                    }
+                    _ => {}
+                }
             }
             ex = body_start + sz;
         }
@@ -637,6 +665,8 @@ fn parse_central_directory(bytes: &[u8], expected_count: u64) -> Result<Vec<Read
             comment_bytes,
             disk_number_start: disk_start,
             lfh_total_size: 0,
+            md5_digest,
+            sha256_digest,
         });
     }
 

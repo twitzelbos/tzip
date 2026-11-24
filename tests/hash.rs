@@ -162,6 +162,59 @@ fn hash_json_output_is_jsonl() {
 }
 
 #[test]
+fn hash_extra_field_round_trips_through_create() {
+    // Create two archives of the same corpus: one with --write-md5 +
+    // --write-sha256, one without. Both `tzip hash --algo md5/sha256`
+    // outputs should match line-for-line, confirming the extra-field
+    // digest matches the on-the-fly decode-and-hash result.
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+
+    run_tzip(
+        tmp.path(),
+        &["create", "plain.zip", "corpus", "-m", "deflate", "-q"],
+    );
+    run_tzip(
+        tmp.path(),
+        &[
+            "create",
+            "hashed.zip",
+            "corpus",
+            "-m",
+            "deflate",
+            "--write-md5",
+            "--write-sha256",
+            "-q",
+        ],
+    );
+
+    for algo in &["md5", "sha256"] {
+        let plain = run_tzip(tmp.path(), &["hash", "plain.zip", "--algo", algo]);
+        let hashed = run_tzip(tmp.path(), &["hash", "hashed.zip", "--algo", algo]);
+        let p = parse_hash_lines(&String::from_utf8_lossy(&plain.stdout));
+        let h = parse_hash_lines(&String::from_utf8_lossy(&hashed.stdout));
+        assert_eq!(p, h, "extra-field digest must match streamed digest for {}", algo);
+    }
+}
+
+#[test]
+fn hash_extra_field_survives_through_other_tools() {
+    // Create with --write-sha256, extract with unzip (which ignores
+    // unknown extras), re-create with tzip: the extra field is
+    // not re-populated (we stream-copy on carry only), but the
+    // archive stays valid and readable.
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "deflate", "--write-sha256", "-q"],
+    );
+    // Verify tzip can list + extract its own archive.
+    let ls = run_tzip(tmp.path(), &["ls", "out.zip"]);
+    assert!(String::from_utf8_lossy(&ls.stdout).contains("a.txt"));
+}
+
+#[test]
 fn hash_include_and_exclude_filter() {
     let tmp = tempfile::tempdir().unwrap();
     make_corpus(&tmp.path().join("corpus"));

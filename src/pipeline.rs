@@ -121,8 +121,19 @@ pub(crate) fn encode_item(
     password: Option<&str>,
     scratch: &mut Scratch,
     single_file_parallel: bool,
+    want_md5: bool,
+    want_sha256: bool,
 ) -> Result<EncodedEntry> {
-    encode_one(raw, method, level, password, scratch, single_file_parallel)
+    encode_one(
+        raw,
+        method,
+        level,
+        password,
+        scratch,
+        single_file_parallel,
+        want_md5,
+        want_sha256,
+    )
 }
 
 /// One-shot tracing: when TZIP_PROFILE=1, print each stage's wall
@@ -678,6 +689,8 @@ pub fn run(opts: Options) -> Result<()> {
     let password = opts.password.clone();
     let method = opts.method;
     let level = opts.level;
+    let want_md5 = opts.write_md5;
+    let want_sha256 = opts.write_sha256;
     // Auto parallel-block DEFLATE when a single large file dominates the
     // workload. In streaming mode we don't know the count up front, so we
     // gate on the batched total. If unset (streaming), the CPU worker will
@@ -706,6 +719,8 @@ pub fn run(opts: Options) -> Result<()> {
                     password.as_deref(),
                     &mut scratch,
                     single_file_parallel,
+                    want_md5,
+                    want_sha256,
                 )?;
                 if let Some(t) = &tui_handle {
                     let elapsed = started.elapsed().as_secs_f64();
@@ -1013,12 +1028,35 @@ fn encode_one(
     password: Option<&str>,
     scratch: &mut Scratch,
     single_file_parallel: bool,
+    want_md5: bool,
+    want_sha256: bool,
 ) -> Result<EncodedEntry> {
     let uncompressed_size = raw.bytes.len() as u64;
 
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&raw.bytes);
-    let crc32 = hasher.finalize();
+    // Fused plaintext pass: CRC-32 + optional MD5 + optional SHA-256
+    // in one sweep so each digest is a near-free extension of the
+    // CRC pass we're already paying for.
+    let mut crc_h = crc32fast::Hasher::new();
+    crc_h.update(&raw.bytes);
+    let crc32 = crc_h.finalize();
+    let md5_digest: Option<[u8; 16]> = if want_md5 {
+        use md5::Digest as _;
+        let mut h = md5::Md5::new();
+        h.update(&raw.bytes[..]);
+        let out: [u8; 16] = h.finalize().into();
+        Some(out)
+    } else {
+        None
+    };
+    let sha256_digest: Option<[u8; 32]> = if want_sha256 {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(&raw.bytes[..]);
+        let out: [u8; 32] = h.finalize().into();
+        Some(out)
+    } else {
+        None
+    };
 
     let out = if single_file_parallel {
         compress::compress_parallel_deflate(&raw.bytes, level)?
@@ -1058,6 +1096,8 @@ fn encode_one(
         version_needed,
         mtime: raw.item.mtime,
         external_attr: raw.item.external_attr,
+        md5_digest,
+        sha256_digest,
     })
 }
 

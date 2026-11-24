@@ -85,12 +85,35 @@ pub fn run(args: HashArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Body-streaming path. Populate LFH sizes up front; clone entries
-    // so the workers get self-contained metadata.
+    // Body-streaming path. For entries that carry a pre-computed
+    // digest in the tzip-native extra field (written via
+    // `tzip create --write-md5` / `--write-sha256`) we can skip the
+    // decompress + hash round-trip entirely and emit straight from
+    // the CDR — same cost as the crc32 fast path. Entries without
+    // a stored digest fall through to the worker pool.
+    let stdout = io::stdout();
+    let mut direct_out = stdout.lock();
     let mut entries: Vec<ReadEntry> = Vec::with_capacity(candidates.len());
     for idx in candidates {
+        let (name, stored) = {
+            let e = &arch.entries()[idx];
+            let stored = match args.algo {
+                HashAlgo::Md5 => e.md5_digest.map(|d| hex_of(&d)),
+                HashAlgo::Sha256 => e.sha256_digest.map(|d| hex_of(&d)),
+                HashAlgo::Crc32 => unreachable!("crc32 handled above"),
+            };
+            (e.name.clone(), stored)
+        };
+        if let Some(hex) = stored {
+            emit_line(&mut direct_out, args.algo, &name, &hex, args.json)?;
+            continue;
+        }
         arch.lfh_total_size_of(idx)?;
         entries.push(arch.entries()[idx].clone());
+    }
+    drop(direct_out);
+    if entries.is_empty() {
+        return Ok(());
     }
     let worker_hint = hint_from_archive(&args.archive, &arch);
     drop(arch);

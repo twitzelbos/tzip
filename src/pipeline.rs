@@ -125,7 +125,21 @@ pub(crate) fn encode_item(
     encode_one(raw, method, level, password, scratch, single_file_parallel)
 }
 
+/// One-shot tracing: when TZIP_PROFILE=1, print each stage's wall
+/// time to stderr. Zero-cost when the env var is absent.
+fn profile(enabled: bool, stage: &str, start: std::time::Instant) {
+    if enabled {
+        eprintln!(
+            "tzip profile: {:20} {:>8.3} ms",
+            stage,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 pub fn run(opts: Options) -> Result<()> {
+    let profile_on = std::env::var("TZIP_PROFILE").ok().as_deref() == Some("1");
+    let overall_start = std::time::Instant::now();
     reject_remote_archive(&opts.archive)?;
 
     // --update dispatches to the update-mode entry point when the target
@@ -172,7 +186,9 @@ pub fn run(opts: Options) -> Result<()> {
 
     // Auto-tune defaults based on source/output filesystem. User-set flags
     // are never overridden.
+    let t_autotune = std::time::Instant::now();
     let opts = auto_tune(opts);
+    profile(profile_on, "auto_tune", t_autotune);
 
     // .7z solid needs the full list up front (it's serial LZMA2 and the
     // sevenz-rust API takes an ordered iterator). Use the batch walk.
@@ -340,8 +356,11 @@ pub fn run(opts: Options) -> Result<()> {
     };
 
     // 2. Open archive + best-effort preallocation + FS-aware buffer sizing
+    let t_open = std::time::Instant::now();
     let file = File::create(&opts.archive)
         .with_context(|| format!("create archive {}", opts.archive.display()))?;
+    profile(profile_on, "File::create", t_open);
+    let t_fsinfo = std::time::Instant::now();
     let out_info = platform::fs_info(
         opts.archive
             .parent()
@@ -349,6 +368,7 @@ pub fn run(opts: Options) -> Result<()> {
             .unwrap_or(std::path::Path::new(".")),
     )
     .ok();
+    profile(profile_on, "fs_info", t_fsinfo);
 
     // Preallocate extents if we know an upper-bound size. Upper-bound for
     // any compression method is `uncompressed_total × 1.05` (AES adds
@@ -359,7 +379,9 @@ pub fn run(opts: Options) -> Result<()> {
     } else {
         256 * 1024 * 1024
     };
+    let t_prealloc = std::time::Instant::now();
     let _ = platform::preallocate(&file, preallocate_len);
+    profile(profile_on, "preallocate", t_prealloc);
 
     // BufWriter capacity — bump on exFAT/msdos (large clusters, sequential
     // writes benefit from big flushes) and scale to iosize otherwise.
@@ -700,6 +722,8 @@ pub fn run(opts: Options) -> Result<()> {
     // With `--sort` we re-order arrivals into walk-index order so archives
     // are byte-identical across runs. Without `--sort` we write in arrival
     // order for minimum latency.
+    profile(profile_on, "setup_until_loop", overall_start);
+    let t_mainloop = std::time::Instant::now();
     let mut wrote_files = 0u64;
     if opts.sort {
         use std::collections::HashMap;
@@ -736,7 +760,9 @@ pub fn run(opts: Options) -> Result<()> {
         }
     }
 
+    profile(profile_on, "main_write_loop", t_mainloop);
     // 8. Join all
+    let t_join = std::time::Instant::now();
     feeder
         .join()
         .map_err(|_| anyhow::anyhow!("feeder thread panicked"))??;
@@ -746,25 +772,32 @@ pub fn run(opts: Options) -> Result<()> {
     for h in cpu_handles {
         h.join().ok().transpose()?;
     }
+    profile(profile_on, "join_workers", t_join);
 
+    let t_finish = std::time::Instant::now();
     let inner = zw.finish()?;
     let mut buf_writer = inner;
     use std::io::{Seek, SeekFrom, Write};
     buf_writer.flush()?;
+    profile(profile_on, "zw.finish+flush", t_finish);
+
     // Trim any unused preallocated tail so the archive's on-disk size
     // matches its logical size. Ignore errors — worst case the file uses
     // slightly more disk than st_size reports until next mount cycle.
+    let t_trim = std::time::Instant::now();
     let actual_len = buf_writer.stream_position().unwrap_or(0);
     if actual_len > 0 {
         let file = buf_writer.get_mut();
         let _ = file.set_len(actual_len);
         let _ = file.seek(SeekFrom::End(0));
     }
+    profile(profile_on, "set_len+trim", t_trim);
 
     progress.finish("done");
     if let Some(t) = tui_handle {
         t.finish();
     }
+    profile(profile_on, "TOTAL", overall_start);
     Ok(())
 }
 
@@ -854,12 +887,16 @@ fn auto_tune(mut opts: Options) -> Options {
 
     #[cfg(target_os = "macos")]
     {
-        use crate::usb_info::probe_path;
+        use crate::usb_info::probe_path_fast;
 
         // Collect fs snapshots for every input + the output's parent dir.
+        // The `_fast` variant skips `diskutil info` (~400 ms shell-out)
+        // when the fs_type + mount point make a USB match impossible —
+        // i.e. the vast majority of workloads on an internal APFS boot
+        // volume. See `probe_one_impl` for the full decision table.
         let mut probes: Vec<crate::usb_info::SourceReport> = Vec::new();
         for p in &opts.paths {
-            if let Ok(r) = probe_path(p) {
+            if let Ok(r) = probe_path_fast(p) {
                 probes.push(r);
             }
         }
@@ -869,7 +906,7 @@ fn auto_tune(mut opts: Options) -> Options {
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        if let Ok(r) = probe_path(&out_parent) {
+        if let Ok(r) = probe_path_fast(&out_parent) {
             probes.push(r);
         }
 

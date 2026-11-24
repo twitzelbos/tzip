@@ -35,6 +35,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Reading remote archives (HTTP / S3)](#reading-remote-archives-http--s3)
 - [Searching across many archives (`tzip grep`)](#searching-across-many-archives-tzip-grep)
 - [Finding entries across archives (`tzip find`)](#finding-entries-across-archives-tzip-find)
+- [Diffing archives (`tzip diff`)](#diffing-archives-tzip-diff)
 - [Mounting archives as a filesystem (`tzip mount`)](#mounting-archives-as-a-filesystem-tzip-mount)
 - [TUI mode](#tui-mode)
 - [Benchmarks (`tzip bench`)](#benchmarks-tzip-bench)
@@ -697,6 +698,40 @@ S3 bucket-globbing is the same as `tzip grep`: prefix expansion via
 ListObjectsV2. Local shell globs are handled by your shell. `find` has
 no body-fetching inner loop, so it skips `grep`'s `--inner-jobs` /
 `--connections` / `--checkpoint` / `--exec` flags.
+
+## Diffing archives (`tzip diff`)
+
+`tzip diff a.zip b.zip` compares two archives at the CDR level.
+Body-free — never fetches any entry content — so it's near-free
+on HTTP/S3 sources too.
+
+```
+tzip diff old.zip new.zip                       # tabular
+tzip diff old.zip new.zip --names-only          # one `status entry` per line
+tzip diff old.zip new.zip --json | jq           # JSONL
+tzip diff --include '*.log' old.zip new.zip     # filter to a subset
+tzip diff --mtime old.zip new.zip               # also report entries that differ only in mtime
+```
+
+Classification:
+
+| status | marker | meaning |
+| --- | :---: | --- |
+| added   | `+` | entry name in `b` only |
+| removed | `-` | entry name in `a` only |
+| changed | `~` | same name, different size or crc32 |
+| mtime-only | `T` | same name + size + crc32, different mtime. Suppressed by default (noisy on repackaged archives); surface with `--mtime` |
+
+Exit status follows the `diff` convention: **0** = identical, **1**
+= differed, **2** = error. Suitable for shell pipelines:
+
+```
+if ! tzip diff releases/v1.zip releases/v2.zip --names-only > /dev/null; then
+  echo "release content changed, running smoke tests"
+fi
+```
+
+---
 
 ## Mounting archives as a filesystem (`tzip mount`)
 

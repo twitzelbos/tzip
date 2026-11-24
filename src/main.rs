@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
 
-use tzip::{bench, cli, find, grep, mount, pipeline, reader};
+use tzip::{bench, cli, diff, find, grep, mount, pipeline, reader};
 
 fn main() -> Result<()> {
     // Parse via ArgMatches so UserSetFlags::from_matches can distinguish
@@ -29,6 +29,13 @@ fn main() -> Result<()> {
         cli::Cmd::Mount(args) => mount::dispatch(args.into_action()?),
         cli::Cmd::Find(args) => find::run(args.into_options()?),
         cli::Cmd::Bench(args) => bench::run(args.into_options()?),
+        cli::Cmd::Diff(args) => {
+            // `tzip diff` carries a shell exit status (0 = identical,
+            // 1 = differed) in its Ok value. Short-circuit the normal
+            // "exit 0 on Ok" behaviour so pipelines can test it.
+            let code = diff::run(args.into_options()?)?;
+            std::process::exit(code);
+        }
     }
 }
 

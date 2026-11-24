@@ -89,6 +89,40 @@ impl S3Source {
         Ok(src)
     }
 
+    /// Construct an `S3Source` with a caller-supplied object length,
+    /// skipping the Range-0-0 probe. Used by extract / grep inner
+    /// workers: the main thread has already opened the archive, so
+    /// the length is known and every worker's own probe would be a
+    /// wasted signed-GET round-trip. Credential + endpoint resolution
+    /// still runs per worker (cheap, and credentials can rotate).
+    pub fn open_with_len(spec: &str, len: u64) -> Result<Self> {
+        let (bucket, key) = split_bucket_key(spec)?;
+        let creds = resolve_credentials().context("resolve AWS credentials")?;
+        let region = resolve_region();
+        let (scheme, host, path_style_prefix) = resolve_endpoint(&bucket, &region)?;
+        let uri_path = if let Some(prefix) = path_style_prefix {
+            format!("{}/{}", prefix, encode_key(&key))
+        } else {
+            format!("/{}", encode_key(&key))
+        };
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(60))
+            .user_agent(&format!("tzip/{}", env!("CARGO_PKG_VERSION")))
+            .build();
+        Ok(Self {
+            agent,
+            scheme,
+            host,
+            uri_path,
+            creds,
+            region,
+            len,
+            pos: 0,
+            cache_start: 0,
+            cache: Vec::new(),
+        })
+    }
+
     fn probe_len(&mut self) -> Result<()> {
         let signed = self.sign(&[ExtraHeader { name: "Range", value: "bytes=0-0" }])?;
         let mut req = self.agent.get(&signed.url);

@@ -31,7 +31,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use crate::cli::GrepOptions;
-use crate::reader::{open_archive, open_source_for, stream_entry_to};
+use crate::reader::{open_archive, stream_entry_to};
 use crate::sources::s3_list;
 use crate::zipreader::ReadEntry;
 
@@ -122,6 +122,11 @@ fn process_archive(
             .with_context(|| format!("probe LFH for {} in {}", name, url))?;
         filtered.push(driver.entries()[idx].clone());
     }
+    // Build the worker-side source hint from the Archive we already
+    // opened. Workers then skip the EOCD scan (local) or length-probe
+    // HEAD / signed Range-0-0 round-trip (http/s3) they'd otherwise
+    // each perform — same hoist we already do in `tzip x`.
+    let worker_hint = crate::reader::hint_from_archive(url, &driver);
     drop(driver);
     if filtered.is_empty() {
         return Ok(());
@@ -146,7 +151,7 @@ fn process_archive(
             let out = Arc::clone(&out);
             let url = url.to_string();
             let handle = scope.spawn(move || -> Result<()> {
-                let mut source = open_source_for(&url)
+                let mut source = crate::reader::open_source_for_with_hint(&url, worker_hint)
                     .with_context(|| format!("open inner source for {}", url))?;
                 while let Ok(re) = rx.recv() {
                     scan_entry(&url, &mut *source, &re, &regex, &opts, cp_writer.as_ref(), &out)?;

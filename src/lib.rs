@@ -5,6 +5,7 @@
 //! `libtzip.dylib` for the Swift FSKit extension to link against at
 //! bundle-load time.
 
+pub mod aggregate;
 pub mod bench;
 pub mod cli;
 pub mod compress;
@@ -16,6 +17,7 @@ pub mod dos_time;
 pub mod find;
 pub mod grep;
 pub mod hash;
+pub mod facets;
 pub mod nameidx;
 pub mod termidx;
 pub mod mount;

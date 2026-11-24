@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
 
-use tzip::{bench, cli, diff, find, grep, hash, mount, pipeline, reader};
+use tzip::{aggregate, bench, cli, diff, find, grep, hash, mount, pipeline, reader};
 
 fn main() -> Result<()> {
     // Parse via ArgMatches so UserSetFlags::from_matches can distinguish
@@ -37,6 +37,7 @@ fn main() -> Result<()> {
             std::process::exit(code);
         }
         cli::Cmd::Hash(args) => hash::run(args),
+        cli::Cmd::Aggregate(args) => aggregate::run(args.into_options()?),
     }
 }
 

@@ -135,6 +135,10 @@ tempfile = "3"
 zip = "0.6"
 # Local HTTP fixture for reader_http / reader_s3 integration tests.
 tiny_http = "0.12"
+# Hash-feature tests compute reference digests independently of the
+# tzip library path, so they pull the same crates tzip uses at runtime.
+sha2 = "0.10"
+md-5 = "0.10"
 
 [build-dependencies]
 cc = "1"

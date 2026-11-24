@@ -44,7 +44,7 @@ use crate::zipwriter::{EncodedEntry, ZipWriter};
 const UNDO_MAGIC: &[u8; 8] = b"TZIPUNDO";
 const UNDO_VERSION: u32 = 1;
 
-pub fn run_update(opts: Options) -> Result<()> {
+pub fn run_update(mut opts: Options) -> Result<()> {
     // Recover from a prior interrupted append-mode update, if any.
     attempt_recover_undo(&opts.archive)?;
 
@@ -106,6 +106,36 @@ pub fn run_update(opts: Options) -> Result<()> {
             .count();
         (n_rep > 0, n_rep)
     };
+
+    // Auto-detect existing hashes on kept entries. If the archive
+    // already stores plaintext MD5s or SHA-256s on its existing
+    // entries, any entry we *add or replace* must get the same digest
+    // computed, otherwise the archive ends up with inconsistent
+    // coverage (some entries hashed, some not — `tzip hash` would
+    // fall back to body-decode for the unhashed subset on an
+    // otherwise fast-path archive).
+    //
+    // Only check entries that are actually being kept (not deleted or
+    // replaced) — a replaced entry's old digest doesn't tell us the
+    // user intends to keep writing that algo.
+    let existing_md5 = arch
+        .entries()
+        .iter()
+        .any(|e| e.md5_digest.is_some()
+            && !delete_matches.contains(e.name.as_str())
+            && !new_names.contains(e.name.as_str()));
+    let existing_sha256 = arch
+        .entries()
+        .iter()
+        .any(|e| e.sha256_digest.is_some()
+            && !delete_matches.contains(e.name.as_str())
+            && !new_names.contains(e.name.as_str()));
+    if existing_md5 {
+        opts.write_md5 = true;
+    }
+    if existing_sha256 {
+        opts.write_sha256 = true;
+    }
 
     // Deduplicate within new_items (first wins) to match create-mode behaviour.
     {
@@ -487,6 +517,8 @@ fn encode_items_into_writer<W: Write + Seek>(
     let method = opts.method;
     let level = opts.level;
     let password = opts.password.clone();
+    let want_md5 = opts.write_md5;
+    let want_sha256 = opts.write_sha256;
     let single_file_parallel = matches!(method, Method::Deflate)
         && total_files == 1
         && total_bytes >= compress::PARALLEL_DEFLATE_THRESHOLD;
@@ -506,8 +538,8 @@ fn encode_items_into_writer<W: Write + Seek>(
                     password.as_deref(),
                     &mut scratch,
                     single_file_parallel,
-                    false, // update mode doesn't support --write-md5 yet
-                    false,
+                    want_md5,
+                    want_sha256,
                 )?;
                 if enc_tx.send(entry).is_err() {
                     break;
@@ -613,6 +645,8 @@ fn encode_items_to_map(
     let method = opts.method;
     let level = opts.level;
     let password = opts.password.clone();
+    let want_md5 = opts.write_md5;
+    let want_sha256 = opts.write_sha256;
     let single_file_parallel = matches!(method, Method::Deflate)
         && total_files == 1
         && total_bytes >= compress::PARALLEL_DEFLATE_THRESHOLD;
@@ -632,8 +666,8 @@ fn encode_items_to_map(
                     password.as_deref(),
                     &mut scratch,
                     single_file_parallel,
-                    false, // update mode doesn't support --write-md5 yet
-                    false,
+                    want_md5,
+                    want_sha256,
                 )?;
                 if enc_tx.send(entry).is_err() {
                     break;

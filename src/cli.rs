@@ -291,6 +291,18 @@ pub struct UpdateArgs {
 
     #[arg(long)]
     pub tui: bool,
+
+    /// Compute + stash plaintext MD5 for every added or replaced entry
+    /// in a tzip-native extra field. If the archive already carries MD5
+    /// hashes on its existing entries, this is auto-enabled regardless
+    /// so added/replaced entries match the archive's existing format.
+    #[arg(long)]
+    pub write_md5: bool,
+
+    /// Same as `--write-md5` for SHA-256. Auto-enabled if the archive
+    /// already carries SHA-256 hashes on existing entries.
+    #[arg(long)]
+    pub write_sha256: bool,
 }
 
 // ── Reader (ls / cat / x) ──────────────────────────────────────────────────
@@ -908,8 +920,13 @@ impl UpdateArgs {
             update: true,
             delete: self.delete,
             atomic: self.atomic,
-            write_md5: false,
-            write_sha256: false,
+            // Explicit `--write-md5` / `--write-sha256` on `tzip u`.
+            // `run_update` may additionally set these to `true` after
+            // peeking the archive, if the existing entries already
+            // carry digests — so added/replaced entries match the
+            // archive's existing format.
+            write_md5: self.write_md5,
+            write_sha256: self.write_sha256,
         })
     }
 }

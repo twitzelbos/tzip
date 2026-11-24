@@ -30,6 +30,15 @@ pub struct MultiDiskSource {
     files: Vec<File>,
     /// Cumulative offset at the start of each disk. `starts[0] == 0`.
     starts: Vec<u64>,
+    /// Per-disk length in bytes, captured at `open()` time. Avoids an
+    /// `fstat` per `Read::read` — a large-entry extract would otherwise
+    /// trigger one per 8 KiB buffered chunk.
+    sizes: Vec<u64>,
+    /// Last-known file-position of each disk's fd, so we can skip
+    /// `lseek` on sequential reads within one disk (the common case).
+    /// Starts at the fd's initial offset (0 — the file was just
+    /// opened); updated after every successful seek or read.
+    fd_pos: Vec<u64>,
     total: u64,
     pos: u64,
 }
@@ -50,6 +59,7 @@ impl MultiDiskSource {
         let base = last_path.with_extension(""); // strips .zip (or any ext)
         let mut files: Vec<File> = Vec::with_capacity(total_disks);
         let mut starts: Vec<u64> = Vec::with_capacity(total_disks);
+        let mut sizes: Vec<u64> = Vec::with_capacity(total_disks);
         let mut total: u64 = 0;
 
         for i in 0..total_disks - 1 {
@@ -63,6 +73,7 @@ impl MultiDiskSource {
             })?;
             let size = f.metadata()?.len();
             starts.push(total);
+            sizes.push(size);
             total = total
                 .checked_add(size)
                 .ok_or_else(|| anyhow::anyhow!("multi-disk archive total exceeds u64"))?;
@@ -73,14 +84,18 @@ impl MultiDiskSource {
         })?;
         let size = f.metadata()?.len();
         starts.push(total);
+        sizes.push(size);
         total = total
             .checked_add(size)
             .ok_or_else(|| anyhow::anyhow!("multi-disk archive total exceeds u64"))?;
         files.push(f);
 
+        let fd_pos = vec![0u64; total_disks];
         Ok(Self {
             files,
             starts,
+            sizes,
+            fd_pos,
             total,
             pos: 0,
         })
@@ -126,21 +141,26 @@ impl Read for MultiDiskSource {
         let Some((disk, in_disk)) = self.resolve(self.pos) else {
             return Ok(0); // At or past EOF
         };
-        // Seek the backing file to the right offset and read up to one
-        // disk's remaining bytes. Short reads at disk boundaries are
-        // the caller's problem to loop over — `read_exact` and
-        // `std::io::copy` both handle this correctly.
-        let disk_size = self.files[disk].metadata()?.len();
-        let remaining_in_disk = disk_size.saturating_sub(in_disk);
+        // Use the per-disk size captured at open() instead of an fstat
+        // per call — sequential extract/grep used to pay one metadata
+        // syscall per buffered chunk.
+        let remaining_in_disk = self.sizes[disk].saturating_sub(in_disk);
         if remaining_in_disk == 0 {
-            // Empty or past-end disk — shouldn't happen since resolve()
-            // returned a disk that contains self.pos, but guard anyway.
             return Ok(0);
         }
+        // Skip the lseek when the fd is already positioned where we
+        // want to read — the common case for sequential reads within
+        // one disk, which is most of what the ZIP body stream looks
+        // like. Short reads at disk boundaries stay the caller's
+        // problem (`read_exact` + `std::io::copy` already loop).
+        if self.fd_pos[disk] != in_disk {
+            self.files[disk].seek(SeekFrom::Start(in_disk))?;
+            self.fd_pos[disk] = in_disk;
+        }
         let want = (remaining_in_disk.min(out.len() as u64)) as usize;
-        self.files[disk].seek(SeekFrom::Start(in_disk))?;
         let n = self.files[disk].read(&mut out[..want])?;
         self.pos += n as u64;
+        self.fd_pos[disk] += n as u64;
         Ok(n)
     }
 }

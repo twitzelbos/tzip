@@ -485,7 +485,7 @@ fn encode_items_into_writer<W: Write + Seek>(
             let mut scratch = Scratch::new();
             while let Ok(raw) = raw_rx.recv() {
                 let entry = pipeline::encode_item(
-                    &raw,
+                    raw,
                     method,
                     level,
                     password.as_deref(),
@@ -609,7 +609,7 @@ fn encode_items_to_map(
             let mut scratch = Scratch::new();
             while let Ok(raw) = raw_rx.recv() {
                 let entry = pipeline::encode_item(
-                    &raw,
+                    raw,
                     method,
                     level,
                     password.as_deref(),

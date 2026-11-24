@@ -497,6 +497,15 @@ pub struct MountArgs {
     #[arg(long)]
     pub allow_other: bool,
 
+    /// Open the mount read-write. Edits (create, write, unlink, mkdir,
+    /// rmdir, truncate) are journaled in memory and committed to the
+    /// archive atomically on unmount via `tzip u`. Linux FUSE3 only in
+    /// this release — a crash before unmount loses the pending
+    /// changes but never corrupts the archive. Local archives only;
+    /// HTTP/S3 mounts stay read-only.
+    #[arg(long)]
+    pub write: bool,
+
     /// macOS + `--features fskit` only: register the tzip FSKit system
     /// extension. One-time per install; user has to approve in System
     /// Settings. No-op on Linux.
@@ -972,6 +981,7 @@ impl MountArgs {
             mountpoint,
             cache_mb: self.cache_mb,
             allow_other: self.allow_other,
+            write: self.write,
             password,
             quiet: self.quiet,
             verbose: self.verbose,

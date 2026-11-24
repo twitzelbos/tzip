@@ -58,6 +58,9 @@ pub struct MountOptions {
     pub password: Option<String>,
     pub quiet: bool,
     pub verbose: bool,
+    /// Open the mount read-write. Linux FUSE3 only in this release;
+    /// Local archives only — HTTP/S3 mounts ignore this and stay RO.
+    pub write: bool,
 }
 
 /// Dispatch for the three MountAction variants.

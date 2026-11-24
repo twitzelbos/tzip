@@ -175,6 +175,21 @@ fn advise(r: &SourceReport, read_jobs: usize, keep_cache: bool) -> Vec<String> {
 }
 
 fn probe_one(path: &Path) -> Result<SourceReport> {
+    probe_one_impl(path, /*include_diskutil=*/ true)
+}
+
+/// Lightweight variant that skips the `diskutil info` shell-out for
+/// filesystem types that we know won't change any auto-tune decisions.
+/// Saves ~400 ms per call on macOS (diskutil startup + ioreg query).
+/// Used by `pipeline::auto_tune`, which only cares about `bus_protocol`
+/// when `fs_type == "apfs"` or `fs_type == "hfs"` (HFS+ on USB gets
+/// the same keep_cache tune). For other filesystems, `bus_protocol` is
+/// left `None` and the caller treats the entry as "not USB-attached".
+pub fn probe_path_fast(path: &Path) -> Result<SourceReport> {
+    probe_one_impl(path, /*include_diskutil=*/ false)
+}
+
+fn probe_one_impl(path: &Path, include_diskutil: bool) -> Result<SourceReport> {
     // statfs on the source path
     let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| anyhow!("path contains NUL"))?;
@@ -188,10 +203,39 @@ fn probe_one(path: &Path) -> Result<SourceReport> {
     let mount_point = PathBuf::from(c_array_to_string(&sfs.f_mntonname));
     let bsd_device = c_array_to_string(&sfs.f_mntfromname);
 
-    // diskutil info gives us Bus Protocol, Device / Media Name
-    let (bus_protocol, media_name) = diskutil_info(&bsd_device).unwrap_or((None, None));
+    // Fast-path decision: when the caller is `--usb-info` /
+    // `--warn-contention` (include_diskutil=true), always shell out so
+    // the diagnostic shows every USB drive — including exFAT SD cards,
+    // NTFS external drives, etc.
+    //
+    // For auto_tune (include_diskutil=false), skip diskutil in the
+    // common cases where it can't change a tuning decision:
+    //   - fs is not APFS/HFS: auto_tune's only USB check needs
+    //     fs=apfs AND bus=USB, so anything else short-circuits to
+    //     "not apfs_on_usb"
+    //   - mount is `/` or `/System/Volumes/*`: these are the macOS
+    //     boot volume + synthesised Data volume, never USB-attached
+    let looks_internal = {
+        let s = mount_point.to_string_lossy();
+        s == "/" || s.starts_with("/System/Volumes/")
+    };
+    let apfs_family =
+        fs_type.eq_ignore_ascii_case("apfs") || fs_type.eq_ignore_ascii_case("hfs");
+    let need_diskutil = if include_diskutil {
+        // Preserve full probe behaviour for the diagnostic callers.
+        true
+    } else {
+        // auto_tune fast path.
+        apfs_family && !looks_internal
+    };
+    let (bus_protocol, media_name) = if need_diskutil {
+        diskutil_info(&bsd_device).unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
 
-    // If USB, correlate to a USB device via ioreg
+    // If USB, correlate to a USB device via ioreg (also shells out,
+    // only done when bus is actually USB so cost is bounded).
     let usb = if bus_protocol.as_deref() == Some("USB") {
         find_usb_device(media_name.as_deref()).ok().flatten()
     } else {

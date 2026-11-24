@@ -110,6 +110,18 @@ impl ReadBuf {
             ReadBuf::Mapped(m) => m.len(),
         }
     }
+
+    /// Hand ownership of the bytes to the caller. For `Owned` we move
+    /// the `Vec` out with no copy; for `Mapped` we must copy, since
+    /// the memory lives in the mmap region. Used by the Store-method
+    /// fast path in `encode_one` to skip a second full memcpy of
+    /// every stored entry.
+    pub fn into_vec(self) -> Vec<u8> {
+        match self {
+            ReadBuf::Owned(v) => v,
+            ReadBuf::Mapped(m) => m.to_vec(),
+        }
+    }
 }
 
 /// Files at or above this size get memory-mapped. Below it, we do a plain

@@ -115,7 +115,7 @@ pub(crate) fn reject_remote_archive(archive: &std::path::Path) -> Result<()> {
 
 /// Shared single-file encoder used by both the main pipeline and update mode.
 pub(crate) fn encode_item(
-    raw: &RawItem,
+    raw: RawItem,
     method: Method,
     level: u32,
     password: Option<&str>,
@@ -700,7 +700,7 @@ pub fn run(opts: Options) -> Result<()> {
                 }
                 let started = std::time::Instant::now();
                 let entry = encode_one(
-                    &raw,
+                    raw,
                     method,
                     level,
                     password.as_deref(),
@@ -1007,23 +1007,31 @@ fn auto_tune(mut opts: Options) -> Options {
 }
 
 fn encode_one(
-    raw: &RawItem,
+    raw: RawItem,
     method: Method,
     level: u32,
     password: Option<&str>,
     scratch: &mut Scratch,
     single_file_parallel: bool,
 ) -> Result<EncodedEntry> {
-    let uncompressed_size = raw.bytes.len() as u64;
+    let RawItem { index, item, bytes } = raw;
+    let uncompressed_size = bytes.len() as u64;
 
     let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&raw.bytes);
+    hasher.update(&bytes);
     let crc32 = hasher.finalize();
 
+    // Store-method fast path: bypass `compress`'s per-call memcpy and
+    // hand the input Vec straight through. For `Owned` reads this is
+    // a zero-copy move; `Mapped` still needs a copy to materialise an
+    // owned body for the writer. Combined, this halves memory traffic
+    // on `-m store` for small-to-medium corpora.
     let out = if single_file_parallel {
-        compress::compress_parallel_deflate(&raw.bytes, level)?
+        compress::compress_parallel_deflate(&bytes, level)?
+    } else if matches!(method, Method::Store) {
+        compress::CompressOut { data: bytes.into_vec(), gp_bit1: false }
     } else {
-        compress::compress(method, level, &raw.bytes, scratch)?
+        compress::compress(method, level, &bytes, scratch)?
     };
     let inner_method = compress::method_id(method);
     let version_needed = compress::version_needed(method);
@@ -1046,8 +1054,8 @@ fn encode_one(
     };
 
     Ok(EncodedEntry {
-        index: raw.index,
-        name: raw.item.name_in_archive.clone(),
+        index,
+        name: item.name_in_archive,
         body,
         uncompressed_size,
         crc32,
@@ -1056,8 +1064,8 @@ fn encode_one(
         encrypted,
         gp_bit1: out.gp_bit1,
         version_needed,
-        mtime: raw.item.mtime,
-        external_attr: raw.item.external_attr,
+        mtime: item.mtime,
+        external_attr: item.external_attr,
     })
 }
 

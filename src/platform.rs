@@ -249,18 +249,37 @@ pub fn fs_info(path: &Path) -> io::Result<FsInfo> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(fs_info_from_statfs(&sfs))
+}
+
+/// Same as `fs_info` but against an already-open fd — saves the
+/// kernel's path-walk when the caller has a `File` in hand. Callers
+/// use this right after `File::create`/`File::open` of the target
+/// instead of a path-based `fs_info(parent_dir)`.
+#[cfg(target_os = "macos")]
+pub fn fs_info_fd(fd: std::os::unix::io::RawFd) -> io::Result<FsInfo> {
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatfs(fd, &mut sfs) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fs_info_from_statfs(&sfs))
+}
+
+#[cfg(target_os = "macos")]
+fn fs_info_from_statfs(sfs: &libc::statfs) -> FsInfo {
     let fs_type = unsafe { std::ffi::CStr::from_ptr(sfs.f_fstypename.as_ptr()) }
         .to_string_lossy()
         .into_owned();
     let mount_point = unsafe { std::ffi::CStr::from_ptr(sfs.f_mntonname.as_ptr()) }
         .to_string_lossy()
         .into_owned();
-    Ok(FsInfo {
+    FsInfo {
         fs_type,
         iosize: sfs.f_iosize.max(0) as u32,
         bsize: sfs.f_bsize as u32,
         mount_point: std::path::PathBuf::from(mount_point),
-    })
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -274,17 +293,34 @@ pub fn fs_info(path: &Path) -> io::Result<FsInfo> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(fs_info_from_statfs(&sfs))
+}
+
+/// Same as `fs_info` but against an already-open fd — saves the
+/// kernel's path-walk when the caller has a `File` in hand.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn fs_info_fd(fd: std::os::unix::io::RawFd) -> io::Result<FsInfo> {
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatfs(fd, &mut sfs) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fs_info_from_statfs(&sfs))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fs_info_from_statfs(sfs: &libc::statfs) -> FsInfo {
     // Linux gives us `f_type` as a magic number, not a name. Map the common
     // ones so `--verbose` diagnostics are legible; fall back to the hex magic
     // for anything unrecognized. These are the filesystems the extent-order
     // reader cares about (FIEMAP support) plus the ones where it's a no-op.
     let fs_type = linux_fs_name(sfs.f_type as i64);
-    Ok(FsInfo {
+    FsInfo {
         fs_type,
         iosize: sfs.f_bsize as u32,
         bsize: sfs.f_bsize as u32,
         mount_point: std::path::PathBuf::from("/"),
-    })
+    }
 }
 
 /// Map a Linux `statfs.f_type` magic to a human-readable name. Magics from
@@ -307,6 +343,11 @@ fn linux_fs_name(magic: i64) -> String {
         _ => return format!("0x{:x}", magic),
     };
     name.to_string()
+}
+
+#[cfg(not(unix))]
+pub fn fs_info_fd(_fd: std::os::raw::c_int) -> io::Result<FsInfo> {
+    fs_info(std::path::Path::new("."))
 }
 
 #[cfg(not(unix))]

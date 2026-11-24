@@ -361,6 +361,15 @@ pub fn run(opts: Options) -> Result<()> {
         .with_context(|| format!("create archive {}", opts.archive.display()))?;
     profile(profile_on, "File::create", t_open);
     let t_fsinfo = std::time::Instant::now();
+    // `fstatfs` on the fd we just opened — skips the kernel's second
+    // path walk that `fs_info(parent_dir)` would trigger. Same result
+    // (file + its parent dir are on the same filesystem).
+    #[cfg(unix)]
+    let out_info = {
+        use std::os::unix::io::AsRawFd;
+        platform::fs_info_fd(file.as_raw_fd()).ok()
+    };
+    #[cfg(not(unix))]
     let out_info = platform::fs_info(
         opts.archive
             .parent()

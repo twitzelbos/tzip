@@ -40,11 +40,32 @@ pub(crate) fn open_archive(spec: &str) -> Result<Archive> {
     }
 }
 
+/// Caller-known layout hint. When the caller has already probed the
+/// archive once (e.g. `tzip x`'s main thread opened it to read the
+/// CDR), it can pass the result here so worker-spawn paths don't
+/// re-scan the EOCD N times. `None` = unknown, probe.
+#[derive(Clone, Copy)]
+pub(crate) enum LocalLayout {
+    SingleDisk,
+    MultiDisk(usize),
+}
+
 /// Open a raw `Read + Seek + Send` backing source for `spec` without
 /// parsing the archive. Used by `tzip grep`'s inner workers so each
 /// worker holds its own independent source (connection) against the
 /// same archive — avoids contention on one shared fd / connection.
 pub(crate) fn open_source_for(spec: &str) -> Result<Box<dyn crate::sources::ReadSeek>> {
+    open_source_for_with_hint(spec, None)
+}
+
+/// Same as `open_source_for` but with an optional pre-probed layout
+/// hint, avoiding a second EOCD scan per worker when the caller
+/// already knows the layout (parallel extract hoists the probe to
+/// the main thread, then hands `Some(layout)` to each worker).
+pub(crate) fn open_source_for_with_hint(
+    spec: &str,
+    hint: Option<LocalLayout>,
+) -> Result<Box<dyn crate::sources::ReadSeek>> {
     if let Some(rest) = spec.strip_prefix("s3://") {
         let src = S3Source::open(rest)
             .with_context(|| format!("open S3 source s3://{}", rest))?;
@@ -54,22 +75,58 @@ pub(crate) fn open_source_for(spec: &str) -> Result<Box<dyn crate::sources::Read
             .with_context(|| format!("open HTTP source {}", spec))?;
         Ok(Box::new(src))
     } else {
-        // For local paths, detect multi-disk archives by peeking the
-        // EOCD and return a `MultiDiskSource` in that case. Parallel
-        // extract workers use this seam, so each worker gets its own
-        // set of file handles — exactly the same per-worker-source
-        // model HTTP + S3 already use for Range GET overlap.
-        local_source_for(Path::new(spec))
+        local_source_for(Path::new(spec), hint)
     }
 }
 
-fn local_source_for(path: &Path) -> Result<Box<dyn crate::sources::ReadSeek>> {
+/// Probe a local archive's layout (single vs multi-disk) once. Used
+/// by callers that will then fan-out workers via
+/// `open_source_for_with_hint(..., Some(layout))`, saving an EOCD
+/// scan per worker. `None` on any probe error — workers fall back to
+/// the self-probing path.
+pub(crate) fn probe_local_layout(spec: &str) -> Option<LocalLayout> {
+    if spec.starts_with("http://") || spec.starts_with("https://") || spec.starts_with("s3://") {
+        return None;
+    }
+    let path = Path::new(spec);
+    let mut probe = std::fs::File::open(path).ok()?;
+    let file_size = probe.seek(SeekFrom::End(0)).ok()?;
+    let n = crate::zipreader::probe_total_disks(&mut probe, file_size).ok()?;
+    Some(if n >= 2 {
+        LocalLayout::MultiDisk(n)
+    } else {
+        LocalLayout::SingleDisk
+    })
+}
+
+fn local_source_for(
+    path: &Path,
+    hint: Option<LocalLayout>,
+) -> Result<Box<dyn crate::sources::ReadSeek>> {
     use crate::sources::multidisk::MultiDiskSource;
 
+    // Fast path: caller told us the layout. Skip the EOCD scan.
+    if let Some(layout) = hint {
+        return match layout {
+            LocalLayout::SingleDisk => {
+                let f = std::fs::File::open(path)
+                    .with_context(|| format!("open {}", path.display()))?;
+                Ok(Box::new(f))
+            }
+            LocalLayout::MultiDisk(n) => {
+                let md = MultiDiskSource::open(path, n).with_context(|| {
+                    format!("open multi-disk source for {}", path.display())
+                })?;
+                Ok(Box::new(md))
+            }
+        };
+    }
+
+    // No hint — scan EOCD once to decide. Same as the pre-hint
+    // behaviour; kept for callers that don't pre-probe (`tzip grep`
+    // inner workers, FSKit reader, etc.).
     let mut probe = std::fs::File::open(path)
         .with_context(|| format!("open {}", path.display()))?;
-    // Probe for multi-disk via the EOCD. On any read error treat as
-    // single-disk — Archive::open_source will surface the parse error.
     let file_size = match probe.seek(SeekFrom::End(0)) {
         Ok(n) => n,
         Err(_) => {
@@ -245,6 +302,18 @@ pub fn run_cat(opts: ReaderOptions) -> Result<()> {
 }
 
 pub fn run_extract(opts: ReaderOptions) -> Result<()> {
+    let profile_on = std::env::var("TZIP_PROFILE").ok().as_deref() == Some("1");
+    let overall_start = std::time::Instant::now();
+    let p = |stage: &str, start: std::time::Instant| {
+        if profile_on {
+            eprintln!(
+                "tzip profile: {:22} {:>8.3} ms",
+                stage,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    };
+
     let (to, names_filter, parallel_req, connections) = match &opts.op {
         ReaderOp::Extract {
             to,
@@ -255,10 +324,12 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
         _ => unreachable!("run_extract called with wrong op"),
     };
 
+    let t = std::time::Instant::now();
     fs::create_dir_all(&to)
         .with_context(|| format!("create extraction root {}", to.display()))?;
     let to = fs::canonicalize(&to)
         .with_context(|| format!("canonicalize {}", to.display()))?;
+    p("mkdir+canonicalize", t);
 
     // `--connections` caps worker count so you can bound an HTTP pool to a
     // size smaller than `-P`. On local archives the two flags collapse.
@@ -268,8 +339,10 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     }
     .max(1);
 
+    let t = std::time::Instant::now();
     let mut arch = open_archive(&opts.archive)
         .with_context(|| format!("open {}", opts.archive))?;
+    p("open_archive", t);
 
     let selected_set: Option<std::collections::HashSet<String>> = if names_filter.is_empty() {
         None
@@ -306,12 +379,14 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
             Some(sel) => sel.contains(&arch.entries()[idx].name),
         })
         .collect();
+    let t = std::time::Instant::now();
     let mut selected: Vec<ReadEntry> = Vec::with_capacity(selected_idx.len());
     for idx in selected_idx {
         arch.lfh_total_size_of(idx)?;
         selected.push(arch.entries()[idx].clone());
     }
     drop(arch);
+    p("lfh_probe_phase_A", t);
 
     // Phase B (serial): resolve on-disk destinations, create every parent
     // directory upfront (dedup'd via BTreeSet) so file-writing workers
@@ -334,10 +409,12 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
         }
         tasks.push((re, dest));
     }
+    let t = std::time::Instant::now();
     for d in &mkdir_set {
         fs::create_dir_all(d)
             .with_context(|| format!("mkdir {}", d.display()))?;
     }
+    p("mkdir_parents_phase_B", t);
 
     // Phase C (parallel): fan-out file extractions. Each worker holds its
     // own backing source so HTTP/S3 Range GETs overlap. Unbounded channel
@@ -358,6 +435,12 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     let verbose = opts.verbose;
     let extracted = AtomicUsize::new(0);
 
+    // Probe the archive's physical layout once on the main thread so
+    // workers skip the per-worker EOCD scan. The common case (local
+    // single-disk) collapses to a single `File::open` in the worker.
+    let layout_hint = probe_local_layout(&spec);
+
+    let t_fanout = std::time::Instant::now();
     std::thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::with_capacity(parallel);
         let workers = parallel.min(total_files.max(1));
@@ -367,7 +450,7 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
             let spec = spec.clone();
             let extracted = &extracted;
             let handle = scope.spawn(move || -> Result<()> {
-                let mut source = open_source_for(&spec)
+                let mut source = open_source_for_with_hint(&spec, layout_hint)
                     .with_context(|| format!("open worker source for {}", spec))?;
                 while let Ok((re, dest)) = rx.recv() {
                     let write_result = (|| -> Result<()> {
@@ -420,11 +503,14 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
         }
     })?;
 
+    p("fanout_phase_C", t_fanout);
+
     let file_count = extracted.into_inner();
     let total = file_count + explicit_dirs.len();
     if !opts.quiet {
         eprintln!("extracted {} entries to {}", total, to.display());
     }
+    p("TOTAL", overall_start);
     Ok(())
 }
 

@@ -50,6 +50,24 @@ pub fn mount(opts: MountOptions) -> Result<()> {
     if opts.verbose {
         opt_parts.push("verbose".to_string());
     }
+    // Writable FSKit mount: the Swift extension picks this up in
+    // `parseMountOptions` and dispatches to `tzip_open_volume_rw`.
+    // Remote archives are rejected on the Rust side (commit needs an
+    // atomic rename on a real filesystem path).
+    if opts.write {
+        let is_remote = opts.archive_spec.starts_with("http://")
+            || opts.archive_spec.starts_with("https://")
+            || opts.archive_spec.starts_with("s3://");
+        if is_remote {
+            if !opts.quiet {
+                eprintln!(
+                    "tzip mount: --write ignored for remote archive; mount is read-only"
+                );
+            }
+        } else {
+            opt_parts.push("write".to_string());
+        }
+    }
     let opts_str = opt_parts.join(",");
 
     let mp_str = opts
@@ -58,11 +76,18 @@ pub fn mount(opts: MountOptions) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("mountpoint is not valid UTF-8"))?;
 
     if !opts.quiet {
+        let mode = if opts_str.contains("write") { "rw" } else { "ro" };
         eprintln!(
-            "tzip mount: {} \u{2192} {}",
+            "tzip mount: {} \u{2192} {} ({})",
             opts.archive_spec,
-            opts.mountpoint.display()
+            opts.mountpoint.display(),
+            mode,
         );
+        if mode == "rw" {
+            eprintln!(
+                "tzip mount: --write mode — pending changes commit on unmount via FSKit's umount path"
+            );
+        }
         if keychain_tag.is_some() {
             eprintln!("tzip mount: AES password stashed in Keychain for the mount's lifetime");
         }

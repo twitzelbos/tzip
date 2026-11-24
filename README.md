@@ -727,7 +727,7 @@ tzip mount https://example.com/release.zip /tmp/mnt &
 |---|---|---|
 | `--cache-mb <N>` | 256 | Memory budget for the per-entry decompressed-body LRU cache. Soft limit — one oversized entry won't force a thrash, just briefly exceeds the budget. |
 | `--allow-other` | off | Add the `allow_other` FUSE option so other users on the host can read the mount. Needs `user_allow_other` in `/etc/fuse.conf`. |
-| `--write` | off | **Linux FUSE3 only.** Open the mount read-write. See *Writable mounts* below. |
+| `--write` | off | Open the mount read-write. Works on Linux FUSE3 and macOS FSKit (15.4+). See *Writable mounts* below. |
 | `-p, --password <PW>` | | AES password for encrypted entries. `--password-file` reads from file. |
 
 ### Semantics
@@ -745,36 +745,39 @@ tzip mount https://example.com/release.zip /tmp/mnt &
 
 ### Writable mounts (`--write`)
 
-Linux FUSE3 only in this release (FSKit r/w is a planned
-follow-up). Opt in with `--write`:
+Works on **Linux FUSE3** and **macOS FSKit (15.4+)** with the same
+semantics. Opt in with `--write`:
 
 ```
 tzip mount out.zip /tmp/mnt --write &
 echo "edit through the mount" > /tmp/mnt/notes/new.md
 rm /tmp/mnt/stale-logs/*.log
 mkdir /tmp/mnt/fresh-dir
-fusermount3 -u /tmp/mnt        # commit happens here
+# Unmount via Ctrl-C on the `tzip mount`, or:
+fusermount3 -u /tmp/mnt    # Linux
+umount /tmp/mnt            # macOS
 ```
 
-Semantics:
+Semantics (same on both platforms):
 
 - **All edits buffer in memory.** `create`, `write`, `unlink`,
   `mkdir`, `rmdir`, and `truncate` modify an in-RAM journal — the
   on-disk archive is untouched.
-- **Commit happens on unmount.** When the FUSE session ends (Ctrl-C
-  the `tzip mount`, or `fusermount3 -u`), the journal is replayed
-  through `tzip u --atomic`: a new archive builds in a tempfile,
-  then renames over the original. Partial commits can't happen.
+- **Commit happens on unmount.** When the session ends, the journal
+  is replayed through `tzip u --atomic`: a new archive builds in a
+  tempfile, then renames over the original. Partial commits can't
+  happen.
 - **A crash before unmount loses the pending changes** but never
   corrupts the archive — the original is only overwritten by a
   fully-formed replacement.
 - **Not supported yet in this cut**: rename, chmod/chown, setting
-  explicit mtime. `touch`, `cp -p`, and `install -m` won't error
-  (the setattr calls accept the metadata silently) but the values
-  don't persist.
+  explicit mtime, symbolic links, hard links. `touch`, `cp -p`,
+  and `install -m` won't error on either platform (the setattr
+  calls accept the metadata silently) but the values don't persist.
 - **Local archives only.** `--write` on an `http://`, `https://`,
   or `s3://` archive is ignored and the mount stays read-only
-  (noted in the mount-startup banner).
+  (noted in the mount-startup banner — FSKit also fails loudly at
+  `loadResource` if someone bypasses the CLI check).
 
 ### Platform support
 

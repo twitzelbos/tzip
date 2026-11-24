@@ -30,9 +30,11 @@ final class TzipFSVolume: FSVolume,
 {
     // Opaque handle to the Rust VirtualFs; freed on deinit.
     private let handle: TzipVfsHandle
+    private let writable: Bool
 
     init(volumeID: FSVolume.Identifier, volumeName: FSFileName, handle: TzipVfsHandle) {
         self.handle = handle
+        self.writable = tzip_is_writable(handle) != 0
         super.init(volumeID: volumeID, volumeName: volumeName)
     }
 
@@ -83,12 +85,43 @@ final class TzipFSVolume: FSVolume,
     }
 
     func unmount(replyHandler reply: @escaping () -> Void) {
+        // Flush any pending writes before the volume vanishes. On a
+        // read-only mount this is a no-op in Rust; on a writable mount
+        // this rebuilds the archive via pipeline::run(update + atomic).
+        commitPendingWrites()
         reply()
     }
 
     func synchronize(flags: FSSyncFlags,
                      replyHandler reply: @escaping (Error?) -> Void) {
+        // Per-volume sync — in-memory writes need an unmount to land, so
+        // we accept the sync without side effects. FSKit still calls us
+        // eventually at unmount time to run the actual commit.
         reply(nil)
+    }
+
+    /// Call `tzip_commit` and log the outcome. Errors are surfaced to
+    /// stderr (the FSKit daemon logs these to Console.app) — we can't
+    /// fail the unmount cleanly from here, so we yell and move on.
+    /// The Rust side guarantees atomic rename: on commit failure the
+    /// original archive is untouched.
+    private func commitPendingWrites() {
+        if !writable { return }
+        var dirty: Int = 0
+        var tombstoned: Int = 0
+        var errPtr: UnsafeMutablePointer<CChar>? = nil
+        let rc = tzip_commit(handle, &dirty, &tombstoned, &errPtr)
+        if rc != 0 {
+            let msg = errPtr.map { String(cString: $0) } ?? "unknown"
+            if let e = errPtr { tzip_free_string(e) }
+            FileHandle.standardError.write(
+                "tzip FSKit: commit FAILED — pending changes not written: \(msg)\n"
+                    .data(using: .utf8) ?? Data())
+        } else if dirty > 0 || tombstoned > 0 {
+            FileHandle.standardError.write(
+                "tzip FSKit: committed \(dirty) new/changed entries, \(tombstoned) deletions\n"
+                    .data(using: .utf8) ?? Data())
+        }
     }
 
     func reclaimItem(_ item: FSItem,
@@ -149,7 +182,7 @@ final class TzipFSVolume: FSVolume,
         out.size = c.size
         out.allocSize = (c.size + 511) & ~UInt64(511)
         out.fileID = FSItem.Identifier(rawValue: c.ino) ?? FSItem.Identifier.rootDirectory
-        var ts = timespec(tv_sec: Int(c.mtime_unix), tv_nsec: 0)
+        let ts = timespec(tv_sec: Int(c.mtime_unix), tv_nsec: 0)
         out.modifyTime = ts
         out.changeTime = ts
         out.accessTime = ts
@@ -160,7 +193,33 @@ final class TzipFSVolume: FSVolume,
     func setAttributes(_ newAttributes: FSItem.SetAttributesRequest,
                        on item: FSItem,
                        replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void) {
-        reply(nil, posixError(EROFS))
+        guard writable else {
+            reply(nil, posixError(EROFS))
+            return
+        }
+        guard let it = item as? TzipFSItem else {
+            reply(nil, posixError(EINVAL))
+            return
+        }
+        // Only the size field drives a real change — truncate. chmod /
+        // chown / timestamp changes are accepted silently to keep
+        // `touch`, `cp -p`, and `install -m` from erroring; they just
+        // don't persist (the writer emits a fixed mode and now() mtime).
+        if newAttributes.isValid(.size) {
+            let rc = tzip_truncate(handle, it.ino, newAttributes.size)
+            if rc != 0 {
+                reply(nil, posixError(errnoFromTzipCode(rc)))
+                return
+            }
+        }
+        // Return the item's current attributes.
+        var c = CAttr()
+        let g = tzip_getattr(handle, it.ino, &c)
+        if g != 0 {
+            reply(nil, posixError(ENOENT))
+            return
+        }
+        reply(fsAttributes(from: c), nil)
     }
 
     func createItem(named name: FSFileName,
@@ -168,7 +227,32 @@ final class TzipFSVolume: FSVolume,
                     inDirectory directory: FSItem,
                     attributes newAttributes: FSItem.SetAttributesRequest,
                     replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
-        reply(nil, nil, posixError(EROFS))
+        guard writable else {
+            reply(nil, nil, posixError(EROFS))
+            return
+        }
+        guard let parent = directory as? TzipFSItem else {
+            reply(nil, nil, posixError(EINVAL))
+            return
+        }
+        var attr = CAttr()
+        let data = name.data
+        let rc: Int32 = data.withUnsafeBytes { buf in
+            guard let p = buf.bindMemory(to: UInt8.self).baseAddress else { return Int32(EINVAL) }
+            switch type {
+            case .file:
+                return tzip_create(handle, parent.ino, p, data.count, &attr)
+            case .directory:
+                return tzip_mkdir(handle, parent.ino, p, data.count, &attr)
+            default:
+                return Int32(EINVAL)
+            }
+        }
+        if rc != 0 {
+            reply(nil, nil, posixError(errnoFromTzipCode(rc)))
+            return
+        }
+        reply(TzipFSItem(ino: attr.ino), name, nil)
     }
 
     func createSymbolicLink(named name: FSFileName,
@@ -176,6 +260,9 @@ final class TzipFSVolume: FSVolume,
                             attributes newAttributes: FSItem.SetAttributesRequest,
                             linkContents contents: FSFileName,
                             replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
+        // ZIP has no first-class symlink encoding (it fakes them via a
+        // Unix-mode external attr), and we don't persist arbitrary
+        // mode bits yet. Keep this at EROFS until we do.
         reply(nil, nil, posixError(EROFS))
     }
 
@@ -183,6 +270,7 @@ final class TzipFSVolume: FSVolume,
                     named name: FSFileName,
                     inDirectory directory: FSItem,
                     replyHandler reply: @escaping (FSFileName?, Error?) -> Void) {
+        // Hardlinks aren't representable in ZIP.
         reply(nil, posixError(EROFS))
     }
 
@@ -193,6 +281,8 @@ final class TzipFSVolume: FSVolume,
                     inDirectory destinationDirectory: FSItem,
                     overItem existingItem: FSItem?,
                     replyHandler reply: @escaping (FSFileName?, Error?) -> Void) {
+        // Deferred: rename needs VFS-level support (not yet added to
+        // either Linux or macOS write paths). Matches the Linux cut.
         reply(nil, posixError(EROFS))
     }
 
@@ -200,7 +290,32 @@ final class TzipFSVolume: FSVolume,
                     named name: FSFileName,
                     fromDirectory directory: FSItem,
                     replyHandler reply: @escaping (Error?) -> Void) {
-        reply(posixError(EROFS))
+        guard writable else {
+            reply(posixError(EROFS))
+            return
+        }
+        guard let parent = directory as? TzipFSItem,
+              let target = item as? TzipFSItem else {
+            reply(posixError(EINVAL))
+            return
+        }
+        // Dispatch unlink vs rmdir based on the item's kind.
+        var c = CAttr()
+        _ = tzip_getattr(handle, target.ino, &c)
+        let data = name.data
+        let rc: Int32 = data.withUnsafeBytes { buf in
+            guard let p = buf.bindMemory(to: UInt8.self).baseAddress else { return Int32(EINVAL) }
+            if c.kind == 1 {
+                return tzip_rmdir(handle, parent.ino, p, data.count)
+            } else {
+                return tzip_unlink(handle, parent.ino, p, data.count)
+            }
+        }
+        if rc != 0 {
+            reply(posixError(errnoFromTzipCode(rc)))
+            return
+        }
+        reply(nil)
     }
 
     func enumerateDirectory(_ directory: FSItem,
@@ -285,7 +400,46 @@ final class TzipFSVolume: FSVolume,
                to item: FSItem,
                at offset: off_t,
                replyHandler reply: @escaping (Int, Error?) -> Void) {
-        reply(0, posixError(EROFS))
+        guard writable else {
+            reply(0, posixError(EROFS))
+            return
+        }
+        guard let it = item as? TzipFSItem else {
+            reply(0, posixError(EINVAL))
+            return
+        }
+        var written: Int = 0
+        var rc: Int32 = -1
+        contents.withUnsafeBytes { raw in
+            guard let p = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            rc = tzip_write(handle, it.ino, UInt64(offset), p, contents.count, &written)
+        }
+        if rc != 0 {
+            reply(0, posixError(errnoFromTzipCode(rc)))
+            return
+        }
+        reply(written, nil)
+    }
+
+    // MARK: Attribute helpers
+
+    private func fsAttributes(from c: CAttr) -> FSItem.Attributes {
+        let out = FSItem.Attributes()
+        out.uid = UInt32(getuid())
+        out.gid = UInt32(getgid())
+        out.mode = c.mode
+        out.type = (c.kind == 1) ? .directory : .file
+        out.linkCount = 1
+        out.flags = 0
+        out.size = c.size
+        out.allocSize = (c.size + 511) & ~UInt64(511)
+        out.fileID = FSItem.Identifier(rawValue: c.ino) ?? FSItem.Identifier.rootDirectory
+        let ts = timespec(tv_sec: Int(c.mtime_unix), tv_nsec: 0)
+        out.modifyTime = ts
+        out.changeTime = ts
+        out.accessTime = ts
+        out.birthTime = ts
+        return out
     }
 }
 
@@ -293,4 +447,16 @@ final class TzipFSVolume: FSVolume,
 
 private func posixError(_ code: Int32) -> NSError {
     NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: nil)
+}
+
+/// Translate a tzip ABI return code (negative errno) to a positive
+/// errno suitable for `posixError(_:)`. Unknown codes fall through to
+/// EIO so the caller sees a non-zero reply rather than a spurious
+/// success.
+private func errnoFromTzipCode(_ rc: Int32) -> Int32 {
+    if rc < 0 {
+        let positive = -rc
+        if positive > 0 { return positive }
+    }
+    return EIO
 }

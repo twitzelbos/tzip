@@ -6,8 +6,9 @@
 //! are POSIX errno-shaped (`0` = OK, `-ENOENT` etc.).
 //!
 //! Lifetime rules:
-//! - `tzip_open_volume` allocates the `VirtualFs` with `Box::into_raw`;
-//!   the returned pointer MUST be released via `tzip_close_volume`.
+//! - `tzip_open_volume` / `tzip_open_volume_rw` allocate the `VirtualFs`
+//!   with `Box::into_raw`; the returned pointer MUST be released via
+//!   `tzip_close_volume`.
 //! - All other functions borrow the handle non-destructively.
 //! - Output buffers (`out_err`, `out_entries`) are caller-allocated;
 //!   where we write C strings via `tzip_strdup`, the caller is
@@ -21,6 +22,7 @@
 
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::os::raw::c_void;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::vfs::{Attr, NodeKind, VirtualFs, ROOT_INO};
@@ -32,9 +34,12 @@ use crate::zipreader::Archive;
 pub const TZIP_OK: c_int = 0;
 pub const TZIP_ENOENT: c_int = -2;
 pub const TZIP_EIO: c_int = -5;
-pub const TZIP_EINVAL: c_int = -22;
+pub const TZIP_EEXIST: c_int = -17;
 pub const TZIP_ENOTDIR: c_int = -20;
 pub const TZIP_EISDIR: c_int = -21;
+pub const TZIP_EINVAL: c_int = -22;
+pub const TZIP_ENOTEMPTY: c_int = -39;
+pub const TZIP_EROFS: c_int = -30;
 
 /// Opaque handle wrapping a boxed `VirtualFs`.
 #[repr(C)]
@@ -52,7 +57,8 @@ pub struct CAttr {
     pub size: u64,
     /// 0 = file, 1 = directory.
     pub kind: u8,
-    /// POSIX mode bits for the item (0o444 or 0o555).
+    /// POSIX mode bits for the item. 0o444/0o555 in a read-only volume;
+    /// 0o644/0o755 in a writable one.
     pub mode: u32,
     /// Unix seconds since epoch.
     pub mtime_unix: i64,
@@ -71,9 +77,10 @@ pub struct CDirEntry {
 
 // ── open / close ──────────────────────────────────────────────────────────
 
-/// Open an archive and construct a `VirtualFs` behind the opaque handle.
-/// `archive_url` is a NUL-terminated UTF-8 string (local path, http URL,
-/// or s3 URL). `password` may be NULL for non-AES archives.
+/// Open an archive and construct a read-only `VirtualFs` behind the
+/// opaque handle. `archive_url` is a NUL-terminated UTF-8 string (local
+/// path, http URL, or s3 URL). `password` may be NULL for non-AES
+/// archives.
 ///
 /// On success returns 0 and writes the handle to `*out_handle`.
 /// On failure returns a negative errno-shaped code and writes a
@@ -84,6 +91,51 @@ pub unsafe extern "C" fn tzip_open_volume(
     password: *const c_char,
     cache_mb: u32,
     verbose: u8,
+    out_handle: *mut TzipVfsHandle,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    open_volume_impl(
+        archive_url,
+        password,
+        cache_mb,
+        verbose,
+        /*writable=*/ false,
+        out_handle,
+        out_err,
+    )
+}
+
+/// Open an archive and construct a **writable** `VirtualFs`. Same
+/// contract as `tzip_open_volume` but writes buffer in RAM until
+/// `tzip_commit` lands them. Remote archives (http/https/s3) are
+/// rejected with -EINVAL + an error string — commit needs atomic
+/// rename on a real filesystem path.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_open_volume_rw(
+    archive_url: *const c_char,
+    password: *const c_char,
+    cache_mb: u32,
+    verbose: u8,
+    out_handle: *mut TzipVfsHandle,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    open_volume_impl(
+        archive_url,
+        password,
+        cache_mb,
+        verbose,
+        /*writable=*/ true,
+        out_handle,
+        out_err,
+    )
+}
+
+unsafe fn open_volume_impl(
+    archive_url: *const c_char,
+    password: *const c_char,
+    cache_mb: u32,
+    verbose: u8,
+    writable: bool,
     out_handle: *mut TzipVfsHandle,
     out_err: *mut *mut c_char,
 ) -> c_int {
@@ -103,11 +155,47 @@ pub unsafe extern "C" fn tzip_open_volume(
         }
     };
 
+    // Writable mounts need atomic rename on a real filesystem path; HTTP
+    // + S3 can't support that. Fail loudly instead of silently dropping
+    // commits on unmount.
+    let is_remote = url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("s3://");
+    if writable && is_remote {
+        return write_err(
+            out_err,
+            "writable FSKit mount only supports local archives — \
+             HTTP/S3 would have nowhere to commit back to",
+        );
+    }
+
     let archive: Archive = match open_archive(&url) {
         Ok(a) => a,
         Err(e) => return write_err(out_err, &format!("open {}: {:#}", url, e)),
     };
-    let vfs = match VirtualFs::new(archive, pw, cache_mb.max(1) as usize, verbose != 0) {
+
+    let archive_path = if writable {
+        match std::fs::canonicalize(&url) {
+            Ok(p) => p,
+            Err(e) => {
+                return write_err(
+                    out_err,
+                    &format!("canonicalize archive path {}: {}", url, e),
+                );
+            }
+        }
+    } else {
+        PathBuf::new()
+    };
+
+    let vfs = match VirtualFs::new_full(
+        archive,
+        pw,
+        cache_mb.max(1) as usize,
+        verbose != 0,
+        writable,
+        archive_path,
+    ) {
         Ok(v) => v,
         Err(e) => return write_err(out_err, &format!("vfs init: {:#}", e)),
     };
@@ -132,6 +220,22 @@ pub unsafe extern "C" fn tzip_root_ino() -> u64 {
     ROOT_INO
 }
 
+/// Whether this handle was opened writable (0 = read-only, 1 = rw).
+/// Lets the Swift side decide whether to short-circuit setAttributes /
+/// createItem / etc. with EROFS before crossing the ABI.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_is_writable(handle: TzipVfsHandle) -> u8 {
+    if handle.inner.is_null() {
+        return 0;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    if vfs.is_writable() {
+        1
+    } else {
+        0
+    }
+}
+
 // ── metadata ──────────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -146,7 +250,7 @@ pub unsafe extern "C" fn tzip_getattr(
     let vfs = &*(handle.inner as *const VirtualFs);
     match vfs.getattr(ino) {
         Some(a) => {
-            *out_attr = to_cattr(a);
+            *out_attr = to_cattr(a, vfs.is_writable());
             TZIP_OK
         }
         None => TZIP_ENOENT,
@@ -168,7 +272,7 @@ pub unsafe extern "C" fn tzip_lookup(
     let slice = std::slice::from_raw_parts(name, name_len);
     match vfs.lookup(parent, slice) {
         Some(a) => {
-            *out_attr = to_cattr(a);
+            *out_attr = to_cattr(a, vfs.is_writable());
             TZIP_OK
         }
         None => TZIP_ENOENT,
@@ -241,8 +345,167 @@ pub unsafe extern "C" fn tzip_read(
     }
 }
 
+// ── write-side (writable mounts only) ─────────────────────────────────────
+
+/// Write `data_len` bytes from `data` at `offset` to file-inode `ino`.
+/// On success, writes `data_len` to `*written`. Short writes don't
+/// happen — we accept the full buffer or fail.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_write(
+    handle: TzipVfsHandle,
+    ino: u64,
+    offset: u64,
+    data: *const u8,
+    data_len: usize,
+    written: *mut usize,
+) -> c_int {
+    if handle.inner.is_null() || data.is_null() || written.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    let slice = std::slice::from_raw_parts(data, data_len);
+    match vfs.write(ino, offset, slice) {
+        Ok(_) => {
+            *written = data_len;
+            TZIP_OK
+        }
+        Err(e) => map_err_to_errno(&e),
+    }
+}
+
+/// Create a new regular file as a child of `parent_ino`. Writes the
+/// new inode's attributes to `*out_attr`.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_create(
+    handle: TzipVfsHandle,
+    parent_ino: u64,
+    name: *const u8,
+    name_len: usize,
+    out_attr: *mut CAttr,
+) -> c_int {
+    if handle.inner.is_null() || name.is_null() || out_attr.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    let slice = std::slice::from_raw_parts(name, name_len);
+    match vfs.create(parent_ino, slice) {
+        Ok(a) => {
+            *out_attr = to_cattr(a, vfs.is_writable());
+            TZIP_OK
+        }
+        Err(e) => map_err_to_errno(&e),
+    }
+}
+
+/// Create an empty directory under `parent_ino`.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_mkdir(
+    handle: TzipVfsHandle,
+    parent_ino: u64,
+    name: *const u8,
+    name_len: usize,
+    out_attr: *mut CAttr,
+) -> c_int {
+    if handle.inner.is_null() || name.is_null() || out_attr.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    let slice = std::slice::from_raw_parts(name, name_len);
+    match vfs.mkdir(parent_ino, slice) {
+        Ok(a) => {
+            *out_attr = to_cattr(a, vfs.is_writable());
+            TZIP_OK
+        }
+        Err(e) => map_err_to_errno(&e),
+    }
+}
+
+/// Remove a file entry from `parent_ino`.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_unlink(
+    handle: TzipVfsHandle,
+    parent_ino: u64,
+    name: *const u8,
+    name_len: usize,
+) -> c_int {
+    if handle.inner.is_null() || name.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    let slice = std::slice::from_raw_parts(name, name_len);
+    match vfs.unlink(parent_ino, slice) {
+        Ok(()) => TZIP_OK,
+        Err(e) => map_err_to_errno(&e),
+    }
+}
+
+/// Remove an empty directory from `parent_ino`.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_rmdir(
+    handle: TzipVfsHandle,
+    parent_ino: u64,
+    name: *const u8,
+    name_len: usize,
+) -> c_int {
+    if handle.inner.is_null() || name.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    let slice = std::slice::from_raw_parts(name, name_len);
+    match vfs.rmdir(parent_ino, slice) {
+        Ok(()) => TZIP_OK,
+        Err(e) => map_err_to_errno(&e),
+    }
+}
+
+/// Resize file `ino` to exactly `new_size` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tzip_truncate(
+    handle: TzipVfsHandle,
+    ino: u64,
+    new_size: u64,
+) -> c_int {
+    if handle.inner.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    match vfs.truncate(ino, new_size) {
+        Ok(()) => TZIP_OK,
+        Err(e) => map_err_to_errno(&e),
+    }
+}
+
+/// Flush pending writes to the on-disk archive via the update engine.
+/// Writes the number of new/changed entries to `*dirty_out` and the
+/// number of deletions to `*tombstoned_out` on success. Safe to call
+/// on a read-only mount (no-op, returns 0).
+#[no_mangle]
+pub unsafe extern "C" fn tzip_commit(
+    handle: TzipVfsHandle,
+    dirty_out: *mut usize,
+    tombstoned_out: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    if handle.inner.is_null() {
+        return TZIP_EINVAL;
+    }
+    let vfs = &*(handle.inner as *const VirtualFs);
+    match vfs.commit() {
+        Ok(summary) => {
+            if !dirty_out.is_null() {
+                *dirty_out = summary.dirty;
+            }
+            if !tombstoned_out.is_null() {
+                *tombstoned_out = summary.tombstoned;
+            }
+            TZIP_OK
+        }
+        Err(e) => write_err(out_err, &format!("commit: {:#}", e)),
+    }
+}
+
 /// Free a string allocated by the Rust side (used for `CDirEntry.name`
-/// and `out_err` of `tzip_open_volume`).
+/// and `out_err` of `tzip_open_volume` / `tzip_commit`).
 #[no_mangle]
 pub unsafe extern "C" fn tzip_free_string(s: *mut c_char) {
     if !s.is_null() {
@@ -259,10 +522,16 @@ fn kind_to_u8(k: NodeKind) -> u8 {
     }
 }
 
-fn to_cattr(a: Attr) -> CAttr {
+fn to_cattr(a: Attr, writable: bool) -> CAttr {
     let (kind_u8, mode) = match a.kind {
-        NodeKind::File => (0u8, 0o444u32),
-        NodeKind::Dir => (1u8, 0o555u32),
+        NodeKind::File => {
+            let m = if writable { 0o644u32 } else { 0o444u32 };
+            (0u8, m)
+        }
+        NodeKind::Dir => {
+            let m = if writable { 0o755u32 } else { 0o555u32 };
+            (1u8, m)
+        }
     };
     CAttr {
         ino: a.ino,
@@ -280,6 +549,25 @@ unsafe fn write_err(out_err: *mut *mut c_char, msg: &str) -> c_int {
         }
     }
     TZIP_EIO
+}
+
+/// Map a `VirtualFs` anyhow::Error to the closest errno-shaped code.
+/// The VFS raises error messages that contain `ENOENT` / `EEXIST` /
+/// `EROFS` / etc. keywords — we scrape those rather than introducing
+/// a typed error enum just for the ABI crossing.
+fn map_err_to_errno(err: &anyhow::Error) -> c_int {
+    let msg = format!("{err:#}");
+    if msg.contains("read-only") {
+        TZIP_EROFS
+    } else if msg.contains("EEXIST") {
+        TZIP_EEXIST
+    } else if msg.contains("ENOENT") || msg.contains("EISDIR") || msg.contains("ENOTDIR") {
+        TZIP_ENOENT
+    } else if msg.contains("ENOTEMPTY") {
+        TZIP_ENOTEMPTY
+    } else {
+        TZIP_EIO
+    }
 }
 
 // Keep the `Arc` import useful so cargo doesn't flag it unused on some

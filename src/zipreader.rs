@@ -119,6 +119,10 @@ pub struct Archive {
     /// linear CDR scan when absent — index entries are strictly
     /// additive and archives without them keep working identically.
     name_index: Option<crate::nameidx::NameIndex>,
+    /// Parsed `.tzip/terms.v1` hashed inverted term index. `tzip grep`
+    /// uses it to narrow candidate entries for literal-token
+    /// queries before running the regex scan.
+    term_index: Option<crate::termidx::TermIndex>,
 }
 
 impl Archive {
@@ -283,8 +287,10 @@ impl Archive {
             archive_comment,
             disk_count: 1,
             name_index: None,
+            term_index: None,
         };
         arch.try_load_name_index();
+        arch.try_load_term_index();
         Ok(arch)
     }
 
@@ -383,8 +389,10 @@ impl Archive {
             archive_comment,
             disk_count,
             name_index: None,
+            term_index: None,
         };
         arch.try_load_name_index();
+        arch.try_load_term_index();
         Ok(arch)
     }
 
@@ -407,33 +415,60 @@ impl Archive {
     /// leaves `self.name_index = None` on any failure — the lookup
     /// path falls back to linear scan, which is strictly correct.
     fn try_load_name_index(&mut self) {
-        let idx = self.entries.iter().position(|e| e.name == crate::nameidx::INDEX_ENTRY_NAME);
-        let Some(i) = idx else { return };
-        // Populate LFH size so we can locate the body.
-        if self.lfh_total_size_of(i).is_err() {
-            return;
-        }
-        let re = &self.entries[i];
-        // We only emit the index entry with method=0 (Store) and
-        // never encrypted; other shapes shouldn't exist, and if an
-        // archive has an index entry under those conditions we
-        // conservatively skip it.
-        if re.method_on_wire != 0 || re.encrypted {
-            return;
-        }
-        let body_off = re.lfh_offset + re.lfh_total_size as u64;
-        let mut body = vec![0u8; re.comp_size as usize];
-        if self
-            .source
-            .seek(SeekFrom::Start(body_off))
-            .and_then(|_| self.source.read_exact(&mut body))
-            .is_err()
-        {
-            return;
-        }
+        let body = match self.read_index_body(crate::nameidx::INDEX_ENTRY_NAME) {
+            Some(b) => b,
+            None => return,
+        };
         if let Ok(ni) = crate::nameidx::NameIndex::parse(&body) {
             self.name_index = Some(ni);
         }
+    }
+
+    /// Try to load `.tzip/terms.v1` as a `TermIndex`. Same silent-
+    /// fallback policy as `try_load_name_index`.
+    fn try_load_term_index(&mut self) {
+        let body = match self.read_index_body(crate::termidx::INDEX_ENTRY_NAME) {
+            Some(b) => b,
+            None => return,
+        };
+        if let Ok(ti) = crate::termidx::TermIndex::parse(&body) {
+            self.term_index = Some(ti);
+        }
+    }
+
+    /// Shared reader for `.tzip/*.v1` sentinel entries. They're always
+    /// written as uncompressed, unencrypted Store entries so we can
+    /// read them directly off the source without going through the
+    /// decompress stack. Returns `None` on any failure so callers
+    /// just skip the feature.
+    fn read_index_body(&mut self, name: &str) -> Option<Vec<u8>> {
+        let idx = self.entries.iter().position(|e| e.name == name)?;
+        self.lfh_total_size_of(idx).ok()?;
+        let re = &self.entries[idx];
+        if re.method_on_wire != 0 || re.encrypted {
+            return None;
+        }
+        let body_off = re.lfh_offset + re.lfh_total_size as u64;
+        let mut body = vec![0u8; re.comp_size as usize];
+        self.source
+            .seek(SeekFrom::Start(body_off))
+            .and_then(|_| self.source.read_exact(&mut body))
+            .ok()?;
+        Some(body)
+    }
+
+    /// Entry indices that could contain every literal token in
+    /// `query`, if the archive carries a `.tzip/terms.v1` index and
+    /// the query has indexable tokens. Returns:
+    /// - `Some(Some(set))` when the index applies; `set` may be
+    ///   empty if no entry has any of the query's tokens.
+    /// - `Some(None)` when the index applies but `query` has no
+    ///   usable tokens (all too short / punctuation-only) — caller
+    ///   should fall through to full linear scan.
+    /// - `None` when the archive has no term index at all.
+    pub fn term_candidates(&self, query: &str) -> Option<Option<std::collections::HashSet<u32>>> {
+        let ti = self.term_index.as_ref()?;
+        Some(ti.candidates(query))
     }
 
     pub fn disk_count(&self) -> usize {

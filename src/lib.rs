@@ -17,6 +17,7 @@ pub mod find;
 pub mod grep;
 pub mod hash;
 pub mod nameidx;
+pub mod termidx;
 pub mod mount;
 pub mod pipeline;
 pub mod platform;

@@ -238,6 +238,17 @@ pub struct CreateArgs {
     /// as a normal (small) ZIP entry and ignore it.
     #[arg(long)]
     pub index_names: bool,
+
+    /// Build a hashed inverted term index over text entries whose
+    /// name matches this glob (repeatable). Stored as `.tzip/terms.v1`
+    /// inside the archive. Later `tzip grep LITERAL archive.zip`
+    /// consults the index to find the set of entries that could
+    /// contain each literal token, then runs its regex scan only
+    /// against those — sub-second grep across archives where the
+    /// term is rare. Regex queries that don't contain any literal
+    /// tokens fall back to full linear scan.
+    #[arg(long, value_name = "GLOB")]
+    pub index_terms: Vec<String>,
 }
 
 // ── Update ─────────────────────────────────────────────────────────────────
@@ -705,6 +716,9 @@ pub struct Options {
     /// When set, pipeline writes a `.tzip/names.v1` entry at the end
     /// of the archive carrying an MPH over all entry names.
     pub index_names: bool,
+    /// Globs of entries to tokenize + index with a hashed inverted
+    /// term index in `.tzip/terms.v1`. Empty = skip.
+    pub index_terms: Vec<String>,
 }
 
 /// Which reader op is running and what it needs.
@@ -870,6 +884,7 @@ impl CreateArgs {
             write_md5: self.write_md5,
             write_sha256: self.write_sha256,
             index_names: self.index_names,
+            index_terms: self.index_terms,
         })
     }
 }
@@ -945,6 +960,7 @@ impl UpdateArgs {
             // of the roadmap handles segmented index updates; for now
             // we skip index emission on update.
             index_names: false,
+            index_terms: Vec::new(),
         })
     }
 }

@@ -958,6 +958,7 @@ impl VirtualFs {
             write_md5: false,
             write_sha256: false,
             index_names: false,
+            index_terms: Vec::new(),
         })
     }
 }

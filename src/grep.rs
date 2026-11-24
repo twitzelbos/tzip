@@ -114,12 +114,35 @@ fn process_archive(
         .iter()
         .filter_map(|(u, n)| (u == url).then(|| n.as_str()))
         .collect();
+    // If the archive carries a `.tzip/terms.v1` index AND the user's
+    // regex pattern has an extractable literal set of tokens (a plain
+    // literal string with no regex metacharacters), consult the
+    // index to narrow the candidate set. Everything else falls
+    // through to full linear scan.
+    let term_candidates: Option<std::collections::HashSet<u32>> =
+        if is_plain_literal(&opts.pattern) {
+            match driver.term_candidates(&opts.pattern) {
+                Some(Some(set)) => Some(set),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
     // Collect candidate indices first so we can mutably probe LFH sizes
     // without holding an immutable borrow of driver.entries().
     let candidates: Vec<usize> = (0..driver.entries().len())
         .filter(|&idx| {
             let re = &driver.entries()[idx];
-            entry_passes_filters(re, &opts) && !url_skip.contains(re.name.as_str())
+            if !entry_passes_filters(re, &opts) || url_skip.contains(re.name.as_str()) {
+                return false;
+            }
+            if let Some(ref set) = term_candidates {
+                if !set.contains(&(idx as u32)) {
+                    return false;
+                }
+            }
+            true
         })
         .collect();
     let mut filtered: Vec<ReadEntry> = Vec::with_capacity(candidates.len());
@@ -432,6 +455,21 @@ fn emit_match(
 }
 
 // ── CDR filters ────────────────────────────────────────────────────────────
+
+/// `true` when `pattern` is a plain literal — no regex metacharacters.
+/// Used to decide whether the `.tzip/terms.v1` index can safely narrow
+/// the candidate set. Complex patterns always run through linear scan.
+///
+/// We deliberately miss some patterns that *could* benefit from the
+/// index (e.g. `"error.*memory"` has two literal substrings) rather
+/// than introduce a regex→literal-extractor dependency; the common
+/// case is plain-literal user queries.
+fn is_plain_literal(pattern: &str) -> bool {
+    // Any of these characters means regex syntax; bail out.
+    !pattern
+        .chars()
+        .any(|c| matches!(c, '\\' | '^' | '$' | '.' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}'))
+}
 
 fn entry_passes_filters(re: &ReadEntry, opts: &GrepOptions) -> bool {
     if !opts.include.is_empty() && !opts.include.iter().any(|g| glob_match(g, &re.name)) {

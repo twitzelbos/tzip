@@ -165,10 +165,26 @@ impl<W: Write + Seek> ZipWriter<W> {
         Ok(())
     }
 
-    pub fn write_entry(&mut self, e: &EncodedEntry) -> Result<()> {
-        let name_bytes = e.name.as_bytes();
-        let comp_size = e.body.len() as u64;
-        let uncomp_size = e.uncompressed_size;
+    pub fn write_entry(&mut self, e: EncodedEntry) -> Result<()> {
+        // Consume the entry so we can hand its `name` straight into
+        // `CentralEntry` as owned bytes (no clone), and hand its
+        // `body` into `write_all` as a drop-at-end move.
+        let EncodedEntry {
+            index: _,
+            name,
+            body,
+            method_on_wire,
+            inner_method,
+            encrypted,
+            gp_bit1,
+            version_needed,
+            crc32,
+            uncompressed_size: uncomp_size,
+            mtime,
+            external_attr,
+        } = e;
+        let name_bytes = name.into_bytes();
+        let comp_size = body.len() as u64;
         let needs_zip64 = comp_size >= 0xFFFF_FFFF || uncomp_size >= 0xFFFF_FFFF;
 
         let lfh_offset = self.pos;
@@ -176,23 +192,23 @@ impl<W: Write + Seek> ZipWriter<W> {
         // -- Local file header
         let mut lfh = Vec::with_capacity(30 + name_bytes.len() + 16);
         lfh.write_u32::<LittleEndian>(SIG_LFH)?;
-        let vn = if needs_zip64 { e.version_needed.max(45) } else { e.version_needed.max(20) };
+        let vn = if needs_zip64 { version_needed.max(45) } else { version_needed.max(20) };
         lfh.write_u16::<LittleEndian>(vn)?; // version needed to extract
         // General purpose bit flag: bit 0 = encrypted (WinZIP AES requires it),
         // bit 1 = "LZMA EOS marker present" for method 14, bit 11 = UTF-8 name.
         let mut gpbf: u16 = 1 << 11;
-        if e.encrypted {
+        if encrypted {
             gpbf |= 1;
         }
-        if e.gp_bit1 {
+        if gp_bit1 {
             gpbf |= 1 << 1;
         }
         lfh.write_u16::<LittleEndian>(gpbf)?;
-        lfh.write_u16::<LittleEndian>(e.method_on_wire)?;
-        lfh.write_u16::<LittleEndian>(e.mtime.1)?; // time
-        lfh.write_u16::<LittleEndian>(e.mtime.0)?; // date
+        lfh.write_u16::<LittleEndian>(method_on_wire)?;
+        lfh.write_u16::<LittleEndian>(mtime.1)?; // time
+        lfh.write_u16::<LittleEndian>(mtime.0)?; // date
         // CRC-32: zero on wire for AE-2
-        let wire_crc = if e.encrypted { 0 } else { e.crc32 };
+        let wire_crc = if encrypted { 0 } else { crc32 };
         lfh.write_u32::<LittleEndian>(wire_crc)?;
         if needs_zip64 {
             lfh.write_u32::<LittleEndian>(0xFFFF_FFFF)?; // compressed size (in extra)
@@ -204,41 +220,41 @@ impl<W: Write + Seek> ZipWriter<W> {
         lfh.write_u16::<LittleEndian>(name_bytes.len() as u16)?;
         // Extra field length = zip64 (0 or 20) + AES (0 or 11)
         let extra_len = (if needs_zip64 { 4 + 16 } else { 0 })
-            + (if e.encrypted { 4 + 7 } else { 0 });
+            + (if encrypted { 4 + 7 } else { 0 });
         lfh.write_u16::<LittleEndian>(extra_len as u16)?;
-        lfh.extend_from_slice(name_bytes);
+        lfh.extend_from_slice(&name_bytes);
         if needs_zip64 {
             lfh.write_u16::<LittleEndian>(0x0001)?; // zip64
             lfh.write_u16::<LittleEndian>(16)?;
             lfh.write_u64::<LittleEndian>(uncomp_size)?;
             lfh.write_u64::<LittleEndian>(comp_size)?;
         }
-        if e.encrypted {
+        if encrypted {
             lfh.write_u16::<LittleEndian>(AES_EXTRA_ID)?;
             lfh.write_u16::<LittleEndian>(7)?;
             lfh.write_u16::<LittleEndian>(2)?; // AE-2
             lfh.extend_from_slice(b"AE"); // vendor ID
             lfh.write_u8(0x03)?; // 0x01=128, 0x02=192, 0x03=256
-            lfh.write_u16::<LittleEndian>(e.inner_method)?;
+            lfh.write_u16::<LittleEndian>(inner_method)?;
         }
 
         self.inner.write_all(&lfh)?;
-        self.inner.write_all(&e.body)?;
+        self.inner.write_all(&body)?;
         self.pos += lfh.len() as u64 + comp_size;
 
         self.entries.push(CentralEntry {
-            name: name_bytes.to_vec(),
-            method_on_wire: e.method_on_wire,
-            inner_method: e.inner_method,
-            encrypted: e.encrypted,
-            gp_bit1: e.gp_bit1,
+            name: name_bytes,
+            method_on_wire,
+            inner_method,
+            encrypted,
+            gp_bit1,
             version_needed: vn,
-            crc32: if e.encrypted { 0 } else { e.crc32 },
+            crc32: if encrypted { 0 } else { crc32 },
             comp_size,
             uncomp_size,
             lfh_offset,
-            mtime: e.mtime,
-            external_attr: e.external_attr,
+            mtime,
+            external_attr,
         });
         Ok(())
     }

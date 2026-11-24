@@ -635,17 +635,30 @@ pub fn run(opts: Options) -> Result<()> {
             while let Ok((index, item)) = feed_rx.recv() {
                 items.push((index, item));
             }
+            // Move chunks out of the Vec without cloning. The prior
+            // `items[start..end].to_vec()` cloned every WorkItem
+            // (`PathBuf` + `String` + optional `Arc`) per chunk; on a
+            // 100k-entry corpus that's a lot of allocator traffic
+            // before any work actually starts. `split_off` just does
+            // a bulk memmove on the pointer-sized `(u64, WorkItem)`
+            // tuples — WorkItem contents are moved, not cloned.
             let total = items.len();
-            let per = (total + n - 1) / n;
-            for i in 0..n {
-                let start = i * per;
-                if start >= total {
-                    break;
-                }
-                let end = ((i + 1) * per).min(total);
-                let chunk: Vec<(u64, WorkItem)> = items[start..end].to_vec();
-                if chunk_tx.send(chunk).is_err() {
-                    break;
+            if total > 0 {
+                let per = (total + n - 1) / n;
+                let mut remaining = items;
+                for _ in 0..n {
+                    if remaining.is_empty() {
+                        break;
+                    }
+                    let take = per.min(remaining.len());
+                    // split_off(at) returns `[at..]`, keeps `[..at]`
+                    // in self. Swap so `chunk` becomes the head and
+                    // `remaining` continues with the tail.
+                    let rest = remaining.split_off(take);
+                    let chunk = std::mem::replace(&mut remaining, rest);
+                    if chunk_tx.send(chunk).is_err() {
+                        break;
+                    }
                 }
             }
             drop(chunk_tx);

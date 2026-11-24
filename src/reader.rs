@@ -606,9 +606,10 @@ fn apply_metadata(f: &File, re: &ReadEntry, _default_mode: u32) {
 }
 
 fn find_entry_index(arch: &Archive, name: &str) -> Result<usize> {
-    arch.entries()
-        .iter()
-        .position(|e| e.name == name)
+    // `lookup_entry_idx` is O(1) when the archive carries a
+    // `.tzip/names.v1` MPH index; it falls back to the same linear
+    // scan this function used to do when no index is present.
+    arch.lookup_entry_idx(name)
         .ok_or_else(|| anyhow!("no entry named {:?} in archive", name))
 }
 

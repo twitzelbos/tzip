@@ -957,6 +957,7 @@ impl VirtualFs {
             atomic: true,
             write_md5: false,
             write_sha256: false,
+            index_names: false,
         })
     }
 }

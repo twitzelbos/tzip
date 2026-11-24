@@ -114,6 +114,11 @@ pub struct Archive {
     /// parallel readers against the same archive can use this instead
     /// of re-probing the EOCD themselves.
     disk_count: usize,
+    /// Parsed `.tzip/names.v1` MPH index, when the archive carries one.
+    /// `lookup_entry_idx` consults this first and falls back to a
+    /// linear CDR scan when absent — index entries are strictly
+    /// additive and archives without them keep working identically.
+    name_index: Option<crate::nameidx::NameIndex>,
 }
 
 impl Archive {
@@ -268,7 +273,7 @@ impl Archive {
 
         let tail_size = file_size - cd_offset;
         let archive_comment = decode_name(&eocd.comment_bytes, 0);
-        Ok(Self {
+        let mut arch = Self {
             source,
             entries,
             file_size,
@@ -277,7 +282,10 @@ impl Archive {
             tail_size,
             archive_comment,
             disk_count: 1,
-        })
+            name_index: None,
+        };
+        arch.try_load_name_index();
+        Ok(arch)
     }
 
     /// Open a multi-disk archive against the concatenated virtual source
@@ -365,7 +373,7 @@ impl Archive {
         let tail_size = file_size - cd_offset;
         let archive_comment = decode_name(&eocd.comment_bytes, 0);
         let disk_count = disk_starts.len();
-        Ok(Self {
+        let mut arch = Self {
             source,
             entries,
             file_size,
@@ -374,13 +382,60 @@ impl Archive {
             tail_size,
             archive_comment,
             disk_count,
-        })
+            name_index: None,
+        };
+        arch.try_load_name_index();
+        Ok(arch)
     }
 
     /// Number of physical disks this archive is spanned across. 1 for a
     /// standard single-file ZIP; `n ≥ 2` only for multi-disk archives
     /// opened through `Archive::open`. Lets extract/grep skip a
     /// redundant EOCD probe when fanning out worker sources.
+    /// Look up an entry index by name in `O(1)` when a
+    /// `.tzip/names.v1` MPH index is present, otherwise fall back to
+    /// an `O(N)` linear scan over the CDR. Archives built without
+    /// `tzip create --index-names` always take the fallback.
+    pub fn lookup_entry_idx(&self, name: &str) -> Option<usize> {
+        if let Some(idx) = &self.name_index {
+            return idx.lookup(name).map(|u| u as usize);
+        }
+        self.entries.iter().position(|e| e.name == name)
+    }
+
+    /// Try to load `.tzip/names.v1` as a `NameIndex`. Silently
+    /// leaves `self.name_index = None` on any failure — the lookup
+    /// path falls back to linear scan, which is strictly correct.
+    fn try_load_name_index(&mut self) {
+        let idx = self.entries.iter().position(|e| e.name == crate::nameidx::INDEX_ENTRY_NAME);
+        let Some(i) = idx else { return };
+        // Populate LFH size so we can locate the body.
+        if self.lfh_total_size_of(i).is_err() {
+            return;
+        }
+        let re = &self.entries[i];
+        // We only emit the index entry with method=0 (Store) and
+        // never encrypted; other shapes shouldn't exist, and if an
+        // archive has an index entry under those conditions we
+        // conservatively skip it.
+        if re.method_on_wire != 0 || re.encrypted {
+            return;
+        }
+        let body_off = re.lfh_offset + re.lfh_total_size as u64;
+        let mut body = vec![0u8; re.comp_size as usize];
+        if self
+            .source
+            .seek(SeekFrom::Start(body_off))
+            .and_then(|_| self.source.read_exact(&mut body))
+            .is_err()
+        {
+            return;
+        }
+        if let Ok(ni) = crate::nameidx::NameIndex::parse(&body) {
+            self.name_index = Some(ni);
+        }
+    }
+
     pub fn disk_count(&self) -> usize {
         self.disk_count
     }

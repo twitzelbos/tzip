@@ -35,14 +35,14 @@ pub fn run(opts: DiffOptions) -> Result<i32> {
         .with_context(|| format!("open archive b: {}", opts.b))?;
 
     let mut map_a: HashMap<String, EntryMeta> = HashMap::new();
-    for e in arch_a.entries() {
+    for e in arch_a.iter_entries() {
         if !passes_filters(&e.name, &opts.include, &opts.exclude) {
             continue;
         }
         map_a.insert(e.name.clone(), meta_from(e));
     }
     let mut map_b: HashMap<String, EntryMeta> = HashMap::new();
-    for e in arch_b.entries() {
+    for e in arch_b.iter_entries() {
         if !passes_filters(&e.name, &opts.include, &opts.exclude) {
             continue;
         }

@@ -12,13 +12,34 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::cli::{ReaderOp, ReaderOptions};
-use crate::crypto::{self, AE2_OVERHEAD};
-use crate::decompress::{self, ReadMethod};
-use crate::zipcrypto::{ZipCryptoReader, ZIPCRYPTO_HEADER_LEN};
-use crate::zipwriter::METHOD_AES;
+use crate::decompress::ReadMethod;
 use crate::sources::{http::HttpSource, s3::S3Source};
-use crate::zipreader::{Archive, ReadEntry};
+use crate::zipreader::{method_from_id, stream_entry_source_to, Archive, ReadEntry};
+
+/// Which reader op is running and what it needs. Lives here (not in
+/// `cli`) so the reader module isn't forced to depend on `cli`,
+/// which fed a long-standing module cycle.
+#[derive(Clone, Debug)]
+pub enum ReaderOp {
+    Ls,
+    Cat { name: String },
+    Extract {
+        to: PathBuf,
+        names: Vec<String>,
+        parallel: usize,
+        connections: Option<usize>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct ReaderOptions {
+    /// Local path, `http(s)://` URL, or `s3://bucket/key` URL.
+    pub archive: String,
+    pub password: Option<String>,
+    pub quiet: bool,
+    pub verbose: bool,
+    pub op: ReaderOp,
+}
 
 /// Dispatches on scheme: `s3://…` → `S3Source`, `http(s)://…` → `HttpSource`,
 /// anything else → local file path. Called by every reader subcommand so
@@ -183,80 +204,6 @@ fn local_source_for(
     }
 }
 
-/// Stream one entry's body (decrypted if needed, decompressed) from an
-/// already-open `ReadSeek` source to `dst`. Used by both `tzip cat`/`x`
-/// and `tzip grep`'s inner workers. `re.lfh_total_size` must already be
-/// populated.
-pub(crate) fn stream_entry_to<W: Write>(
-    source: &mut dyn crate::sources::ReadSeek,
-    re: &ReadEntry,
-    password: Option<&str>,
-    dst: &mut W,
-) -> Result<u64> {
-    let body_offset = re.lfh_offset + re.lfh_total_size as u64;
-    source
-        .seek(SeekFrom::Start(body_offset))
-        .with_context(|| format!("seek to body of {}", re.name))?;
-
-    let inner_method = method_from_id(re.inner_method, re.gp_flags)
-        .ok_or_else(|| anyhow!("unsupported compression method {} on {}", re.inner_method, re.name))?;
-
-    if re.encrypted {
-        let password = password.ok_or_else(|| {
-            anyhow!(
-                "entry {} is encrypted — pass --password / -p (or - to prompt)",
-                re.name
-            )
-        })?;
-        if re.method_on_wire == METHOD_AES {
-            // WinZip AES-256 AE-2.
-            let ciphertext_len = re
-                .comp_size
-                .checked_sub(AE2_OVERHEAD as u64)
-                .ok_or_else(|| anyhow!("entry {} too small to be AE-2", re.name))?;
-            let mut plaintext: Vec<u8> =
-                Vec::with_capacity(re.uncomp_size.min(64 * 1024 * 1024) as usize);
-            crypto::decrypt_ae2(password, source, ciphertext_len, &mut plaintext)?;
-            decompress::decompress(
-                inner_method,
-                std::io::Cursor::new(&plaintext),
-                re.uncomp_size,
-                dst,
-            )
-        } else {
-            // Traditional PKZIP encryption (ZipCrypto). The 12-byte
-            // encryption header is baked into the comp_size, so after
-            // ZipCryptoReader consumes it the decompressor sees
-            // comp_size - 12 bytes of plaintext.
-            let verify_byte = zipcrypto_verify_byte(re);
-            let bounded = source.take(re.comp_size);
-            let decrypted = ZipCryptoReader::new(bounded, password.as_bytes(), verify_byte)
-                .with_context(|| format!("decrypt ZipCrypto entry {}", re.name))?;
-            // Hand decompress the ciphertext_len bytes of plaintext —
-            // bounded reader already enforces the limit.
-            let _ = ZIPCRYPTO_HEADER_LEN; // kept for documentation; not needed at the call site
-            decompress::decompress(inner_method, decrypted, re.uncomp_size, dst)
-        }
-    } else {
-        let bounded = source.take(re.comp_size);
-        decompress::decompress(inner_method, bounded, re.uncomp_size, dst)
-    }
-}
-
-/// The verify byte ZipCrypto compares against the last plaintext byte
-/// of the 12-byte encryption header. When the entry uses a streaming
-/// data descriptor (GP bit 3) the CRC isn't known at header time, so
-/// the spec substitutes the high byte of the DOS time field.
-fn zipcrypto_verify_byte(re: &ReadEntry) -> u8 {
-    const GP_BIT_STREAMING_DATA_DESCRIPTOR: u16 = 1 << 3;
-    if re.gp_flags & GP_BIT_STREAMING_DATA_DESCRIPTOR != 0 {
-        // (date, time) tuple: time is the second field.
-        ((re.mtime.1 >> 8) & 0xff) as u8
-    } else {
-        ((re.crc32 >> 24) & 0xff) as u8
-    }
-}
-
 // ── Entry points ───────────────────────────────────────────────────────────
 
 pub fn run_ls(opts: ReaderOptions) -> Result<()> {
@@ -277,7 +224,7 @@ pub fn run_ls(opts: ReaderOptions) -> Result<()> {
 
     let mut total_uncomp = 0u64;
     let mut total_comp = 0u64;
-    for e in arch.entries() {
+    for e in arch.iter_entries() {
         let method = method_label(e);
         let encrypted_mark = if e.encrypted { "*" } else { " " };
         let dt = format_dos_mtime(e.mtime);
@@ -301,7 +248,7 @@ pub fn run_ls(opts: ReaderOptions) -> Result<()> {
         "{:>10}  {:>10}                                    {} files",
         total_uncomp,
         total_comp,
-        arch.entries().len()
+        arch.len()
     )?;
     if !arch.archive_comment().is_empty() {
         writeln!(out)?;
@@ -322,12 +269,9 @@ pub fn run_cat(opts: ReaderOptions) -> Result<()> {
         .with_context(|| format!("open {}", opts.archive))?;
 
     let idx = find_entry_index(&arch, &name)?;
-    arch.lfh_total_size_of(idx)?;
-    let re = arch.entries()[idx].clone();
-
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    stream_entry(&mut arch, &re, opts.password.as_deref(), &mut out)?;
+    arch.stream_entry_to(idx, opts.password.as_deref(), &mut out)?;
     Ok(())
 }
 
@@ -383,7 +327,7 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     // Fail fast on typo'd names before we start writing anything.
     if let Some(sel) = &selected_set {
         let present: std::collections::HashSet<&str> =
-            arch.entries().iter().map(|e| e.name.as_str()).collect();
+            arch.iter_entries().map(|e| e.name.as_str()).collect();
         let missing: Vec<&String> = sel
             .iter()
             .filter(|n| !present.contains(n.as_str()))
@@ -403,17 +347,17 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     // Phase A (serial, needs &mut arch): populate lfh_total_size and clone
     // the selected entries so the parallel workers get owned, self-contained
     // metadata and never touch `arch`.
-    let selected_idx: Vec<usize> = (0..arch.entries().len())
+    let selected_idx: Vec<usize> = (0..arch.len())
         .filter(|&idx| match &selected_set {
             None => true,
-            Some(sel) => sel.contains(&arch.entries()[idx].name),
+            Some(sel) => sel.contains(&arch.entry(idx).name),
         })
         .collect();
     let t = std::time::Instant::now();
     let mut selected: Vec<ReadEntry> = Vec::with_capacity(selected_idx.len());
     for idx in selected_idx {
         arch.lfh_total_size_of(idx)?;
-        selected.push(arch.entries()[idx].clone());
+        selected.push(arch.entry(idx).clone());
     }
     // Build a worker-side source hint from `arch` before dropping it —
     // disk count for local archives, total byte length for HTTP/S3.
@@ -508,7 +452,7 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
                         // enough to drain. The default 8 KiB costs ~6
                         // syscalls on a 50 KiB entry.
                         let mut buf = BufWriter::with_capacity(64 * 1024, f);
-                        stream_entry_to(&mut *source, &re, password.as_deref(), &mut buf)?;
+                        stream_entry_source_to(&mut *source, &re, password.as_deref(), &mut buf)?;
                         buf.flush().context("flush extract buffer")?;
                         // Hold the handle open for the metadata ops so we
                         // avoid a second `open`+`close` per entry. On APFS
@@ -567,17 +511,6 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     }
     p("TOTAL", overall_start);
     Ok(())
-}
-
-// ── Shared per-entry pipeline ──────────────────────────────────────────────
-
-fn stream_entry<W: Write>(
-    arch: &mut Archive,
-    re: &ReadEntry,
-    password: Option<&str>,
-    dst: &mut W,
-) -> Result<u64> {
-    stream_entry_to(arch.source_mut(), re, password, dst)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -658,32 +591,6 @@ fn method_label(e: &ReadEntry) -> &'static str {
     }
 }
 
-/// Resolve a ZIP compression method ID + general-purpose flag word to
-/// the read-side enum. The GP flags are needed by Implode (bits 1 and 2
-/// carry the window size and literal-tree decisions); everything else
-/// ignores them.
-fn method_from_id(id: u16, gp_flags: u16) -> Option<ReadMethod> {
-    Some(match id {
-        0 => ReadMethod::Store,
-        1 => ReadMethod::Shrink,
-        2 => ReadMethod::Reduce(1),
-        3 => ReadMethod::Reduce(2),
-        4 => ReadMethod::Reduce(3),
-        5 => ReadMethod::Reduce(4),
-        6 => ReadMethod::Implode {
-            large_window: (gp_flags & 0b0000_0010) != 0,
-            lit_tree: (gp_flags & 0b0000_0100) != 0,
-        },
-        8 => ReadMethod::Deflate,
-        9 => ReadMethod::Deflate64,
-        12 => ReadMethod::Bzip2,
-        14 => ReadMethod::Lzma,
-        93 => ReadMethod::Zstd,
-        95 => ReadMethod::Xz,
-        98 => ReadMethod::Ppmd,
-        _ => return None,
-    })
-}
 
 fn format_dos_mtime((date, time): (u16, u16)) -> String {
     // DOS date = (year-1980) << 9 | month << 5 | day

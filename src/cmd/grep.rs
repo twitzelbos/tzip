@@ -31,8 +31,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use crate::cli::GrepOptions;
-use crate::reader::{open_archive_with_cache, stream_entry_to};
-use crate::zipreader::ReadEntry;
+use crate::reader::open_archive_with_cache;
+use crate::zipreader::{stream_entry_source_to, ReadEntry};
 
 const CHECKPOINT_VERSION: u32 = 1;
 
@@ -139,10 +139,10 @@ fn process_archive(
         };
 
     // Collect candidate indices first so we can mutably probe LFH sizes
-    // without holding an immutable borrow of driver.entries().
-    let candidates: Vec<usize> = (0..driver.entries().len())
+    // without holding an immutable borrow of the driver.
+    let candidates: Vec<usize> = (0..driver.len())
         .filter(|&idx| {
-            let re = &driver.entries()[idx];
+            let re = driver.entry(idx);
             if !entry_passes_filters(re, &opts) || url_skip.contains(re.name.as_str()) {
                 return false;
             }
@@ -156,11 +156,11 @@ fn process_archive(
         .collect();
     let mut filtered: Vec<ReadEntry> = Vec::with_capacity(candidates.len());
     for idx in candidates {
-        let name = driver.entries()[idx].name.clone();
+        let name = driver.entry(idx).name.clone();
         driver
             .lfh_total_size_of(idx)
             .with_context(|| format!("probe LFH for {} in {}", name, url))?;
-        filtered.push(driver.entries()[idx].clone());
+        filtered.push(driver.entry(idx).clone());
     }
     // Build the worker-side source hint from the Archive we already
     // opened. Workers then skip the EOCD scan (local) or length-probe
@@ -242,14 +242,12 @@ fn scan_entry(
     {
         let tee: Option<&mut File> = exec_tmp.as_mut().map(|f| f.as_file_mut());
         let mut scanner = LineScanner::new(regex, tee, emit_ctx, stop_after_first);
-        stream_entry_to(source, re, opts.password.as_deref(), &mut scanner)
+        stream_entry_source_to(source, re, opts.password.as_deref(), &mut scanner)
             .with_context(|| format!("read body of {} in {}", re.name, url))?;
-        scanner.finish()
+        match_count = scanner.match_count();
+        scanner
+            .finish()
             .with_context(|| format!("finalise scan of {} in {}", re.name, url))?;
-        if let Some(err) = scanner.deferred_err.take() {
-            return Err(err);
-        }
-        match_count = scanner.match_count;
     }
 
     if let Some(cmd) = &opts.exec {
@@ -339,25 +337,33 @@ impl<'a, T: Write> LineScanner<'a, T> {
         }
     }
 
-    /// Scan the final line (one without a trailing `\n`), if any. The
-    /// existing semantic — don't invent a blank line when the body ends
-    /// in `\n` — is captured naturally: `buf` is empty in that case.
-    fn finish(&mut self) -> Result<()> {
+    /// Scan the final line (one without a trailing `\n`), if any,
+    /// and surface any emit-side error the Write impl had to defer.
+    /// The io::Write trait signature forces `scan_line`'s anyhow
+    /// errors to be buffered in `deferred_err`; `finish` is where we
+    /// unpack them so callers see one unified `Result`.
+    fn finish(mut self) -> Result<()> {
         if let Some(t) = self.tee.as_mut() {
             t.flush().context("flush exec tempfile")?;
         }
-        if self.halted || self.buf.is_empty() {
-            return Ok(());
-        }
-        self.line_no += 1;
-        let line = std::mem::take(&mut self.buf);
-        if self.regex.is_match(&line) {
-            self.match_count += 1;
-            if let Some(ctx) = &self.emit {
-                emit_match(ctx.out, ctx.opts, ctx.archive, ctx.entry, self.line_no, &line)?;
+        if !self.halted && !self.buf.is_empty() {
+            self.line_no += 1;
+            let line = std::mem::take(&mut self.buf);
+            if self.regex.is_match(&line) {
+                self.match_count += 1;
+                if let Some(ctx) = &self.emit {
+                    emit_match(ctx.out, ctx.opts, ctx.archive, ctx.entry, self.line_no, &line)?;
+                }
             }
         }
+        if let Some(err) = self.deferred_err.take() {
+            return Err(err);
+        }
         Ok(())
+    }
+
+    fn match_count(&self) -> u64 {
+        self.match_count
     }
 
     /// Scan one completed line (buf + chunk-slice). Returns Err to

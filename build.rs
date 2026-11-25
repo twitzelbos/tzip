@@ -4,11 +4,11 @@ fn main() {
         // Objective-C blocks compile in C mode on Apple Clang with -fblocks.
         // Blocks runtime is part of libSystem on macOS — no explicit link needed.
         cc::Build::new()
-            .file("src/dispatch_shim.c")
+            .file("src/platform/dispatch_shim.c")
             .flag("-fblocks")
             .flag_if_supported("-Wno-incompatible-pointer-types")
             .compile("dispatch_shim");
-        println!("cargo:rerun-if-changed=src/dispatch_shim.c");
+        println!("cargo:rerun-if-changed=src/platform/dispatch_shim.c");
     }
 
     // The FSKit install / uninstall shim is a small Obj-C file that wraps

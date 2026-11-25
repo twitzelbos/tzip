@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use std::os::unix::io::{IntoRawFd, RawFd};
 
-use crate::pipeline::Source;
+use crate::source::Source;
 use crate::platform::{self, ReadBuf};
 use crate::walker::WorkItem;
 

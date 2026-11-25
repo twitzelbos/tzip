@@ -16,24 +16,10 @@ use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use crate::zipreader::ReadEntry;
-
-pub const SIG_LFH: u32 = 0x0403_4b50;
-pub const SIG_CDR: u32 = 0x0201_4b50;
-pub const SIG_EOCD: u32 = 0x0605_4b50;
-pub const SIG_EOCD64: u32 = 0x0606_4b50;
-pub const SIG_EOCD64_LOC: u32 = 0x0706_4b50;
-
-pub const METHOD_AES: u16 = 99;
-pub const AES_EXTRA_ID: u16 = 0x9901;
-/// tzip-native extra field carrying a plaintext digest. Layout:
-/// `[algo: u8] [digest: N bytes]`, where algo=1=MD5 (16 bytes) /
-/// algo=2=SHA-256 (32 bytes). The 4-byte id+size prefix is standard
-/// APPNOTE extra framing. Picked outside the well-known ID range
-/// (APPNOTE section 4.6) so other tools ignore it cleanly.
-pub const TZIP_HASH_EXTRA_ID: u16 = 0x7A68;
-pub const TZIP_HASH_ALGO_MD5: u8 = 1;
-pub const TZIP_HASH_ALGO_SHA256: u8 = 2;
+use crate::zipformat::{
+    AES_EXTRA_ID, METHOD_AES, ReadEntry, SIG_CDR, SIG_EOCD, SIG_EOCD64, SIG_EOCD64_LOC, SIG_LFH,
+    TZIP_HASH_ALGO_MD5, TZIP_HASH_ALGO_SHA256, TZIP_HASH_EXTRA_ID,
+};
 
 /// Per-entry info produced by the workers, consumed by the writer.
 pub struct EncodedEntry {

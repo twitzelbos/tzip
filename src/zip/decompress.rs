@@ -18,7 +18,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{Read, Write};
 
-use crate::cli::Method;
+use crate::method::Method;
 use compcol::Decoder as CompcolDecoder;
 
 /// All methods tzip can *read*. A superset of the write-side `Method`

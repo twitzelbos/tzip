@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use std::io::Write;
 use xz2::stream::{LzmaOptions, Stream};
 
-use crate::cli::Method;
+use crate::method::Method;
 
 /// Output of a single-shot compression call.
 ///
@@ -26,14 +26,51 @@ pub struct CompressOut {
 ///   `deflate_compress_bound(input_len)` on demand; capacity never shrinks.
 /// * `deflate` — libdeflater compressor. Cheap to reuse; free to recreate.
 pub struct Scratch {
-    pub out: Vec<u8>,
-    pub deflate: Option<Compressor>,
-    pub deflate_level: i32,
+    out: Vec<u8>,
+    deflate: Option<Compressor>,
+    deflate_level: i32,
 }
 
 impl Scratch {
     pub fn new() -> Self {
         Self { out: Vec::new(), deflate: None, deflate_level: -1 }
+    }
+
+    /// Store-method encode: copy `input` through the growing
+    /// scratch buffer. Keeps Scratch in charge of its own buffer —
+    /// callers don't see the raw Vec.
+    fn store(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.out);
+        buf.clear();
+        buf.reserve(input.len());
+        buf.extend_from_slice(input);
+        buf
+    }
+
+    /// DEFLATE-method encode via libdeflater. Scratch keeps a
+    /// `Compressor` at the requested level and reuses the growing
+    /// output buffer.
+    fn deflate_into_vec(&mut self, input: &[u8], level: u32) -> Result<Vec<u8>> {
+        let mut buf = std::mem::take(&mut self.out);
+        let bound;
+        {
+            let c = self.get_deflate(level)?;
+            bound = c.deflate_compress_bound(input.len());
+        }
+        if buf.capacity() < bound {
+            buf.reserve(bound - buf.capacity());
+        }
+        // SAFETY: libdeflater writes exactly `n` bytes; we truncate to `n`
+        // before exposing the buffer.
+        unsafe {
+            buf.set_len(bound);
+        }
+        let c = self.get_deflate(level)?;
+        let n = c
+            .deflate_compress(input, &mut buf[..])
+            .map_err(|e| anyhow!("deflate failed: {e:?}"))?;
+        buf.truncate(n);
+        Ok(buf)
     }
 
     fn get_deflate(&mut self, level: u32) -> Result<&mut Compressor> {
@@ -59,34 +96,14 @@ pub fn compress(
     scratch: &mut Scratch,
 ) -> Result<CompressOut> {
     match method {
-        Method::Store => {
-            // Fast path: no compression, just steal the input.
-            let mut buf = std::mem::take(&mut scratch.out);
-            buf.clear();
-            buf.reserve(input.len());
-            buf.extend_from_slice(input);
-            Ok(CompressOut { data: buf, gp_bit1: false })
-        }
-        Method::Deflate => {
-            let mut buf = std::mem::take(&mut scratch.out);
-            let bound;
-            {
-                let c = scratch.get_deflate(level)?;
-                bound = c.deflate_compress_bound(input.len());
-            }
-            if buf.capacity() < bound {
-                buf.reserve(bound - buf.capacity());
-            }
-            // SAFETY: libdeflater writes exactly `n` bytes; we truncate to `n`
-            // before exposing the buffer.
-            unsafe { buf.set_len(bound); }
-            let c = scratch.get_deflate(level)?;
-            let n = c
-                .deflate_compress(input, &mut buf[..])
-                .map_err(|e| anyhow!("deflate failed: {e:?}"))?;
-            buf.truncate(n);
-            Ok(CompressOut { data: buf, gp_bit1: false })
-        }
+        Method::Store => Ok(CompressOut {
+            data: scratch.store(input),
+            gp_bit1: false,
+        }),
+        Method::Deflate => Ok(CompressOut {
+            data: scratch.deflate_into_vec(input, level)?,
+            gp_bit1: false,
+        }),
         Method::Bzip2 => bzip2(input, level).map(|d| CompressOut { data: d, gp_bit1: false }),
         Method::Lzma => lzma_for_zip(input, level).map(|d| CompressOut { data: d, gp_bit1: true }),
         Method::Xz => xz(input, level).map(|d| CompressOut { data: d, gp_bit1: false }),

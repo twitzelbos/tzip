@@ -25,7 +25,7 @@ use sevenz_rust::{
 use std::fs::File;
 use std::io::Cursor;
 
-use crate::cli::Options;
+use crate::options::Options;
 use crate::platform;
 use crate::progress::Progress;
 use crate::walker::WorkItem;

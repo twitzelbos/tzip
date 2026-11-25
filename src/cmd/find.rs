@@ -58,7 +58,7 @@ fn process_archive(
     // Buffer this archive's hits so a single lock-and-write emits them
     // contiguously — avoids interleaving many archives mid-line.
     let mut buf: Vec<u8> = Vec::new();
-    for re in driver.entries() {
+    for re in driver.iter_entries() {
         if !entry_passes_filters(re, &opts) {
             continue;
         }

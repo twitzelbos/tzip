@@ -50,7 +50,7 @@ use apfs::catalog::InodeVal;
 
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use crate::pipeline::Source;
+use crate::source::Source;
 use crate::platform::ReadBuf;
 use crate::walker::WorkItem;
 

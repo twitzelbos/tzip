@@ -338,12 +338,49 @@ impl ColumnarSchema {
     }
 }
 
+/// Shared buffer backing the streaming Parquet writer. ArrowWriter
+/// requires `W: Write + Send`, so we can't just hand it `&mut Vec<u8>`
+/// and still keep the writer alive across `add_body` calls. Instead
+/// both the builder and the writer hold an `Arc<Mutex<Vec<u8>>>`; the
+/// writer appends to it; `finish()` drops the writer and reclaims
+/// the `Vec`.
+#[derive(Clone)]
+struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// How many rows accumulate in the in-memory Arrow builders before
+/// they're flushed as a Parquet row group. ChatGPT review #7: the
+/// pre-fix builder held every column cell in memory until `finish`,
+/// so a billion-row columnar sidecar would need O(rows × columns)
+/// of RAM on the writer thread. 64 Ki rows per row group matches
+/// Parquet's typical default and keeps the live column arrays well
+/// under ~tens of MB on realistic schemas.
+const ROWS_PER_ROW_GROUP: usize = 64 * 1024;
+
 /// Build-side accumulator. One `ColumnBuilder` per schema field.
+///
+/// Flushes a Parquet row group every `ROWS_PER_ROW_GROUP` rows via
+/// the long-lived `ArrowWriter`, so the peak live-row count is
+/// bounded regardless of corpus size.
 pub struct ColumnarBuilder {
     schema: ColumnarSchema,
     arrow_schema: Arc<ArrowSchema>,
     cols: Vec<ColumnBuilder>,
-    rows: usize,
+    /// Rows accumulated in `cols` since the last row-group flush.
+    rows_in_batch: usize,
+    /// Total rows written (flushed + current batch).
+    rows_total: usize,
+    writer: Option<ArrowWriter<SharedBuf>>,
+    buf: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 enum ColumnBuilder {
@@ -355,7 +392,27 @@ enum ColumnBuilder {
 
 impl ColumnarBuilder {
     pub fn new(schema: ColumnarSchema) -> Self {
-        let cols: Vec<ColumnBuilder> = schema
+        let cols = Self::fresh_cols(&schema);
+        let arrow_schema = schema.to_arrow();
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::with_capacity(64 * 1024)));
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let writer = ArrowWriter::try_new(SharedBuf(buf.clone()), arrow_schema.clone(), Some(props))
+            .expect("open streaming parquet writer");
+        Self {
+            schema,
+            arrow_schema,
+            cols,
+            rows_in_batch: 0,
+            rows_total: 0,
+            writer: Some(writer),
+            buf,
+        }
+    }
+
+    fn fresh_cols(schema: &ColumnarSchema) -> Vec<ColumnBuilder> {
+        schema
             .fields
             .iter()
             .map(|f| match f.ty {
@@ -364,9 +421,7 @@ impl ColumnarBuilder {
                 FieldType::Float64 => ColumnBuilder::Float64(Float64Builder::new()),
                 FieldType::Bool => ColumnBuilder::Bool(BooleanBuilder::new()),
             })
-            .collect();
-        let arrow_schema = schema.to_arrow();
-        Self { schema, arrow_schema, cols, rows: 0 }
+            .collect()
     }
 
     pub fn schema(&self) -> &ColumnarSchema {
@@ -374,7 +429,7 @@ impl ColumnarBuilder {
     }
 
     pub fn row_count(&self) -> usize {
-        self.rows
+        self.rows_total
     }
 
     /// Consume one entry body. Handles both single-record JSON and
@@ -385,62 +440,101 @@ impl ColumnarBuilder {
     /// column of that row; the row count still advances so columns
     /// stay aligned with the sidecar's notion of "N records
     /// contributed to the archive."
-    pub fn add_body(&mut self, body: &[u8]) {
+    ///
+    /// Flushes a Parquet row group whenever the in-memory batch
+    /// crosses `ROWS_PER_ROW_GROUP` — see ChatGPT review #7.
+    pub fn add_body(&mut self, body: &[u8]) -> Result<()> {
         let mut any_record = false;
         let stream = serde_json::Deserializer::from_slice(body).into_iter::<serde_json::Value>();
         for value in stream {
             match value {
                 Ok(v) => {
                     any_record = true;
-                    self.rows += 1;
-                    for (i, col) in self.cols.iter_mut().enumerate() {
-                        let field = &self.schema.fields[i];
-                        let probed = walk_path(&v, &field.path);
-                        col.push_from_json(field.ty, probed);
+                    self.push_one_row(|cols, schema| {
+                        for (i, col) in cols.iter_mut().enumerate() {
+                            let field = &schema.fields[i];
+                            let probed = walk_path(&v, &field.path);
+                            col.push_from_json(field.ty, probed);
+                        }
+                    });
+                    if self.rows_in_batch >= ROWS_PER_ROW_GROUP {
+                        self.flush_batch()?;
                     }
                 }
                 Err(_) => {
                     // Malformed record — emit one all-null row and
                     // stop. serde_json doesn't recover from a mid-
                     // stream parse error.
-                    self.rows += 1;
-                    for col in &mut self.cols {
-                        col.push_null();
+                    self.push_one_row(|cols, _| {
+                        for col in cols.iter_mut() {
+                            col.push_null();
+                        }
+                    });
+                    if self.rows_in_batch >= ROWS_PER_ROW_GROUP {
+                        self.flush_batch()?;
                     }
-                    return;
+                    return Ok(());
                 }
             }
         }
         if !any_record {
-            self.rows += 1;
-            for col in &mut self.cols {
-                col.push_null();
+            self.push_one_row(|cols, _| {
+                for col in cols.iter_mut() {
+                    col.push_null();
+                }
+            });
+            if self.rows_in_batch >= ROWS_PER_ROW_GROUP {
+                self.flush_batch()?;
             }
         }
+        Ok(())
     }
 
-    /// Serialise the accumulated columns as a Parquet payload with
-    /// Snappy page compression. One row group covers everything —
-    /// Phase 5 corpora are "one archive one row-group" scale; if
-    /// corpora grow past ~1M rows the writer will add further row
-    /// groups implicitly.
-    pub fn finish(self) -> Result<Vec<u8>> {
-        let arrays: Vec<ArrayRef> = self
-            .cols
-            .into_iter()
-            .map(|c| c.finish())
-            .collect();
+    fn push_one_row<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut [ColumnBuilder], &ColumnarSchema),
+    {
+        self.rows_total += 1;
+        self.rows_in_batch += 1;
+        f(&mut self.cols, &self.schema);
+    }
+
+    /// Serialise the current in-memory batch as one Parquet row
+    /// group and reset the column builders.
+    ///
+    /// Explicitly calls `ArrowWriter::flush` so each
+    /// `ROWS_PER_ROW_GROUP`-sized batch lands as its own row group.
+    /// That gives queries row-group-level pruning later (DuckDB
+    /// skips groups whose statistics don't overlap the predicate)
+    /// at the cost of slightly more footer overhead.
+    fn flush_batch(&mut self) -> Result<()> {
+        if self.rows_in_batch == 0 {
+            return Ok(());
+        }
+        let old_cols =
+            std::mem::replace(&mut self.cols, Self::fresh_cols(&self.schema));
+        let arrays: Vec<ArrayRef> = old_cols.into_iter().map(|c| c.finish()).collect();
         let batch = RecordBatch::try_new(self.arrow_schema.clone(), arrays)
             .context("build columnar record batch")?;
-        let mut buf: Vec<u8> = Vec::with_capacity(1024 * 64);
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut w = ArrowWriter::try_new(&mut buf, self.arrow_schema.clone(), Some(props))
-            .context("open parquet writer")?;
-        w.write(&batch).context("write parquet row group")?;
-        w.close().context("close parquet writer")?;
-        Ok(buf)
+        let writer = self
+            .writer
+            .as_mut()
+            .expect("flush_batch called after finish");
+        writer.write(&batch).context("write parquet batch")?;
+        writer.flush().context("flush parquet row group")?;
+        self.rows_in_batch = 0;
+        Ok(())
+    }
+
+    /// Flush the tail batch, write the Parquet footer, drop the
+    /// writer, and reclaim the underlying buffer.
+    pub fn finish(mut self) -> Result<Vec<u8>> {
+        self.flush_batch()?;
+        let writer = self.writer.take().expect("writer already taken");
+        writer.close().context("close parquet writer")?;
+        let mutex = Arc::try_unwrap(self.buf)
+            .map_err(|_| anyhow::anyhow!("columnar buffer still shared on finish"))?;
+        Ok(mutex.into_inner().map_err(|e| anyhow::anyhow!("buffer mutex poisoned: {}", e))?)
     }
 }
 
@@ -606,10 +700,10 @@ mod tests {
         }"#;
         let schema = ColumnarSchema::parse(src).unwrap();
         let mut b = ColumnarBuilder::new(schema);
-        b.add_body(br#"{"status_code":200,"user":"alice","latency_ms":3.4,"cached":true}"#);
-        b.add_body(br#"{"status_code":500,"user":"bob","latency_ms":12.1,"cached":false}"#);
-        b.add_body(br#"{"status_code":404}"#);
-        b.add_body(b"not json");
+        b.add_body(br#"{"status_code":200,"user":"alice","latency_ms":3.4,"cached":true}"#).unwrap();
+        b.add_body(br#"{"status_code":500,"user":"bob","latency_ms":12.1,"cached":false}"#).unwrap();
+        b.add_body(br#"{"status_code":404}"#).unwrap();
+        b.add_body(b"not json").unwrap();
         let payload = b.finish().unwrap();
 
         // Parquet magic "PAR1" at both ends.
@@ -624,9 +718,9 @@ mod tests {
         )
         .unwrap();
         let mut b = ColumnarBuilder::new(schema);
-        b.add_body(br#"{"other":42}"#);
-        b.add_body(br#"{"status_code":null}"#);
-        b.add_body(br#"{"status_code":200}"#);
+        b.add_body(br#"{"other":42}"#).unwrap();
+        b.add_body(br#"{"status_code":null}"#).unwrap();
+        b.add_body(br#"{"status_code":200}"#).unwrap();
         let payload = b.finish().unwrap();
         assert_eq!(&payload[0..4], b"PAR1");
     }
@@ -638,9 +732,58 @@ mod tests {
         )
         .unwrap();
         let mut b = ColumnarBuilder::new(schema);
-        b.add_body(br#"{"event":{"kind":"click"}}"#);
+        b.add_body(br#"{"event":{"kind":"click"}}"#).unwrap();
         let payload = b.finish().unwrap();
         assert_eq!(&payload[0..4], b"PAR1");
+    }
+
+    #[test]
+    fn streaming_write_flushes_multiple_row_groups() {
+        // ChatGPT review #7: pre-fix, the columnar builder held
+        // every column cell in memory until `finish`, scaling
+        // linearly with corpus size. The streaming rewrite flushes
+        // a Parquet row group every ROWS_PER_ROW_GROUP rows.
+        //
+        // Push one row past the row-group boundary and verify
+        // the resulting file (a) decodes end-to-end (so
+        // `flush`/`close` wrote both row groups correctly), and
+        // (b) reports >1 row group in its footer.
+        let schema = ColumnarSchema::parse(
+            br#"{"fields":[{"name":"n","type":"int64","path":".n"}]}"#,
+        )
+        .unwrap();
+        let mut b = ColumnarBuilder::new(schema);
+        let rows = ROWS_PER_ROW_GROUP + 128;
+        for i in 0..rows {
+            let body = format!("{{\"n\":{}}}", i);
+            b.add_body(body.as_bytes()).unwrap();
+        }
+        assert_eq!(b.row_count(), rows);
+        let payload = b.finish().unwrap();
+        assert_eq!(&payload[0..4], b"PAR1");
+        assert_eq!(&payload[payload.len() - 4..], b"PAR1");
+
+        use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+        let meta = ArrowReaderMetadata::load(
+            &bytes::Bytes::copy_from_slice(&payload),
+            Default::default(),
+        )
+        .unwrap();
+        let num_row_groups = meta.metadata().num_row_groups();
+        assert!(
+            num_row_groups >= 2,
+            "expected ≥ 2 row groups after streaming {} rows past the {} boundary, got {}",
+            rows,
+            ROWS_PER_ROW_GROUP,
+            num_row_groups
+        );
+        let total_rows: i64 = meta
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|rg| rg.num_rows())
+            .sum();
+        assert_eq!(total_rows, rows as i64);
     }
 
     #[test]
@@ -655,7 +798,7 @@ mod tests {
         }"#;
         let schema = ColumnarSchema::parse(src).unwrap();
         let mut b = ColumnarBuilder::new(schema);
-        b.add_body(br#"{"ts":"2026-11-25","status_code":200,"latency_ms":1.2,"event":{"cached":true}}"#);
+        b.add_body(br#"{"ts":"2026-11-25","status_code":200,"latency_ms":1.2,"event":{"cached":true}}"#).unwrap();
         let payload = b.finish().unwrap();
 
         let recovered = ColumnarSchema::from_parquet_bytes(&payload).unwrap();

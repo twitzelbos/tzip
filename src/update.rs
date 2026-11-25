@@ -984,7 +984,7 @@ fn encode_items_into_writer<W: Write + Seek>(
                     fb.add_body(&body);
                 }
                 if let Some(cb) = s.columnar_builder.as_mut() {
-                    cb.add_body(&body);
+                    cb.add_body(&body)?;
                 }
             }
             s.local_count += 1;

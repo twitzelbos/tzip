@@ -808,7 +808,7 @@ pub fn run(opts: Options) -> Result<()> {
                         fb.add_body(&body);
                     }
                     if let Some(cb) = columnar_builder.as_mut() {
-                        cb.add_body(&body);
+                        cb.add_body(&body)?;
                     }
                 }
                 zw.write_entry(e)?;
@@ -838,7 +838,7 @@ pub fn run(opts: Options) -> Result<()> {
                     fb.add_body(&body);
                 }
                 if let Some(cb) = columnar_builder.as_mut() {
-                    cb.add_body(&body);
+                    cb.add_body(&body)?;
                 }
             }
             zw.write_entry(entry)?;

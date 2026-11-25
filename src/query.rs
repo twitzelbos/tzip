@@ -53,6 +53,16 @@ pub struct QueryOpts {
 /// via `tempfile::NamedTempFile` on drop; DuckDB reads the file in
 /// one shot so there's no lifetime issue.
 pub fn run(opts: QueryOpts) -> Result<()> {
+    // Open + extract the sidecar BEFORE probing for `duckdb`. A
+    // missing sidecar is a create-side problem the user fixes by
+    // rebuilding; missing duckdb is a one-time install. If both
+    // apply, surface the create-side error first — otherwise users
+    // follow the install hint and still hit the sidecar error on
+    // the next run.
+    let mut archive = Archive::open(&opts.archive)
+        .with_context(|| format!("open archive {}", opts.archive.display()))?;
+    let payload = extract_columnar_entry(&mut archive, opts.password.as_deref())?;
+
     if which_duckdb().is_none() {
         bail!(
             "`duckdb` CLI not found on PATH. Install it to use `tzip query --sql`:\n\
@@ -63,10 +73,6 @@ pub fn run(opts: QueryOpts) -> Result<()> {
             crate::columnar::INDEX_ENTRY_NAME,
         );
     }
-
-    let mut archive = Archive::open(&opts.archive)
-        .with_context(|| format!("open archive {}", opts.archive.display()))?;
-    let payload = extract_columnar_entry(&mut archive, opts.password.as_deref())?;
 
     // Stage the Parquet bytes to a temp file. DuckDB reads the file
     // through its Parquet reader; passing it on stdin isn't an

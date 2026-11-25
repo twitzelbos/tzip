@@ -32,7 +32,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::cli::GrepOptions;
 use crate::reader::{open_archive_with_cache, stream_entry_to};
-use crate::sources::s3_list;
 use crate::zipreader::ReadEntry;
 
 const CHECKPOINT_VERSION: u32 = 1;
@@ -40,7 +39,7 @@ const CHECKPOINT_VERSION: u32 = 1;
 pub fn run(opts: GrepOptions) -> Result<()> {
     // 1. Expand the archive list: locals pass through, s3://…/*.zip
     //    goes through ListObjectsV2.
-    let archives = expand_archives(&opts.archives)?;
+    let archives = crate::shards::expand(&opts.archives)?;
     if archives.is_empty() {
         if !opts.quiet {
             eprintln!("tzip: no archives matched the given patterns");
@@ -544,26 +543,6 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-// ── Archive expansion ──────────────────────────────────────────────────────
-
-fn expand_archives(input: &[String]) -> Result<Vec<String>> {
-    let mut out: Vec<String> = Vec::new();
-    for spec in input {
-        if let Some(rest) = spec.strip_prefix("s3://") {
-            if s3_list::has_glob(rest) {
-                let expanded = s3_list::expand(rest)
-                    .with_context(|| format!("expand S3 glob {}", spec))?;
-                out.extend(expanded);
-                continue;
-            }
-        }
-        // Everything else: pass through. Local shell globs are already
-        // expanded by the shell before argv.
-        out.push(spec.clone());
-    }
-    Ok(out)
 }
 
 // ── Regex builder ──────────────────────────────────────────────────────────

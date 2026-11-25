@@ -83,6 +83,11 @@ struct ServerState {
     /// hashes the body; we just need a stable, unique opaque
     /// handle.
     etag_counter: u64,
+    /// When `true`, `CompleteMultipartUpload` returns 412 and
+    /// leaves the object untouched regardless of whether the
+    /// client's If-Match actually matches. Lets a test force
+    /// the concurrent-writer code path without racing threads.
+    force_complete_412: bool,
 }
 
 impl ServerState {
@@ -105,6 +110,16 @@ impl ServerGuard {
     }
     fn current_etag(&self) -> String {
         self.state.lock().unwrap().etag.clone()
+    }
+    fn current_body(&self) -> Vec<u8> {
+        self.state.lock().unwrap().body.clone()
+    }
+    /// Arm the mock to return 412 on the next
+    /// `CompleteMultipartUpload`. Lets a test exercise the
+    /// atomic-CAS failure path without needing a real concurrent
+    /// writer.
+    fn force_complete_412(&self) {
+        self.state.lock().unwrap().force_complete_412 = true;
     }
     fn upload_count(&self) -> usize {
         self.state.lock().unwrap().uploads.len()
@@ -133,6 +148,7 @@ fn serve_mock_s3_mpu(bucket: &str, key: &str, fixture: Vec<u8>) -> ServerGuard {
         etag: "mocketag-initial".to_string(),
         uploads: BTreeMap::new(),
         etag_counter: 0,
+        force_complete_412: false,
     }));
     let state_srv = Arc::clone(&state);
     let stop = Arc::new(AtomicBool::new(false));
@@ -441,18 +457,21 @@ fn handle_complete_mpu(
 
     let result = {
         let mut s = state.lock().unwrap();
-        if let Some(wanted) = if_match {
-            if wanted != s.etag {
-                drop(s);
-                let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+        // Test hook: force a 412 regardless of actual match.
+        // Lets us exercise the concurrent-writer path without
+        // racing a second client.
+        let mismatch = s.force_complete_412
+            || if_match.as_deref().is_some_and(|w| w != s.etag);
+        if mismatch {
+            drop(s);
+            let body = br#"<?xml version="1.0" encoding="UTF-8"?>
 <Error><Code>PreconditionFailed</Code></Error>"#
-                    .to_vec();
-                let resp = tiny_http::Response::from_data(body)
-                    .with_status_code(412)
-                    .with_header(header("Content-Type", "application/xml"));
-                let _ = req.respond(resp);
-                return;
-            }
+                .to_vec();
+            let resp = tiny_http::Response::from_data(body)
+                .with_status_code(412)
+                .with_header(header("Content-Type", "application/xml"));
+            let _ = req.respond(resp);
+            return;
         }
         let upload = match s.uploads.remove(&upload_id) {
             Some(u) => u,
@@ -759,6 +778,66 @@ fn s3_append_small_archive_single_put_fallback() {
     let out = String::from_utf8(stdout).unwrap();
     assert!(out.contains("a.txt"));
     assert!(out.contains("b.txt"));
+}
+
+#[test]
+fn s3_append_fails_cleanly_on_etag_mismatch_without_mutating_object() {
+    // Concurrent-writer scenario: tzip opens the archive and
+    // captures ETag=e1, another writer flips the object to e2,
+    // then tzip's `CompleteMultipartUpload` arrives carrying
+    // If-Match=e1 and the server returns 412.
+    //
+    // Expected: tzip's `tzip u` exits non-zero and the live
+    // object's bytes stay what the second writer left there
+    // (NOT tzip's composed new tail). This is issue #68's
+    // "ETag mismatch → 412 → original unchanged" case.
+    //
+    // We can't race two real writers in one subprocess test, so
+    // the mock has a `force_complete_412` hook that simulates a
+    // stale If-Match regardless of what the client actually
+    // sends.
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = tmp.path().join("corpus");
+    make_big_corpus(&corpus);
+    run_tzip_create(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "store", "-q"],
+    );
+    let initial_body = fs::read(tmp.path().join("out.zip")).unwrap();
+    let server = serve_mock_s3_mpu("mybucket", "out.zip", initial_body.clone());
+    let initial_etag = server.current_etag();
+
+    // Arm the mock before tzip runs.
+    server.force_complete_412();
+
+    fs::write(tmp.path().join("new.txt"), b"concurrent-writer-scenario\n").unwrap();
+    let env = env_s3(&server);
+    let env_ref = env_s3_refs(&env);
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["u", "s3://mybucket/out.zip", "new.txt"],
+        &env_ref,
+    );
+    assert!(!ok, "tzip u must fail when Complete returns 412");
+    assert!(
+        stderr.contains("CompleteMultipartUpload")
+            || stderr.to_lowercase().contains("precondition")
+            || stderr.contains("412"),
+        "stderr must surface the CAS failure: {}",
+        stderr
+    );
+    // Critical atomicity invariant: the live object is byte-
+    // identical to what it was before the failed append.
+    assert_eq!(
+        server.current_body(),
+        initial_body,
+        "object body must not change on a 412"
+    );
+    assert_eq!(
+        server.current_etag(),
+        initial_etag,
+        "object etag must not change on a 412"
+    );
 }
 
 #[test]

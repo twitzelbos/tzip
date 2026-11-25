@@ -79,17 +79,20 @@ impl Drop for ServerGuard {
 /// Spin up a tiny_http server that serves `file_path` with full Range
 /// support. The server binds to 127.0.0.1 on an ephemeral port.
 fn serve_file(file_path: PathBuf, support_ranges: bool) -> ServerGuard {
-    // Bind to :0 to pick a free port, then pass that address to tiny_http.
+    // Hand the already-bound listener straight to tiny_http so the
+    // port never gets released between bind and rebind — the old
+    // drop-and-rebind dance was a TOCTOU race that occasionally lost
+    // the port to a concurrent test on Linux CI (EADDRINUSE).
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
     let addr = listener.local_addr().expect("local_addr");
-    drop(listener); // tiny_http will re-bind on the same port.
 
     let bytes = fs::read(&file_path).expect("read fixture file");
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
 
     let join = thread::spawn(move || {
-        let server = tiny_http::Server::http(addr).expect("tiny_http server");
+        let server = tiny_http::Server::from_listener(listener, None)
+            .expect("tiny_http from_listener");
         loop {
             if stop2.load(Ordering::SeqCst) {
                 break;

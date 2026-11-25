@@ -90,9 +90,12 @@ impl Drop for ServerGuard {
 }
 
 fn serve(file_path: PathBuf, initial_etag: &str) -> ServerGuard {
+    // Hand the already-bound listener to tiny_http instead of
+    // drop-and-rebind — the latter is a TOCTOU race (CI flake on
+    // ubuntu-latest) that occasionally loses the port to a
+    // concurrent test.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
     let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
 
     let body = fs::read(&file_path).expect("read fixture");
     let state = Arc::new(Mutex::new(ServerState {
@@ -106,7 +109,8 @@ fn serve(file_path: PathBuf, initial_etag: &str) -> ServerGuard {
     let range_hits2 = Arc::clone(&range_hits);
 
     let join = thread::spawn(move || {
-        let server = tiny_http::Server::http(addr).expect("tiny_http server");
+        let server = tiny_http::Server::from_listener(listener, None)
+            .expect("tiny_http from_listener");
         loop {
             if stop2.load(Ordering::SeqCst) {
                 break;

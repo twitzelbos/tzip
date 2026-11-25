@@ -22,6 +22,7 @@ pub mod facets;
 pub mod indexcache;
 pub mod nameidx;
 pub mod query;
+pub mod shards;
 pub mod termidx;
 pub mod mount;
 pub mod pipeline;

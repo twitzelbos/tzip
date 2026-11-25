@@ -1361,8 +1361,15 @@ pub struct HashArgs {
 
 #[derive(Args, Debug)]
 pub struct AggregateArgs {
-    /// Archive. Local path, `http(s)://` URL, or `s3://bucket/key.zip` URL.
-    pub archive: String,
+    /// Archives to aggregate across (Phase 7 shard fan-out). Local
+    /// paths, `http(s)://` URLs, and `s3://bucket/key.zip` URLs are
+    /// all accepted; `s3://bucket/prefix/*.zip` is expanded via
+    /// `ListObjectsV2`. Shell globs for local files are expanded
+    /// by your shell before argv. Counts are summed across shards
+    /// so `--by status_code shards-*.zip` returns one unified
+    /// count-by-value table.
+    #[arg(required = true, value_name = "ARCHIVE")]
+    pub archives: Vec<String>,
 
     /// Field (leaf name) to aggregate by. Matches the leaf of the
     /// path used at create time (`--facet '.event.kind'` → use
@@ -1401,7 +1408,7 @@ pub struct AggregateArgs {
 
 #[derive(Clone, Debug)]
 pub struct AggregateOptions {
-    pub archive: String,
+    pub archives: Vec<String>,
     pub by: Option<String>,
     pub fields: bool,
     pub top: usize,
@@ -1417,7 +1424,7 @@ impl AggregateArgs {
             bail!("tzip aggregate: pass --by FIELD or --fields");
         }
         Ok(AggregateOptions {
-            archive: self.archive,
+            archives: self.archives,
             by: self.by,
             fields: self.fields,
             top: self.top,
@@ -1433,9 +1440,14 @@ impl AggregateArgs {
 
 #[derive(Args, Debug)]
 pub struct QueryArgs {
-    /// Archive to query. Accepts local paths, `http(s)://` URLs,
-    /// and `s3://bucket/key.zip` URLs.
-    pub archive: String,
+    /// Archives to query (Phase 7 shard fan-out). Local paths,
+    /// `http(s)://` URLs, and `s3://bucket/key.zip` URLs are all
+    /// accepted; `s3://bucket/shards/*.zip` is expanded via
+    /// `ListObjectsV2`. Multiple shards are UNION'd via DuckDB's
+    /// `read_parquet([...])` under the `tzip` view, so one SELECT
+    /// sees every row across every shard.
+    #[arg(required = true, value_name = "ARCHIVE")]
+    pub archives: Vec<String>,
 
     /// SQL to run. The columnar sidecar is registered as a view
     /// named `tzip`, so `SELECT status, COUNT(*) FROM tzip GROUP BY
@@ -1491,7 +1503,7 @@ impl QueryArgs {
             QueryFormatArg::Csv => crate::query::QueryFormat::Csv,
         };
         Ok(crate::query::QueryOpts {
-            archive: self.archive,
+            archives: self.archives,
             sql: self.sql,
             format,
             password: self.password,

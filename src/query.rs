@@ -40,63 +40,77 @@ pub enum QueryFormat {
 }
 
 pub struct QueryOpts {
-    /// Archive spec: local path, `http(s)://` URL, or `s3://` URL.
-    pub archive: String,
+    /// Archive specs: one or more local paths, `http(s)://` URLs,
+    /// or `s3://bucket/key.zip` URLs; S3 globs like
+    /// `s3://bucket/shards/*.zip` are expanded via `ListObjectsV2`.
+    /// Multiple shards are UNION'd via DuckDB's `read_parquet([...])`
+    /// — the Phase 7 horizontal-shard fan-out.
+    pub archives: Vec<String>,
     pub sql: String,
     pub format: QueryFormat,
     pub password: Option<String>,
-    /// When set, index entries (including the columnar sidecar)
-    /// extracted from this archive are kept in an on-disk LRU under
-    /// `spec.dir`. Repeat queries against the same remote archive
-    /// then hit the cache instead of re-fetching.
+    /// When set, index entries (including each shard's columnar
+    /// sidecar) are kept in an on-disk LRU under `spec.dir`.
+    /// Repeat queries then hit the cache instead of re-fetching.
     pub cache: Option<crate::indexcache::IndexCacheSpec>,
 }
 
-/// Dispatch one SQL query against an archive's columnar sidecar.
+/// Dispatch one SQL query across the columnar sidecars of one or
+/// more archives.
 ///
-/// The sidecar lives inside the ZIP, so we stage it to a temp
-/// Parquet file before invoking `duckdb`. The temp file is removed
-/// via `tempfile::NamedTempFile` on drop; DuckDB reads the file in
-/// one shot so there's no lifetime issue.
+/// Each shard's `.tzip/columnar.v1.parquet` entry is extracted to a
+/// temp file (`tempfile::NamedTempFile`, cleaned up on drop), then
+/// all temp paths are handed to DuckDB via `read_parquet([...])` —
+/// DuckDB UNION'd Parquet reads cover Phase 7's "horizontal shard
+/// parallelism" row: the merge happens inside the query engine, not
+/// in tzip's Rust.
 pub fn run(opts: QueryOpts) -> Result<()> {
-    // Open + extract the sidecar BEFORE probing for `duckdb`. A
-    // missing sidecar is a create-side problem the user fixes by
-    // rebuilding; missing duckdb is a one-time install. If both
-    // apply, surface the create-side error first — otherwise users
-    // follow the install hint and still hit the sidecar error on
-    // the next run.
+    let archives = crate::shards::expand(&opts.archives)?;
+    if archives.is_empty() {
+        bail!("no archives matched the given patterns");
+    }
+
+    // Open + extract each shard's sidecar BEFORE probing for
+    // `duckdb`. A missing sidecar on any shard is a create-side
+    // problem; missing duckdb is a one-time install. Surfacing the
+    // create-side error first saves the user "install duckdb, retry,
+    // still broken" trips.
     let cache_arc = match &opts.cache {
         Some(spec) => Some(spec.open()?),
         None => None,
     };
-    let mut archive = crate::reader::open_archive_with_cache(&opts.archive, cache_arc)
-        .with_context(|| format!("open archive {}", opts.archive))?;
-    let payload = extract_columnar_entry(&mut archive, opts.password.as_deref())?;
+    let mut temps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(archives.len());
+    for spec in &archives {
+        let mut archive =
+            crate::reader::open_archive_with_cache(spec, cache_arc.clone())
+                .with_context(|| format!("open archive {}", spec))?;
+        let payload = extract_columnar_entry(&mut archive, opts.password.as_deref())
+            .with_context(|| format!("extract columnar sidecar from {}", spec))?;
+        let tmp = tempfile::Builder::new()
+            .prefix("tzip-columnar-")
+            .suffix(".parquet")
+            .tempfile()
+            .context("create temp file for columnar sidecar")?;
+        tmp.as_file()
+            .write_all_at_zero(&payload)
+            .context("write columnar sidecar to temp file")?;
+        temps.push(tmp);
+    }
 
     if which_duckdb().is_none() {
+        let first = archives.first().map(|s| s.as_str()).unwrap_or("archive.zip");
         bail!(
             "`duckdb` CLI not found on PATH. Install it to use `tzip query --sql`:\n\
              - macOS:  brew install duckdb\n\
              - Linux:  apt install duckdb  (or download from https://duckdb.org/docs/installation/)\n\
              Alternatively, extract the sidecar with `tzip x {} {}` and query it directly.",
-            opts.archive,
+            first,
             crate::columnar::INDEX_ENTRY_NAME,
         );
     }
 
-    // Stage the Parquet bytes to a temp file. DuckDB reads the file
-    // through its Parquet reader; passing it on stdin isn't an
-    // option because Parquet is seekable-only.
-    let tmp = tempfile::Builder::new()
-        .prefix("tzip-columnar-")
-        .suffix(".parquet")
-        .tempfile()
-        .context("create temp file for columnar sidecar")?;
-    tmp.as_file()
-        .write_all_at_zero(&payload)
-        .context("write columnar sidecar to temp file")?;
-
-    run_duckdb(tmp.path(), &opts.sql, opts.format)
+    let parquet_paths: Vec<&Path> = temps.iter().map(|t| t.path()).collect();
+    run_duckdb(&parquet_paths, &opts.sql, opts.format)
 }
 
 fn extract_columnar_entry(archive: &mut Archive, password: Option<&str>) -> Result<Vec<u8>> {
@@ -167,21 +181,32 @@ fn which_duckdb() -> Option<PathBuf> {
     None
 }
 
-fn run_duckdb(parquet_path: &Path, sql: &str, format: QueryFormat) -> Result<()> {
-    // Register the Parquet file as a view named `tzip` so the user's
-    // SQL can use `FROM tzip`. The initial dot-command sets the
-    // output format for everything that follows on the same stdin.
+fn run_duckdb(parquet_paths: &[&Path], sql: &str, format: QueryFormat) -> Result<()> {
+    // Register all shard sidecars as a single view named `tzip`.
+    // `read_parquet(['a.parquet','b.parquet',...])` UNION-reads the
+    // files with aligned schemas — the standard DuckDB pattern for
+    // multi-file tables. One shard is just a single-element list.
+    let mut quoted = String::new();
+    for (i, p) in parquet_paths.iter().enumerate() {
+        if i > 0 {
+            quoted.push_str(",");
+        }
+        let s = p
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("parquet temp path is not UTF-8"))?
+            .replace('\'', "''");
+        quoted.push('\'');
+        quoted.push_str(&s);
+        quoted.push('\'');
+    }
     let setup = format!(
-        "{format_cmd}\nCREATE VIEW tzip AS SELECT * FROM read_parquet('{path}');\n",
+        "{format_cmd}\nCREATE VIEW tzip AS SELECT * FROM read_parquet([{paths}]);\n",
         format_cmd = match format {
             QueryFormat::Box => ".mode box",
             QueryFormat::Json => ".mode json",
             QueryFormat::Csv => ".mode csv",
         },
-        path = parquet_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("parquet temp path is not UTF-8"))?
-            .replace('\'', "''"),
+        paths = quoted,
     );
     let script = format!("{setup}{sql};\n");
 

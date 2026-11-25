@@ -614,9 +614,47 @@ fn run_update_append(
 fn run_update_rebuild(
     opts: &Options,
     mut arch: Archive,
-    kept: Vec<ReadEntry>,
+    mut kept: Vec<ReadEntry>,
     new_items: Vec<WorkItem>,
 ) -> Result<()> {
+    // ChatGPT review #6: stale `.tzip/*` sentinels carried from the
+    // source archive reference entries by their CDR index. After a
+    // rebuild (replace / delete / --atomic / --sort) the final CDR
+    // layout differs, so those indices point at the wrong rows —
+    // false positives, false negatives, and `nameidx::lookup`
+    // returning offsets inside unrelated entries. Strip them.
+    //
+    // We re-emit `.tzip/names.v1` from the final (kept + new) name
+    // set since that is cheap (just filenames). For term / facet /
+    // columnar indices the only correct source is re-tokenising the
+    // kept entries' plaintext bodies, which costs full decompression
+    // (and decrypt, for AES archives) — bigger than a bug fix should
+    // reach. Users who need those indices after a rebuild should
+    // re-run `tzip create ... --index-terms ... --facet ...` or
+    // append-only updates (which keep segmented indices coherent).
+    let mut dropped_stale_names = false;
+    let mut dropped_stale_other = false;
+    kept.retain(|e| {
+        if !e.name.starts_with(".tzip/") {
+            return true;
+        }
+        if e.name == crate::nameidx::INDEX_ENTRY_NAME
+            || e.name.starts_with(".tzip/names.v1.seg")
+        {
+            dropped_stale_names = true;
+        } else {
+            dropped_stale_other = true;
+        }
+        false
+    });
+    let want_regen_names = dropped_stale_names || opts.index_names;
+    if dropped_stale_other && !opts.quiet {
+        eprintln!(
+            "tzip: rebuild dropped stale .tzip/* indices (term / facet / columnar). \
+             Re-run `tzip create --index-terms / --facet / --write-columnar` to \
+             regenerate them."
+        );
+    }
     let pid = std::process::id();
     let tmp_name = format!(
         "{}.tzip-tmp-{}",
@@ -726,14 +764,29 @@ fn run_update_rebuild(
                 progress.set_msg(format!("carried {}", display_name));
             }
             // Phase 2: parallel encode of new items.
-            // Rebuild mode writes a fresh archive so indices here
-            // land as the Phase-1/2/3 unsuffixed base entries (via
-            // the create-mode pipeline). For now we don't
-            // re-emit indices during rebuild — users that want that
-            // should re-run `tzip create ... --index-names ...` on
-            // the output. Phase 4's segmented path only covers
-            // append mode.
             encode_items_into_writer(opts, new_items, &mut zw, &progress, None)?;
+        }
+
+        // ChatGPT review #6: if the source had `.tzip/names.v1`
+        // (or the user explicitly asked for it this run), emit a
+        // fresh one covering the final kept + new name set. Term /
+        // facet / columnar indices were dropped earlier — they
+        // need re-tokenisation of plaintext bodies to rebuild
+        // correctly, which costs full decompression of kept
+        // entries; left for a dedicated `tzip reindex` pass.
+        if want_regen_names {
+            let names = zw.entry_names();
+            if !names.is_empty() {
+                let payload = crate::nameidx::build(
+                    &names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )?;
+                emit_sentinel_entry(
+                    &mut zw,
+                    opts,
+                    crate::nameidx::INDEX_ENTRY_NAME,
+                    payload,
+                )?;
+            }
         }
 
         let mut inner = zw.finish()?;

@@ -135,6 +135,19 @@ impl<W: Write + Seek> ZipWriter<W> {
         self.entries.len()
     }
 
+    /// Names of all entries recorded so far, in CDR order. Used by
+    /// update's rebuild path to regenerate `.tzip/names.v1` from
+    /// the final (kept + new) entry list — see `run_update_rebuild`
+    /// / ChatGPT review #6. Non-UTF-8 names (if any) are decoded
+    /// lossily; a `.tzip/names.v1` built over them would already be
+    /// best-effort.
+    pub fn entry_names(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+            .collect()
+    }
+
     pub fn record_existing(&mut self, re: &ReadEntry, lfh_offset: u64) {
         self.entries.push(CentralEntry {
             name: re.name_bytes.clone(),

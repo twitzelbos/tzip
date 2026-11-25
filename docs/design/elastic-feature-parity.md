@@ -133,14 +133,22 @@ stays coherent across incremental updates, no rebuild needed.
 
 ### Phase 5: DuckDB sidecar for deep aggregations — SHIPPED in #57
 
-**Known limitation:** `tzip u` doesn't refresh the columnar sidecar.
-Rebuild-mode byte-copies kept entries without decompressing, so
-re-extracting their JSON for the Parquet rebuild would need a
-parallel decompression path. Workaround: delete the stale
-`.tzip/columnar.v1.parquet` from the archive (via `tzip u --delete
-'.tzip/columnar.v1.parquet'`) and re-create with
-`--write-columnar schema.json`. A future segmented columnar
-(analogous to Phase 4 `.segN`) would avoid this.
+### Phase 5b: Append-emitted columnar segments — SHIPPED in #61
+
+`tzip u --write-columnar` now emits a
+`.tzip/columnar.v1.parquet.segN` segment, exactly analogous to
+Phase-4's `.segN` story for name / term / facet indices. Schema
+is auto-loaded from the base sidecar's Parquet file-level metadata
+(the create-time schema is embedded there under the key
+`tzip.columnar.schema.v1`), so append usage is the ergonomic
+`tzip u out.zip new-logs/ --write-columnar` — no schema path
+needed.
+
+At query time, `tzip query` extracts the base sidecar plus every
+`.segN` sibling, stages each to a temp Parquet file, and hands
+the list to DuckDB via `read_parquet([..])`. DuckDB UNIONs them
+transparently, so a user's `SELECT ... FROM tzip` sees every row
+across the whole segment chain.
 
 **Deliverable:** `tzip create --write-columnar 'schema.json'` (or
 auto-infer schema from first N JSON entries) extracts declared

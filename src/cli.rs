@@ -381,6 +381,23 @@ pub struct UpdateArgs {
     /// field are summed at `tzip aggregate` time.
     #[arg(long, value_name = "PATH")]
     pub facet: Vec<String>,
+
+    /// Append a columnar Parquet segment (Phase 5b). Append-mode
+    /// emits `.tzip/columnar.v1.parquet.segN` from the added
+    /// entries' JSON bodies; `tzip query` reads base + every
+    /// segment via DuckDB's `read_parquet([..])` UNION. Schema is
+    /// auto-loaded from the existing base sidecar's Parquet
+    /// metadata — `tzip create --write-columnar schema.json` must
+    /// have been run at least once. To use a different schema on
+    /// the segment, pass `--columnar-schema PATH`.
+    #[arg(long)]
+    pub write_columnar: bool,
+
+    /// Optional schema override for `--write-columnar` on append.
+    /// Only meaningful with `--write-columnar`; if omitted, the
+    /// schema is auto-loaded from the base sidecar.
+    #[arg(long, value_name = "SCHEMA.json", requires = "write_columnar")]
+    pub columnar_schema: Option<PathBuf>,
 }
 
 // ── Reader (ls / cat / x) ──────────────────────────────────────────────────
@@ -1044,14 +1061,19 @@ impl UpdateArgs {
             index_names: self.index_names,
             index_terms: self.index_terms,
             facet: self.facet,
-            // Phase 5 columnar sidecar isn't appendable yet — the
-            // rebuild path (triggered by --delete / --replace or
-            // explicit --mode rebuild) would re-emit it, but
-            // append-mode leaves the existing Parquet entry intact.
-            // Expose the flag so rebuild-mode `tzip u` can refresh
-            // the sidecar; append-mode update_pipeline simply ignores
-            // it.
-            write_columnar: None,
+            // Phase 5b: append-mode emits a Parquet segment.
+            //   `--write-columnar` alone  → Some(empty PathBuf) =
+            //     auto-load schema from the existing base sidecar.
+            //   `--write-columnar --columnar-schema PATH` →
+            //     Some(PATH) = override with this schema.
+            //   flag absent → None = don't emit a columnar segment.
+            // The empty-PathBuf sentinel is recognised by
+            // `resolve_columnar_schema_for_update`.
+            write_columnar: if self.write_columnar {
+                Some(self.columnar_schema.unwrap_or_default())
+            } else {
+                None
+            },
         })
     }
 }

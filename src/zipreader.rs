@@ -481,6 +481,19 @@ impl Archive {
         }
     }
 
+    /// Enumerate every `.tzip/columnar.v1.parquet[.segN]` body in
+    /// segment-number order (Phase 5b). Query dispatch stages all
+    /// of these to temp files and hands the list to DuckDB's
+    /// `read_parquet([...])` for a transparent UNION.
+    ///
+    /// Returns an empty Vec when the archive has no columnar
+    /// sidecar at all; a single-element Vec for the Phase-5 base
+    /// case; a multi-element Vec for archives with Phase-5b
+    /// segments. Readers don't need to care which case applies.
+    pub fn columnar_segment_bodies(&mut self) -> Vec<Vec<u8>> {
+        self.read_segment_bodies(crate::columnar::INDEX_ENTRY_NAME)
+    }
+
     /// For each unsuffixed base name `.tzip/*.v1`, return the
     /// bodies of the base entry and every `.segN` sibling in
     /// segment-number order. Readers parse each into whatever

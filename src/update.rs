@@ -53,11 +53,13 @@ const UNDO_VERSION: u32 = 1;
 fn next_segment_numbers(
     existing: &[ReadEntry],
     facet_specs: &[String],
-) -> (u32, u32, Vec<u32>) {
+) -> (u32, u32, Vec<u32>, u32) {
     let mut name_max: u32 = 0;
     let mut term_max: u32 = 0;
+    let mut columnar_max: u32 = 0;
     let mut facet_max: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
+    let columnar_seg_prefix = format!("{}.seg", crate::columnar::INDEX_ENTRY_NAME);
     for e in existing {
         let n = &e.name;
         if n == crate::nameidx::INDEX_ENTRY_NAME {
@@ -71,6 +73,12 @@ fn next_segment_numbers(
         } else if let Some(rest) = n.strip_prefix(".tzip/terms.v1.seg") {
             if let Ok(k) = rest.parse::<u32>() {
                 term_max = term_max.max(k);
+            }
+        } else if n == crate::columnar::INDEX_ENTRY_NAME {
+            columnar_max = columnar_max.max(0);
+        } else if let Some(rest) = n.strip_prefix(&columnar_seg_prefix) {
+            if let Ok(k) = rest.parse::<u32>() {
+                columnar_max = columnar_max.max(k);
             }
         } else if let Some(rest) = n.strip_prefix(".tzip/facets.v1/") {
             let (leaf, seg) = match rest.rsplit_once(".seg") {
@@ -88,6 +96,7 @@ fn next_segment_numbers(
     // the Phase-1/2/3 unsuffixed base entries.
     let name_seg = name_max + 1;
     let term_seg = term_max + 1;
+    let columnar_seg = columnar_max + 1;
     let facet_segs: Vec<u32> = facet_specs
         .iter()
         .map(|spec| {
@@ -97,7 +106,7 @@ fn next_segment_numbers(
             facet_max.get(&short).copied().unwrap_or(0) + 1
         })
         .collect();
-    (name_seg, term_seg, facet_segs)
+    (name_seg, term_seg, facet_segs, columnar_seg)
 }
 
 /// Serialize each index-segment builder in `seg` and write it into
@@ -113,13 +122,14 @@ fn write_index_segment_entries<W: Write + Seek>(
     name_seg_n: u32,
     term_seg_n: u32,
     facet_seg_ns: &[u32],
+    columnar_seg_n: u32,
 ) -> Result<()> {
     // `seg.names` currently has the K payload-entry names (new
     // files). They occupy CDR positions `[base_idx, base_idx+K)`.
-    // Sentinel entries emitted below (facet / term / names
-    // themselves) also take CDR positions; we track those via the
-    // running `zw.entry_count()` so their posting IDs are correct
-    // too when `--index-names` is on.
+    // Sentinel entries emitted below (facet / term / columnar /
+    // names themselves) also take CDR positions; we track those via
+    // the running `zw.entry_count()` so their posting IDs are
+    // correct too when `--index-names` is on.
     let mut named: Vec<(String, u32)> = Vec::with_capacity(seg.names.len() + 1);
     for (i, name) in seg.names.iter().enumerate() {
         named.push((name.clone(), seg.base_idx + i as u32));
@@ -144,6 +154,24 @@ fn write_index_segment_entries<W: Write + Seek>(
             named.push((name, pos));
         }
     }
+    // Phase 5b columnar Parquet segment.
+    if let Some(cb) = seg.columnar_builder.take() {
+        if cb.row_count() > 0 {
+            let payload = cb.finish()?;
+            if !payload.is_empty() {
+                let name = format!(
+                    "{}.seg{}",
+                    crate::columnar::INDEX_ENTRY_NAME,
+                    columnar_seg_n
+                );
+                let pos = zw.entry_count() as u32;
+                emit_sentinel_entry(zw, &name, payload)?;
+                if opts.index_names {
+                    named.push((name, pos));
+                }
+            }
+        }
+    }
     if let Some(tb) = seg.term_builder.take() {
         let payload = tb.finish()?;
         if !payload.is_empty() {
@@ -163,6 +191,41 @@ fn write_index_segment_entries<W: Write + Seek>(
         emit_sentinel_entry(zw, &name, payload)?;
     }
     Ok(())
+}
+
+/// Resolve Phase-5b's columnar schema: explicit `--write-columnar
+/// SCHEMA.json` file, bare `--write-columnar` with auto-load from
+/// the archive's existing base sidecar, or `None` when the flag
+/// was absent. Separate function so `run_update_append` reads
+/// linearly.
+fn resolve_columnar_schema_for_update(
+    opts: &Options,
+    arch: &mut Archive,
+) -> Result<Option<crate::columnar::ColumnarSchema>> {
+    let Some(path) = &opts.write_columnar else {
+        return Ok(None);
+    };
+    // Explicit file path: parse it. User override of any stashed
+    // schema in the base sidecar — tzip intentionally lets the user
+    // reshape the columns between archive generations this way.
+    if !path.as_os_str().is_empty() {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read columnar schema {}", path.display()))?;
+        return Ok(Some(crate::columnar::ColumnarSchema::parse(&bytes)?));
+    }
+    // Bare `--write-columnar`: load the schema out of the base
+    // sidecar's Parquet metadata.
+    let bodies = arch.columnar_segment_bodies();
+    let base = bodies.into_iter().next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`--write-columnar` without a schema path requires an existing \
+             `{}` sidecar to auto-load the schema from; archive has none. \
+             Pass `--write-columnar schema.json` or run `tzip create \
+             --write-columnar` once first.",
+            crate::columnar::INDEX_ENTRY_NAME,
+        )
+    })?;
+    Ok(Some(crate::columnar::ColumnarSchema::from_parquet_bytes(&base)?))
 }
 
 /// Write one Store-method sentinel entry (`.tzip/*`) via `zw`.
@@ -217,10 +280,19 @@ struct IndexSegment {
     /// Pre-compiled `--index-terms` globs, matched per-entry to
     /// decide whether to tokenize.
     index_terms_globs: Arc<Vec<String>>,
+    /// Phase-5b columnar builder. `Some` when the archive has a
+    /// columnar sidecar (loaded via `ColumnarSchema::from_parquet_bytes`)
+    /// or when the user passes `--write-columnar schema.json`
+    /// explicitly; `None` otherwise.
+    columnar_builder: Option<crate::columnar::ColumnarBuilder>,
 }
 
 impl IndexSegment {
-    fn new(opts: &Options, base_idx: u32) -> Result<Self> {
+    fn new(
+        opts: &Options,
+        base_idx: u32,
+        columnar_schema: Option<crate::columnar::ColumnarSchema>,
+    ) -> Result<Self> {
         Ok(Self {
             base_idx,
             local_count: 0,
@@ -236,11 +308,12 @@ impl IndexSegment {
                 .map(|s| crate::facets::FacetBuilder::new(s))
                 .collect::<Result<_>>()?,
             index_terms_globs: Arc::new(opts.index_terms.clone()),
+            columnar_builder: columnar_schema.map(crate::columnar::ColumnarBuilder::new),
         })
     }
 
     fn want_facet(&self) -> bool {
-        !self.facet_builders.is_empty()
+        !self.facet_builders.is_empty() || self.columnar_builder.is_some()
     }
 }
 
@@ -409,6 +482,12 @@ fn run_update_append(
     let orig_file_size = arch.file_size();
     let cd_offset = arch.cd_offset();
     let tail = arch.tail_bytes().context("snapshot archive tail for undo")?;
+    // Phase 5b: resolve the columnar schema before dropping the
+    // archive handle. `--write-columnar` (bare) needs to read the
+    // existing base sidecar's Parquet metadata, which goes through
+    // `arch`. Drop happens next so the writer can reopen the fd
+    // for appending.
+    let columnar_schema = resolve_columnar_schema_for_update(opts, &mut arch)?;
     drop(arch);
     write_undo_file(&undo_path, orig_file_size, cd_offset, &tail)
         .with_context(|| format!("write undo file {}", undo_path.display()))?;
@@ -462,10 +541,12 @@ fn run_update_append(
         opts.quiet || opts.tui,
     ));
     let base_idx = existing.len() as u32;
-    let want_any_segment =
-        opts.index_names || !opts.index_terms.is_empty() || !opts.facet.is_empty();
+    let want_any_segment = opts.index_names
+        || !opts.index_terms.is_empty()
+        || !opts.facet.is_empty()
+        || columnar_schema.is_some();
     let mut seg = if want_any_segment {
-        Some(IndexSegment::new(opts, base_idx)?)
+        Some(IndexSegment::new(opts, base_idx, columnar_schema)?)
     } else {
         None
     };
@@ -484,7 +565,7 @@ fn run_update_append(
     //     1 if no existing segment, so segments never collide with
     //     the Phase-1/2/3 unsuffixed base entries.
     if let Some(mut s) = seg.take() {
-        let (name_seg_n, term_seg_n, facet_seg_ns) =
+        let (name_seg_n, term_seg_n, facet_seg_ns, columnar_seg_n) =
             next_segment_numbers(&existing, &opts.facet);
         write_index_segment_entries(
             &mut zw,
@@ -493,6 +574,7 @@ fn run_update_append(
             name_seg_n,
             term_seg_n,
             &facet_seg_ns,
+            columnar_seg_n,
         )?;
     }
 
@@ -830,6 +912,9 @@ fn encode_items_into_writer<W: Write + Seek>(
             if let Some(body) = entry.facet_body.take() {
                 for fb in &mut s.facet_builders {
                     fb.add_body(&body);
+                }
+                if let Some(cb) = s.columnar_builder.as_mut() {
+                    cb.add_body(&body);
                 }
             }
             s.local_count += 1;

@@ -142,6 +142,10 @@ ppmd-rust = "1.5"
 parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
 arrow-array = "60"
 arrow-schema = "60"
+# `bytes` is already in the tree transitively via parquet; naming it
+# explicitly so columnar.rs can read sidecar metadata back out via
+# `ArrowReaderMetadata::load(&Bytes, ...)`.
+bytes = "1"
 
 # Linux io_uring reader (optional, behind the `io-uring` feature) +
 # FUSE3 for `tzip mount`. `fuser` only compiles on Linux.

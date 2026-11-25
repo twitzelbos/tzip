@@ -2366,6 +2366,7 @@ dependencies = [
  "bincode",
  "boomphf",
  "byteorder",
+ "bytes",
  "bzip2",
  "cbindgen",
  "cc",

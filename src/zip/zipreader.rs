@@ -67,10 +67,20 @@ pub struct Archive {
     name_segments: Vec<crate::nameidx::NameIndex>,
     /// Term-index segments. `tzip grep` queries union the posting
     /// lists from every segment before narrowing candidates.
+    /// Loaded lazily on first `term_candidates` / `term_coverage`
+    /// call — see `term_segments_loaded`; ChatGPT review #5.
     term_segments: Vec<crate::termidx::TermIndex>,
+    /// `true` once `try_load_term_segments` has run. Guards the
+    /// lazy populate so we don't re-scan the CDR + source every
+    /// call. Stays `false` on archives that never run grep.
+    term_segments_loaded: bool,
     /// Per-field facet segments. Each field maps to one or more
     /// `Facet` instances; `facet()` merges counts across them.
+    /// Loaded lazily — ChatGPT review #5. Only `tzip aggregate`
+    /// touches facets, so eager loading was dead I/O for every
+    /// other op (which was most of them).
     facet_segments: std::collections::HashMap<String, Vec<crate::facets::Facet>>,
+    facet_segments_loaded: bool,
     /// Phase 6 index cache binding. Set via `attach_cache`.
     /// `None` on local archives (no payoff — body-reads are already
     /// a local file-seek) and on remote archives opened without an
@@ -286,12 +296,16 @@ impl Archive {
             disk_count: 1,
             name_segments: Vec::new(),
             term_segments: Vec::new(),
+            term_segments_loaded: false,
             facet_segments: std::collections::HashMap::new(),
+            facet_segments_loaded: false,
             cache_ctx: cache_binding.map(|(cache, archive_id)| CacheCtx { cache, archive_id }),
         };
         arch.try_load_name_segments();
-        arch.try_load_term_segments();
-        arch.try_load_facet_segments();
+        // term + facet segments load lazily on first access —
+        // ChatGPT review #5. Most ops (`ls`, `x`, `cat`, `query`)
+        // never touch them; eager loading was pure dead I/O on
+        // remote archives.
         Ok(arch)
     }
 
@@ -391,12 +405,14 @@ impl Archive {
             disk_count,
             name_segments: Vec::new(),
             term_segments: Vec::new(),
+            term_segments_loaded: false,
             facet_segments: std::collections::HashMap::new(),
+            facet_segments_loaded: false,
             cache_ctx: None,
         };
         arch.try_load_name_segments();
-        arch.try_load_term_segments();
-        arch.try_load_facet_segments();
+        // See primary `open_source_with_cache` for why term + facet
+        // are not eagerly loaded here either.
         Ok(arch)
     }
 
@@ -591,8 +607,27 @@ impl Archive {
         }
     }
 
+    /// Lazy-load the facet segments if they haven't been yet. Idempotent.
+    /// Callers that need facets go through this (directly or via `facet*`);
+    /// callers that don't pay nothing at open time. ChatGPT review #5.
+    fn ensure_facet_segments(&mut self) {
+        if !self.facet_segments_loaded {
+            self.try_load_facet_segments();
+            self.facet_segments_loaded = true;
+        }
+    }
+
+    /// Lazy-load the term segments if they haven't been yet. Idempotent.
+    fn ensure_term_segments(&mut self) {
+        if !self.term_segments_loaded {
+            self.try_load_term_segments();
+            self.term_segments_loaded = true;
+        }
+    }
+
     /// Available facet field names (leaves), alphabetic order.
-    pub fn facet_fields(&self) -> Vec<String> {
+    pub fn facet_fields(&mut self) -> Vec<String> {
+        self.ensure_facet_segments();
         let mut names: Vec<String> = self.facet_segments.keys().cloned().collect();
         names.sort();
         names
@@ -602,7 +637,8 @@ impl Archive {
     /// every segment this archive carries. `None` if no segment has
     /// the field. Appendable-safe: `tzip u` can write additional
     /// `.segN` entries and they fold into the returned total.
-    pub fn facet(&self, field: &str) -> Option<crate::facets::Facet> {
+    pub fn facet(&mut self, field: &str) -> Option<crate::facets::Facet> {
+        self.ensure_facet_segments();
         let segs = self.facet_segments.get(field)?;
         if segs.is_empty() {
             return None;
@@ -629,7 +665,11 @@ impl Archive {
     /// - `Some(None)` when every segment said the query has no
     ///   usable tokens — caller should fall through to full scan.
     /// - `None` when the archive has no term index at all.
-    pub fn term_candidates(&self, query: &str) -> Option<Option<std::collections::HashSet<u32>>> {
+    pub fn term_candidates(
+        &mut self,
+        query: &str,
+    ) -> Option<Option<std::collections::HashSet<u32>>> {
+        self.ensure_term_segments();
         if self.term_segments.is_empty() {
             return None;
         }
@@ -672,7 +712,8 @@ impl Archive {
     /// - `Coverage::Unknown` when any segment predates the
     ///   trailer, or when the archive has no term index at all —
     ///   the caller must scan `idx` conservatively.
-    pub fn term_coverage(&self, idx: u32) -> TermCoverage {
+    pub fn term_coverage(&mut self, idx: u32) -> TermCoverage {
+        self.ensure_term_segments();
         if self.term_segments.is_empty() {
             return TermCoverage::Unknown;
         }

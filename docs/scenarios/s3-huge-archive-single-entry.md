@@ -130,7 +130,7 @@ LFH (~100 bytes of overhead each).
 ## Open design: CDR caching
 
 The structural-cost analysis above points at a real follow-up:
-**ETag-keyed CDR caching**.
+**ETag-keyed CDR caching** (tracked as issue #74).
 
 - At open time, `Archive::open_source_with_cache` could consult the
   Phase 6 cache for a `CDR@<etag>` blob before issuing the CDR
@@ -144,8 +144,82 @@ The structural-cost analysis above points at a real follow-up:
 - Scope: a modest extension of `src/index/indexcache.rs` + the
   existing `CacheCtx` plumbing on `Archive`.
 
-That's **not in this repo today** — this doc ends at the analysis.
-File it as an issue if you need it, or sidestep by sharding (above).
+### Security: does caching an ETag leak information about an encrypted archive?
+
+Short answer: no new information disclosure beyond what the live
+S3 object already exposes — but the local cache file must be
+`0700`-mode so other users on the same machine can't read entry
+names.
+
+**What an ETag of a tzip AES-256 archive actually contains.**
+S3 computes the ETag as `MD5(whole object bytes)` for a single
+PUT, or `MD5(concat MD5 of parts) + "-N"` for multipart. The
+"object bytes" are:
+
+- ZIP structural headers (LFH, CDR, EOCD) — plaintext by ZIP
+  spec.
+- Entry bodies wrapped in WinZIP AE-2:
+  `random 16-byte salt + pw-verify + CTR ciphertext + HMAC-SHA1[..10]`
+  (see `src/zip/crypto.rs::encrypt_ae2_in_place_with_salt`).
+
+The salt is fresh per entry per upload (`rand::thread_rng().fill_bytes`),
+so identical plaintext produces different ciphertext → different
+MD5 → different ETag. **The ETag doesn't leak plaintext bodies,
+doesn't help a known-plaintext attack, doesn't expose the
+password.**
+
+What the ETag *does* reveal:
+
+- The object changed at time t.
+- Approximate size (correlated with but not equal to
+  `Content-Length`).
+- Multipart part count (the `-N` suffix).
+
+Every one of those is already exposed by `HEAD` /
+`ListObjects` to anyone with `s3:GetObject`. Keying the cache on
+ETag adds zero disclosure to the network / bucket path.
+
+**The one real concern, specific to tzip.** The ZIP spec keeps
+entry names in the central directory **in plaintext even on
+password-protected archives** — only entry *bodies* get
+encrypted. So a cached CDR contains the entry-name list. That's
+not new information on the wire (the live archive exposes it
+to anyone who can read it), but it would be new information to
+**other OS users on the same machine** if the cache file
+inherited default `0644` permissions from the process umask.
+This is already true today for the Phase 6 cache of
+`.tzip/names.v1` — not a new disclosure channel — but the CDR
+cache is a natural place to tighten this once for every bucket.
+
+**Design requirements this adds to #74.**
+
+1. Cache directory root created `0700` and cache files `0600`
+   on Unix. Reuse / harden the Phase 6 cache's dir-creation
+   path.
+2. Cache key includes the full source URL, not just the ETag —
+   two different objects with coincidentally equal fingerprints
+   (improbable with MD5, more so with weak / server-specific
+   fingerprints on non-S3 HTTP) must not share a slot. Phase 6
+   already keys on `(archive_url, fingerprint)` via
+   `ArchiveId`; reuse that.
+3. Non-S3 HTTP sources that don't emit an ETag: fall back to
+   `Last-Modified` → `Content-Length` → "no fingerprint
+   available, skip the cache" (hard-disable, do not fall
+   through to an unkeyed cache). Same chain Phase 6 uses.
+4. Weak ETags (`W/"..."`) are treated as opaque strings:
+   verbatim, aggressive invalidation. Worst case an extra
+   cold fetch; never a correctness issue.
+5. Out of scope: encrypting cache contents at rest. The data
+   isn't more sensitive than `~/.cache/aws-cli/` or the OS's
+   own HTTP caches; users who need encrypted local cache put
+   `$HOME/.cache/tzip` on a FileVault / LUKS volume.
+
+**Relationship to PR #70's S3 append.** Append goes through
+`CompleteMultipartUpload`, which produces a new object ETag
+(computed over the composed parts). The CDR cache invalidates
+on that ETag change naturally — a reader sees a cache miss,
+fetches the fresh CDR, repopulates. No coordination needed
+between writer and reader.
 
 ---
 

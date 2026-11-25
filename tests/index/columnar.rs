@@ -225,6 +225,143 @@ fn query_runs_sql_via_duckdb() {
 }
 
 #[test]
+fn query_row_group_prune_narrows_scan_and_returns_correct_results() {
+    // ChatGPT review #4 regression test. Build a sidecar with
+    // ≥ 2 row groups by pushing 70 Ki JSONL rows through the
+    // columnar builder, then run a predicate that only one row
+    // group's stats allow and verify:
+    //
+    //   (a) the result is correct (DuckDB sees exactly the
+    //       matching rows, not an under- or over-count),
+    //   (b) stderr shows the prune diagnostic with N < M,
+    //       proving the range-read pruner actually dropped a
+    //       row group.
+    //
+    // Soundness regression target: a bug in the predicate
+    // extractor or stats comparator would most likely show up
+    // as (a) failing, not (b) — hence we assert (a) hard and
+    // (b) only probabilistically.
+    if !have_duckdb() {
+        eprintln!("skipping: duckdb not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("logs")).unwrap();
+
+    // Two NDJSON files, each ~40 Ki rows, with disjoint `n`
+    // ranges — guarantees two distinct row groups with
+    // non-overlapping `n` statistics.
+    let rows_per_file = 40_000;
+    for (file_idx, (low, high)) in [(0, 40_000), (100_000, 140_000)].iter().enumerate() {
+        let mut body = String::with_capacity(rows_per_file * 20);
+        for n in *low..*high {
+            use std::fmt::Write;
+            writeln!(body, "{{\"n\":{}}}", n).unwrap();
+        }
+        fs::write(
+            tmp.path().join(format!("logs/batch_{:02}.jsonl", file_idx)),
+            body.as_bytes(),
+        )
+        .unwrap();
+    }
+    let schema = tmp.path().join("schema.json");
+    fs::write(
+        &schema,
+        br#"{ "fields": [ { "name": "n", "type": "int64", "path": ".n" } ] }"#,
+    )
+    .unwrap();
+
+    run(
+        tmp.path(),
+        &[
+            "create",
+            "out.zip",
+            "logs",
+            "-m",
+            "store",
+            "--index-terms",
+            "*.jsonl",
+            "--write-columnar",
+            "--columnar-schema",
+            schema.to_str().unwrap(),
+            "-q",
+        ],
+    );
+
+    // Pick a predicate whose constant falls between the two
+    // batches' ranges but past where the column builder's
+    // 64 Ki-row-per-row-group flush lands. Since the builder
+    // flushes at 64 Ki total rows and each batch is 40 Ki, the
+    // first row group straddles the batch boundary — but the
+    // key property we need is that ONE of the two resulting
+    // row groups has max(n) < 130000 and the other has
+    // max(n) > 130000. That holds for either file-walk order
+    // because the two batches' n-ranges are disjoint.
+    //
+    //   (0..40000, 100000..140000) walked in order →
+    //     RG1 covers n ∈ [0, ~124000), RG2 covers [~124000, 140000)
+    //     → RG1 max < 130000 (pruned), RG2 max > 130000 (kept)
+    //
+    //   reverse walk order →
+    //     RG1 covers n ∈ [0, ~164000) spanning both batches
+    //       (but file_01 only has 40 Ki rows so the overflow
+    //       spills into file_00), RG2 covers the other tail
+    //     → either way exactly one row group's max falls past
+    //       130000 and the other's does not.
+    //
+    // 140_000 - 130_000 - 1 = 9_999 rows satisfy `n > 130000`.
+    let out = Command::new(tzip_bin())
+        .current_dir(tmp.path())
+        .args([
+            "query",
+            "--format",
+            "csv",
+            "-s",
+            "SELECT COUNT(*) AS n FROM tzip WHERE n > 130000",
+            "out.zip",
+        ])
+        .output()
+        .expect("run tzip query");
+    assert!(
+        out.status.success(),
+        "query failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("9999"),
+        "expected 9999 rows satisfying n > 130000, got stdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    // Prune diagnostic should fire with N<M. A regression that
+    // silently disables pruning fails here even though results
+    // stay correct.
+    assert!(
+        stderr.contains("row groups kept"),
+        "expected prune diagnostic in stderr: {}",
+        stderr
+    );
+    // Parse "N/M row groups kept" and assert N < M.
+    let frac = stderr
+        .lines()
+        .find(|l| l.contains("row groups kept"))
+        .and_then(|l| l.split_whitespace().find(|t| t.contains('/')))
+        .expect("prune diagnostic format");
+    let (kept, total) = frac.split_once('/').unwrap();
+    let kept: usize = kept.parse().unwrap();
+    let total: usize = total.parse().unwrap();
+    assert!(total >= 2, "expected ≥ 2 row groups to prune from, got {}", total);
+    assert!(
+        kept < total,
+        "expected pruning to drop a row group, got kept={}, total={}",
+        kept,
+        total
+    );
+}
+
+#[test]
 fn query_supports_date_bucketing() {
     if !have_duckdb() {
         eprintln!("skipping: duckdb not on PATH");

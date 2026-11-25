@@ -859,7 +859,7 @@ pub fn run(opts: Options) -> Result<()> {
         if opts.index_names {
             indexed_names.push(name.clone());
         }
-        crate::update::emit_sentinel_entry(&mut zw, &opts, &name, payload)?;
+        crate::sentinel::emit(&mut zw, &opts, &name, payload)?;
     }
 
     // --write-columnar: emit `.tzip/columnar.v1.parquet` (Phase 5).
@@ -874,7 +874,7 @@ pub fn run(opts: Options) -> Result<()> {
             if opts.index_names {
                 indexed_names.push(name.clone());
             }
-            crate::update::emit_sentinel_entry(&mut zw, &opts, &name, payload)?;
+            crate::sentinel::emit(&mut zw, &opts, &name, payload)?;
         }
     }
 
@@ -888,7 +888,7 @@ pub fn run(opts: Options) -> Result<()> {
             if opts.index_names {
                 indexed_names.push(name.clone());
             }
-            crate::update::emit_sentinel_entry(&mut zw, &opts, &name, payload)?;
+            crate::sentinel::emit(&mut zw, &opts, &name, payload)?;
         }
     }
 
@@ -901,7 +901,7 @@ pub fn run(opts: Options) -> Result<()> {
             &indexed_names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         )?;
         let name = crate::nameidx::INDEX_ENTRY_NAME.to_string();
-        crate::update::emit_sentinel_entry(&mut zw, &opts, &name, payload)?;
+        crate::sentinel::emit(&mut zw, &opts, &name, payload)?;
     }
 
     profile(profile_on, "main_write_loop", t_mainloop);

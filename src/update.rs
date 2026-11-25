@@ -150,7 +150,7 @@ fn write_index_segment_entries<W: Write + Seek>(
             seg_n
         );
         let pos = zw.entry_count() as u32;
-        emit_sentinel_entry(zw, opts, &name, payload)?;
+        crate::sentinel::emit(zw, opts, &name, payload)?;
         if opts.index_names {
             named.push((name, pos));
         }
@@ -166,7 +166,7 @@ fn write_index_segment_entries<W: Write + Seek>(
                     columnar_seg_n
                 );
                 let pos = zw.entry_count() as u32;
-                emit_sentinel_entry(zw, opts, &name, payload)?;
+                crate::sentinel::emit(zw, opts, &name, payload)?;
                 if opts.index_names {
                     named.push((name, pos));
                 }
@@ -178,7 +178,7 @@ fn write_index_segment_entries<W: Write + Seek>(
         if !payload.is_empty() {
             let name = format!("{}.seg{}", crate::termidx::INDEX_ENTRY_NAME, term_seg_n);
             let pos = zw.entry_count() as u32;
-            emit_sentinel_entry(zw, opts, &name, payload)?;
+            crate::sentinel::emit(zw, opts, &name, payload)?;
             if opts.index_names {
                 named.push((name, pos));
             }
@@ -189,7 +189,7 @@ fn write_index_segment_entries<W: Write + Seek>(
             named.iter().map(|(n, p)| (n.as_str(), *p)).collect();
         let payload = crate::nameidx::build_with_positions(&pairs)?;
         let name = format!("{}.seg{}", crate::nameidx::INDEX_ENTRY_NAME, name_seg_n);
-        emit_sentinel_entry(zw, opts, &name, payload)?;
+        crate::sentinel::emit(zw, opts, &name, payload)?;
     }
     Ok(())
 }
@@ -227,53 +227,6 @@ fn resolve_columnar_schema_for_update(
         )
     })?;
     Ok(Some(crate::columnar::ColumnarSchema::from_parquet_bytes(&base)?))
-}
-
-/// Write one sentinel entry (`.tzip/*`) via `zw`. Encrypts the
-/// payload with AES-256 when `opts.password` is set — index
-/// bodies are content-derived, so leaving them plaintext on an
-/// AES archive would let an attacker enumerate every entry name,
-/// term, and facet value without knowing the password (ChatGPT
-/// review #2).
-pub(crate) fn emit_sentinel_entry<W: Write + Seek>(
-    zw: &mut ZipWriter<W>,
-    opts: &Options,
-    name: &str,
-    body: Vec<u8>,
-) -> Result<()> {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&body);
-    let crc = hasher.finalize();
-    let body_len = body.len() as u64;
-    let (final_body, encrypted, method_on_wire) = match opts.password.as_deref() {
-        Some(pw) if !pw.is_empty() => (
-            crate::crypto::wrap_ae2(pw, &body)?,
-            true,
-            crate::zipformat::METHOD_AES,
-        ),
-        _ => (body, false, 0),
-    };
-    let e = crate::zipwriter::EncodedEntry {
-        index: u64::MAX,
-        name: name.to_string(),
-        body: final_body,
-        uncompressed_size: body_len,
-        crc32: crc,
-        method_on_wire,
-        // `inner_method = 0` (Store) because the sentinel payload
-        // isn't compressed before encryption.
-        inner_method: 0,
-        encrypted,
-        gp_bit1: false,
-        version_needed: if encrypted { 51 } else { 20 },
-        mtime: (0, 0),
-        external_attr: 0o100644u32 << 16,
-        md5_digest: None,
-        sha256_digest: None,
-        index_terms: None,
-        facet_body: None,
-    };
-    zw.write_entry(e)
 }
 
 /// Per-invocation index-building state for `tzip u` indexing flags.
@@ -780,7 +733,7 @@ fn run_update_rebuild(
                 let payload = crate::nameidx::build(
                     &names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                 )?;
-                emit_sentinel_entry(
+                crate::sentinel::emit(
                     &mut zw,
                     opts,
                     crate::nameidx::INDEX_ENTRY_NAME,

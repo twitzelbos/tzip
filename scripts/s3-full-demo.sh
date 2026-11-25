@@ -250,17 +250,35 @@ fi
 
 # ── READ PHASE ────────────────────────────────────────────────
 banner "4/15  tzip ls (no password — names are plaintext in CDR)"
-LS_COUNT=$("$TZIP" ls "$S3_URL" | wc -l | tr -d ' ')
-echo "entries listed: $LS_COUNT"
+# `tzip ls` prints a header + separator + rows + totals table,
+# so counting lines overcounts. Use `tzip find --names-only`
+# for a clean "one entry name per line" stream instead.
+LS_COUNT=$("$TZIP" find --names-only "$S3_URL" | wc -l | tr -d ' ')
+echo "entries counted (via find --names-only): $LS_COUNT"
 if [[ "$LS_COUNT" -lt "$ENTRIES" ]]; then
     echo "FAIL: expected ≥ $ENTRIES entries, got $LS_COUNT" >&2
     exit 1
 fi
 
-banner "5/15  tzip ls -l (long listing shows method=PPMd + encrypted)"
-run "ls-long" bash -c "'$TZIP' ls -l '$S3_URL' | head -5"
+banner "5/15  tzip ls — the default long listing already shows method / mtime / name"
+# `tzip ls` has no `-l` flag — the default output IS the long
+# form. Older versions of this script passed `-l`, which errors
+# out.
+run "ls-head" bash -c "'$TZIP' ls '$S3_URL' | head -8"
 
-MARKER_ENTRY=$("$TZIP" ls "$S3_URL" | grep 'entry-0.*json' | head -1)
+# Pick one `entry-NNNNNN.json` for the per-entry ops that
+# follow. `tzip find --names-only` emits `<archive>:<entry>`
+# per line; strip the archive prefix with the last-colon
+# split so S3 URLs' own colon doesn'\''t confuse it.
+MARKER_ENTRY=$(
+    "$TZIP" find --names-only --include 'corpus/entry-*.json' "$S3_URL" \
+    | head -1 \
+    | sed 's/^.*:\([^:]*\)$/\1/'
+)
+if [[ -z "$MARKER_ENTRY" ]]; then
+    echo "FAIL: couldn'\''t locate a corpus/entry-*.json in the archive" >&2
+    exit 1
+fi
 echo "sample entry name: $MARKER_ENTRY"
 
 banner "6/15  tzip cat (one entry, with password)"
@@ -280,7 +298,11 @@ echo "PASS: wrong password rejected (exit code $rc)"
 banner "8/15  tzip x — extract one entry to disk, diff against original"
 mkdir -p extract
 run "x" "$TZIP" x "$S3_URL" "$MARKER_ENTRY" -C extract -p "$PASSWORD"
-diff -q "extract/$MARKER_ENTRY" "corpus/$(basename "$MARKER_ENTRY")"
+# The original lives in the cache dir, NOT the per-run scratch;
+# `$MARKER_ENTRY` is `corpus/entry-NNNNNN.json`, so the
+# original is `$CACHED_CORPUS/<basename>` (CACHED_CORPUS is
+# already `.../corpus`).
+diff -q "extract/$MARKER_ENTRY" "$CACHED_CORPUS/$(basename "$MARKER_ENTRY")"
 echo "PASS: extracted bytes match the original"
 
 banner "9/15  tzip grep — term index narrows candidates to the one marker entry"

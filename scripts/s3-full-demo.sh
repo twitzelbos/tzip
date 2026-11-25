@@ -235,17 +235,79 @@ ls -la "$CACHED_ARCHIVE"
 
 # ── Upload (lazy — reuse an already-published object) ─────────
 banner "3/15  aws s3 cp — publish to the test key (if missing)"
+LOCAL_SIZE=$(stat -f%z "$CACHED_ARCHIVE" 2>/dev/null || stat -c%s "$CACHED_ARCHIVE")
+LOCAL_HUMAN=$(du -h "$CACHED_ARCHIVE" | cut -f1)
+NEED_UPLOAD=1
 if aws s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null 2>&1; then
     REMOTE_SIZE=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --query 'ContentLength' --output text)
-    LOCAL_SIZE=$(stat -f%z "$CACHED_ARCHIVE" 2>/dev/null || stat -c%s "$CACHED_ARCHIVE")
     if [[ "$REMOTE_SIZE" == "$LOCAL_SIZE" ]]; then
         echo "remote object s3://${BUCKET}/${KEY} already matches local size ($LOCAL_SIZE) — skipping upload"
+        NEED_UPLOAD=0
     else
         echo "remote object size $REMOTE_SIZE ≠ local $LOCAL_SIZE — re-uploading"
-        run "upload" aws s3 cp "$CACHED_ARCHIVE" "$S3_URL"
     fi
-else
-    run "upload" aws s3 cp "$CACHED_ARCHIVE" "$S3_URL"
+fi
+
+if [[ "$NEED_UPLOAD" == "1" ]]; then
+    echo "uploading $CACHED_ARCHIVE ($LOCAL_HUMAN / $LOCAL_SIZE bytes) → $S3_URL"
+    # `aws s3 cp` writes its own progress line via carriage
+    # returns to stderr; in some terminals (non-tty stderr,
+    # tmux split-pane, CI-like contexts) that line never
+    # updates and the upload *looks* hung for the few minutes
+    # it takes to push a ~hundred-MB archive.
+    #
+    # Workaround: launch the aws cp in the background and
+    # heart-beat our own progress line every 5s by polling the
+    # in-progress multipart upload's part count + the staged
+    # object once Complete has landed. Falls back to "still
+    # uploading" when neither API returns useful state yet.
+    aws s3 cp "$CACHED_ARCHIVE" "$S3_URL" &
+    AWS_PID=$!
+    START=$(date +%s)
+    PREV_STATUS=""
+    while kill -0 "$AWS_PID" 2>/dev/null; do
+        sleep 5
+        # One-shot status probe: if the object already landed
+        # (small file / fast upload), report the final size;
+        # otherwise count in-progress multipart parts for this
+        # key. Both calls are best-effort and swallowed on
+        # error so one flaky probe doesn't kill the script.
+        NOW=$(date +%s)
+        ELAPSED=$((NOW - START))
+        STATUS=""
+        if HEAD_SIZE=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --query 'ContentLength' --output text 2>/dev/null); then
+            if [[ "$HEAD_SIZE" != "None" && "$HEAD_SIZE" != "null" ]]; then
+                STATUS="object has $HEAD_SIZE bytes (size match: $([[ "$HEAD_SIZE" == "$LOCAL_SIZE" ]] && echo yes || echo no))"
+            fi
+        fi
+        if [[ -z "$STATUS" ]]; then
+            PARTS=$(aws s3api list-multipart-uploads --bucket "$BUCKET" --prefix "$KEY" --query 'length(Uploads || `[]`)' --output text 2>/dev/null || echo "?")
+            if [[ "$PARTS" != "?" && "$PARTS" != "0" ]]; then
+                # Count completed parts for the first upload.
+                UPLOAD_ID=$(aws s3api list-multipart-uploads --bucket "$BUCKET" --prefix "$KEY" --query 'Uploads[0].UploadId' --output text 2>/dev/null || echo "")
+                if [[ -n "$UPLOAD_ID" && "$UPLOAD_ID" != "None" ]]; then
+                    PART_COUNT=$(aws s3api list-parts --bucket "$BUCKET" --key "$KEY" --upload-id "$UPLOAD_ID" --query 'length(Parts || `[]`)' --output text 2>/dev/null || echo "?")
+                    STATUS="multipart in progress — $PART_COUNT parts uploaded"
+                fi
+            fi
+        fi
+        [[ -z "$STATUS" ]] && STATUS="still uploading…"
+        # Collapse repeated noise (no state change between
+        # polls) to a single-line heartbeat that advances the
+        # elapsed counter but doesn't fill the screen.
+        if [[ "$STATUS" != "$PREV_STATUS" ]]; then
+            printf '\n  [+%ds] %s\n' "$ELAPSED" "$STATUS"
+            PREV_STATUS="$STATUS"
+        else
+            printf '  [+%ds] (unchanged)\n' "$ELAPSED"
+        fi
+    done
+    # Reap aws; non-zero exit here aborts the script.
+    if ! wait "$AWS_PID"; then
+        echo "FAIL: aws s3 cp exited non-zero" >&2
+        exit 1
+    fi
+    echo "upload finished in $(($(date +%s) - START))s"
 fi
 
 # ── READ PHASE ────────────────────────────────────────────────

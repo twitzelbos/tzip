@@ -1,6 +1,7 @@
 # tzip
 
-A parallel ZIP/7z packer written in Rust. Designed for two things at once:
+A parallel ZIP/7z packer written in Rust that doubles as a **queryable,
+append-safe archive-as-database**. Designed for three things at once:
 
 1. **Unspeakably insane throughput on modern CPUs** — libdeflater, hardware
    AES-256 and SHA-1, per-file rayon parallelism, parallel-block DEFLATE
@@ -11,6 +12,13 @@ A parallel ZIP/7z packer written in Rust. Designed for two things at once:
    optional macOS-specific fast paths (`getattrlistbulk`, `openat`,
    `F_RDADVISE`, `dispatch_io_read`) that reduce syscall count and metadata
    pressure on APFS.
+3. **An Elastic-class query stack baked into the archive** — optional
+   in-archive indices (names/terms/facets/columnar-Parquet sidecar) turn
+   `tzip grep`, `tzip aggregate`, `tzip query --sql`, and `tzip jq` into
+   sub-second operations on cold S3 archives. Append-safe segments
+   (`.tzip/*.segN`) keep the indices fresh without full rebuilds. See
+   [the archive is the database](#the-archive-is-the-database) below for
+   the one-paragraph pitch.
 
 Targets `p7zip a -tzip -mx=9 -mem=AES256` as its wire-format baseline —
 archives are readable by 7-Zip, Keka, WinZip, PeaZip, iZip, and (for the
@@ -26,6 +34,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [The archive is the database](#the-archive-is-the-database)
 - [CLI reference](#cli-reference)
 - [Compression methods](#compression-methods)
 - [AES-256 encryption](#aes-256-encryption)
@@ -34,6 +43,9 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Reading archives](#reading-archives)
 - [Reading remote archives (HTTP / S3)](#reading-remote-archives-http--s3)
 - [Searching across many archives (`tzip grep`)](#searching-across-many-archives-tzip-grep)
+- [Aggregations over facet indices (`tzip aggregate`)](#aggregations-over-facet-indices-tzip-aggregate)
+- [Streamed JSON filtering (`tzip jq`)](#streamed-json-filtering-tzip-jq)
+- [SQL via embedded DuckDB (`tzip query`)](#sql-via-embedded-duckdb-tzip-query)
 - [Finding entries across archives (`tzip find`)](#finding-entries-across-archives-tzip-find)
 - [Diffing archives (`tzip diff`)](#diffing-archives-tzip-diff)
 - [Mounting archives as a filesystem (`tzip mount`)](#mounting-archives-as-a-filesystem-tzip-mount)
@@ -132,19 +144,95 @@ tzip cat out.zip secret.txt -p 'hunter2'
 
 ---
 
+## The archive is the database
+
+Optional in-archive indices turn a plain `.zip` into a cold-queryable,
+append-safe analytics store — same file, no sidecar database, no cluster.
+Indices are themselves ordinary ZIP entries (named `.tzip/*.v1`), so
+other tools see them as plain-named entries and ignore them cleanly.
+
+```bash
+# Create logs.zip with every read-side index baked in
+tzip create logs.zip logs/ -m deflate \
+    --index-names                 \ # .tzip/names.v1    → O(1) name lookup
+    --index-terms '*.json'        \ # .tzip/terms.v1    → sub-second `tzip grep`
+    --facet '.status_code'        \ # .tzip/facets.v1/… → `tzip aggregate`
+    --facet '.user'               \
+    --write-columnar schema.json    # .tzip/columnar.v1.parquet → `tzip query --sql`
+
+# Fast literal search (uses .tzip/terms.v1 to narrow candidate entries)
+tzip grep 'OutOfMemoryError' logs.zip
+
+# Facet aggregation — body-free, millisecond-scale
+tzip aggregate --by status_code logs.zip
+
+# Ad-hoc jq filter — compiled once, applied per entry
+tzip jq -r 'select(.status_code == 500) | "\(.ts) \(.path)"' logs.zip
+
+# SQL via embedded DuckDB on the Parquet sidecar
+tzip query -s "SELECT path, AVG(latency_ms) FROM tzip
+               GROUP BY path ORDER BY 2 DESC LIMIT 10" logs.zip
+
+# Horizontal shard fan-out — all four read verbs accept archive globs.
+tzip grep 'OutOfMemoryError' s3://logs/shards/*.zip
+tzip aggregate --by status_code s3://logs/shards/*.zip
+tzip jq '.user' s3://logs/shards/*.zip
+tzip query -s "SELECT status_code, COUNT(*) FROM tzip GROUP BY status_code" \
+    s3://logs/shards/*.zip
+
+# Append new data without rebuilding — every index grows a `.segN` segment
+tzip u logs.zip new-logs/ --index-terms '*.json' --facet '.status_code' --write-columnar
+
+# Client-side cache keeps repeated remote queries sub-20 ms
+tzip query --cache-dir ~/.cache/tzip -s "SELECT ..." s3://logs/shards/*.zip
+```
+
+### Picking the right verb
+
+| You want to… | Use | Needs |
+|---|---|---|
+| Know where a literal token appears | `tzip grep` | `--index-terms` (faster) |
+| Count values of a structured field | `tzip aggregate` | `--facet` |
+| Filter/reshape raw JSON | `tzip jq` | nothing (reads bodies) |
+| Group, join, percentile, date-histogram | `tzip query --sql` | `--write-columnar` + `duckdb` on PATH |
+| List / stream / extract files | `tzip ls` / `cat` / `x` | nothing |
+| Find entries by name / size / mtime | `tzip find` | nothing |
+
+The [elastic-replacement scenarios doc](docs/scenarios/elastic-replacement.md)
+walks through six real-world cases where this story replaces Elasticsearch,
+ClickHouse, or Athena — with cost numbers and the exact commands.
+
+---
+
 ## CLI reference
 
 tzip 0.2 uses subcommands:
 
 ```
-tzip create <ARCHIVE> <PATHS>...   # create a new archive
-tzip u      <ARCHIVE> [PATHS]...   # update: add / replace / delete entries
-tzip ls     <ARCHIVE>              # list entries
-tzip cat    <ARCHIVE> <NAME>       # stream one entry to stdout
-tzip x      <ARCHIVE> [NAMES]...   # extract (whole archive or selected names)
+# Archive write side
+tzip create    <ARCHIVE> <PATHS>...   # create a new archive
+tzip u         <ARCHIVE> [PATHS]...   # update: add / replace / delete entries
+
+# Archive read side
+tzip ls        <ARCHIVE>              # list entries
+tzip cat       <ARCHIVE> <NAME>       # stream one entry to stdout
+tzip x         <ARCHIVE> [NAMES]...   # extract (whole archive or selected names)
+tzip find      <ARCHIVE>...           # list entries matching name / size / mtime
+tzip diff      <A> <B>                # CDR-level diff between two archives
+tzip hash      <ARCHIVE>              # crc32 / md5 / sha256 of entries
+
+# Search / analytics (optional index entries)
+tzip grep      PATTERN <ARCHIVE>...   # literal/regex search, uses .tzip/terms.v1
+tzip aggregate --by FIELD <ARCHIVE>…  # count-by-value, uses .tzip/facets.v1/<field>
+tzip jq        FILTER <ARCHIVE>…      # streamed JSON filter via jaq
+tzip query     -s SQL <ARCHIVE>…      # DuckDB SQL on .tzip/columnar.v1.parquet
+
+# Misc
+tzip mount     <ARCHIVE> <MP>         # FUSE mount an archive as a filesystem
+tzip bench     [CORPUS]               # benchmarks against 7z / zip / unzip
 ```
 
-Aliases: `a` for `create`, `l` for `ls`, `extract` for `x`.
+Aliases: `a` for `create`, `l` for `ls`, `extract` for `x`, `agg` for `aggregate`.
 
 The flags below are for `create` unless the row says otherwise. `u`
 takes the same subset relevant to its work (jobs, read-jobs, walk-jobs,
@@ -683,6 +771,101 @@ are still handled by your shell.
 - **Output ordering is non-deterministic** with parallel workers.
   Use `-P 1 --inner-jobs 1` for stable order, or pipe through
   `--json | jq -s 'sort_by(.archive, .entry, .line)'`.
+
+## Aggregations over facet indices (`tzip aggregate`)
+
+`tzip aggregate --by FIELD archive.zip` returns a sorted
+count-by-value table in milliseconds — no body decode. Works
+against `.tzip/facets.v1/<field>` entries written by
+`tzip create --facet '.field'`. Multiple archives are UNION'd
+(Phase 7 shard fan-out), and Phase 4 segments (`.segN`) are summed
+transparently across appends.
+
+```
+$ tzip aggregate --by status_code s3://logs/shards/*.zip
+         1,443,921  200
+             9,811  404
+               912  500
+-- 3 distinct value(s), 1,454,644 total entries across 48 shards --
+
+$ tzip aggregate --fields logs.zip        # list indexed fields
+status_code
+user
+event.kind
+```
+
+Flags: `--top N` for top-N by count, `--json` for one JSON object
+per line, `--cache-dir DIR` for client-side index caching
+(mirrors `tzip query`).
+
+---
+
+## Streamed JSON filtering (`tzip jq`)
+
+`tzip jq FILTER <archive>...` compiles a jq filter via embedded
+jaq and runs it against every JSON entry in every passed archive.
+Same ergonomics as piping `tzip cat ... | jq` but one command,
+filter compiled once across all entries, no sidecar required.
+
+```
+$ tzip jq -r '.user' logs.zip               # raw string output (-r)
+alice
+bob
+carol
+
+$ tzip jq 'select(.status_code == 500) | {ts, path}' s3://logs/*.zip
+{"ts":"2026-11-25T03:12:04Z","path":"/api/checkout"}
+{"ts":"2026-11-25T03:12:05Z","path":"/api/pay"}
+```
+
+Flags: `-r/--raw-output`, `--entry-prefix` (tag every line with
+`archive:entry\t`), `--include GLOB` (default `*.json` +
+`*.jsonl`), `--cache-dir DIR`, `-p/--password`.
+
+Use `jq` for ad-hoc exploration; use `query` when you want SQL
+aggregates or joins — see [Picking the right verb](#picking-the-right-verb).
+
+---
+
+## SQL via embedded DuckDB (`tzip query`)
+
+`tzip query -s "SELECT ..." archive.zip` dispatches to the system
+`duckdb` CLI with the archive's `.tzip/columnar.v1.parquet`
+sidecar registered as a view named `tzip`. DuckDB handles
+grouping, histograms via `date_trunc`, percentiles, joins across
+multiple shard sidecars (via `read_parquet([...])`), and every
+other OLAP pattern Elastic/ClickHouse users expect. Phase 5b
+columnar segments (`.tzip/columnar.v1.parquet.segN`) UNION in
+automatically for archives built with incremental appends.
+
+```
+$ tzip query -s "SELECT status_code, COUNT(*) FROM tzip GROUP BY status_code" logs.zip
+┌─────────────┬──────────────┐
+│ status_code │ count_star() │
+├─────────────┼──────────────┤
+│ 200         │ 1,443,921    │
+│ 404         │ 9,811        │
+│ 500         │ 912          │
+└─────────────┴──────────────┘
+
+$ tzip query --format csv \
+    -s "SELECT path, AVG(latency_ms) AS p50 FROM tzip
+        WHERE status_code BETWEEN 500 AND 599 GROUP BY path ORDER BY p50 DESC LIMIT 5" \
+    s3://logs/shards/*.zip --cache-dir ~/.cache/tzip
+path,p50
+/api/checkout,842.1
+/api/pay,712.4
+...
+```
+
+Requires `duckdb` on PATH (`brew install duckdb` /
+`apt install duckdb`). The design doc for why it's not bundled:
+[docs/design/elastic-feature-parity.md](docs/design/elastic-feature-parity.md).
+
+Flags: `--format box|json|csv`, `--cache-dir DIR`,
+`--cache-size-mb MB`, `-p/--password`.
+
+---
 
 ## Finding entries across archives (`tzip find`)
 

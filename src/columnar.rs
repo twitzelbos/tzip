@@ -49,7 +49,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::facets::FieldPath;
@@ -67,7 +67,7 @@ pub fn is_columnar_entry_name(name: &str) -> bool {
 /// Narrow set of column types Phase 5 supports. Dates and
 /// timestamps round-trip as strings — DuckDB's `CAST(col AS
 /// TIMESTAMP)` handles ISO-8601 and `strptime` covers the rest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
     String,
@@ -76,12 +76,32 @@ pub enum FieldType {
     Bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct RawField {
     name: String,
     r#type: FieldType,
     path: String,
 }
+
+#[derive(Debug, Serialize)]
+struct RawSchemaSer<'a> {
+    fields: Vec<RawFieldRef<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RawFieldRef<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    r#type: FieldType,
+    path: String,
+}
+
+/// Arrow-schema metadata key under which we stash the tzip
+/// `ColumnarSchema` as JSON. Append-mode `tzip u` reads this back
+/// so segments can be produced without the user re-specifying the
+/// schema path. Any Parquet reader ignores unknown keys, so this
+/// is strictly additive.
+const SCHEMA_METADATA_KEY: &str = "tzip.columnar.schema.v1";
 
 /// Parsed schema — one entry per output column.
 #[derive(Debug, Clone)]
@@ -134,7 +154,11 @@ impl ColumnarSchema {
         Ok(Self { fields })
     }
 
-    /// Arrow schema for the declared columns; all nullable.
+    /// Arrow schema for the declared columns (all nullable) with
+    /// the tzip schema JSON embedded as file-level metadata under
+    /// `SCHEMA_METADATA_KEY`. Phase-5b append-mode `tzip u`
+    /// reads this back so new segments reuse the exact same
+    /// columns without the user re-specifying the schema path.
     fn to_arrow(&self) -> Arc<ArrowSchema> {
         let fields: Vec<Field> = self
             .fields
@@ -149,7 +173,54 @@ impl ColumnarSchema {
                 Field::new(&f.name, dt, true)
             })
             .collect();
-        Arc::new(ArrowSchema::new(fields))
+        let mut meta = std::collections::HashMap::new();
+        if let Ok(json) = self.to_json() {
+            meta.insert(SCHEMA_METADATA_KEY.to_string(), json);
+        }
+        Arc::new(ArrowSchema::new(fields).with_metadata(meta))
+    }
+
+    /// Serialise back to the same JSON shape the user authored,
+    /// for embedding in Parquet file metadata.
+    fn to_json(&self) -> Result<String> {
+        let raw = RawSchemaSer {
+            fields: self
+                .fields
+                .iter()
+                .map(|f| RawFieldRef {
+                    name: &f.name,
+                    r#type: f.ty,
+                    path: format!(".{}", f.path.segments().collect::<Vec<_>>().join(".")),
+                })
+                .collect(),
+        };
+        serde_json::to_string(&raw).context("serialize columnar schema to json")
+    }
+
+    /// Read a `ColumnarSchema` back out of an existing
+    /// `.tzip/columnar.v1.parquet` payload by parsing its Arrow
+    /// file-level metadata. Fails loudly if the payload wasn't
+    /// produced by tzip or doesn't carry the schema key —
+    /// append-mode uses this to avoid making the user re-pass
+    /// the schema path after create.
+    pub fn from_parquet_bytes(payload: &[u8]) -> Result<Self> {
+        use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+        let meta = ArrowReaderMetadata::load(
+            &bytes::Bytes::copy_from_slice(payload),
+            Default::default(),
+        )
+        .context("open parquet sidecar for schema inspection")?;
+        let arrow_schema = meta.schema();
+        let json = arrow_schema
+            .metadata()
+            .get(SCHEMA_METADATA_KEY)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Parquet sidecar has no `{}` metadata — was it produced by tzip ≥ phase-5b? \
+                 Re-run `tzip create --write-columnar schema.json` to add it, or pass \
+                 `--write-columnar schema.json` to `tzip u` so append knows the columns.",
+                SCHEMA_METADATA_KEY,
+            ))?;
+        Self::parse(json.as_bytes())
     }
 }
 
@@ -398,5 +469,66 @@ mod tests {
         b.add_body(br#"{"event":{"kind":"click"}}"#);
         let payload = b.finish().unwrap();
         assert_eq!(&payload[0..4], b"PAR1");
+    }
+
+    #[test]
+    fn schema_roundtrips_through_parquet_metadata() {
+        let src = br#"{
+            "fields": [
+                { "name": "ts",          "type": "string",  "path": ".ts" },
+                { "name": "status_code", "type": "int64",   "path": ".status_code" },
+                { "name": "latency_ms",  "type": "float64", "path": ".latency_ms" },
+                { "name": "cached",      "type": "bool",    "path": ".event.cached" }
+            ]
+        }"#;
+        let schema = ColumnarSchema::parse(src).unwrap();
+        let mut b = ColumnarBuilder::new(schema);
+        b.add_body(br#"{"ts":"2026-11-25","status_code":200,"latency_ms":1.2,"event":{"cached":true}}"#);
+        let payload = b.finish().unwrap();
+
+        let recovered = ColumnarSchema::from_parquet_bytes(&payload).unwrap();
+        assert_eq!(recovered.fields.len(), 4);
+        assert_eq!(recovered.fields[0].name, "ts");
+        assert_eq!(recovered.fields[0].ty, FieldType::String);
+        assert_eq!(recovered.fields[1].ty, FieldType::Int64);
+        assert_eq!(recovered.fields[2].ty, FieldType::Float64);
+        assert_eq!(recovered.fields[3].ty, FieldType::Bool);
+        // Nested path preserved end-to-end.
+        let last = recovered.fields.last().unwrap();
+        let path: Vec<&str> = last.path.segments().collect();
+        assert_eq!(path, vec!["event", "cached"]);
+    }
+
+    #[test]
+    fn from_parquet_bytes_rejects_payload_without_schema_metadata() {
+        // Minimal valid Parquet file produced WITHOUT going through
+        // `ColumnarSchema::to_arrow` — simulates a sidecar built by
+        // another tool.
+        use arrow_array::Int64Array;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let batch = arrow_array::RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1)]))],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(
+            &mut buf,
+            arrow_schema.clone(),
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let err = ColumnarSchema::from_parquet_bytes(&buf).unwrap_err();
+        assert!(
+            format!("{}", err).contains(SCHEMA_METADATA_KEY),
+            "error should name the missing metadata key: {}",
+            err
+        );
     }
 }

@@ -84,17 +84,32 @@ pub fn run(opts: QueryOpts) -> Result<()> {
         let mut archive =
             crate::reader::open_archive_with_cache(spec, cache_arc.clone())
                 .with_context(|| format!("open archive {}", spec))?;
-        let payload = extract_columnar_entry(&mut archive, opts.password.as_deref())
+        // Phase-5b: pull the base sidecar AND every `.segN`
+        // sibling. DuckDB's `read_parquet([...])` UNIONs them
+        // transparently as long as the schemas align (they do,
+        // because Phase-5b appends reuse the base schema via
+        // Arrow metadata — see `ColumnarSchema::from_parquet_bytes`).
+        let payloads = extract_columnar_segment_bodies(&mut archive, opts.password.as_deref())
             .with_context(|| format!("extract columnar sidecar from {}", spec))?;
-        let tmp = tempfile::Builder::new()
-            .prefix("tzip-columnar-")
-            .suffix(".parquet")
-            .tempfile()
-            .context("create temp file for columnar sidecar")?;
-        tmp.as_file()
-            .write_all_at_zero(&payload)
-            .context("write columnar sidecar to temp file")?;
-        temps.push(tmp);
+        if payloads.is_empty() {
+            bail!(
+                "archive {} has no columnar sidecar entry ({}). \
+                 Re-create with `tzip create --write-columnar schema.json` to add one.",
+                spec,
+                crate::columnar::INDEX_ENTRY_NAME,
+            );
+        }
+        for payload in payloads {
+            let tmp = tempfile::Builder::new()
+                .prefix("tzip-columnar-")
+                .suffix(".parquet")
+                .tempfile()
+                .context("create temp file for columnar sidecar")?;
+            tmp.as_file()
+                .write_all_at_zero(&payload)
+                .context("write columnar sidecar to temp file")?;
+            temps.push(tmp);
+        }
     }
 
     if which_duckdb().is_none() {
@@ -113,23 +128,16 @@ pub fn run(opts: QueryOpts) -> Result<()> {
     run_duckdb(&parquet_paths, &opts.sql, opts.format)
 }
 
-fn extract_columnar_entry(archive: &mut Archive, password: Option<&str>) -> Result<Vec<u8>> {
-    let name = crate::columnar::INDEX_ENTRY_NAME;
-    let idx = archive
-        .lookup_entry_idx(name)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "archive has no columnar sidecar entry ({}). \
-                 Re-create with `tzip create --write-columnar schema.json` to add one.",
-                name
-            )
-        })?;
-    archive.lfh_total_size_of(idx)?;
-    let entry = archive.entries()[idx].clone();
-    let mut out: Vec<u8> = Vec::with_capacity(entry.uncomp_size as usize);
-    crate::reader::stream_entry_to(archive.source_mut(), &entry, password, &mut out)
-        .with_context(|| format!("read columnar sidecar entry {}", name))?;
-    Ok(out)
+/// Return the base `.tzip/columnar.v1.parquet` body and every
+/// `.segN` sibling in segment order. Password is unused for now —
+/// columnar sidecars are always Store-method unencrypted entries —
+/// but carried in the signature so future AES-sealed sidecars
+/// won't need a call-site refactor.
+fn extract_columnar_segment_bodies(
+    archive: &mut Archive,
+    _password: Option<&str>,
+) -> Result<Vec<Vec<u8>>> {
+    Ok(archive.columnar_segment_bodies())
 }
 
 /// Portable "write at offset 0" — using plain `Write::write_all` on

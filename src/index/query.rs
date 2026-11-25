@@ -95,19 +95,23 @@ pub fn run(opts: QueryOpts) -> Result<()> {
         Some(spec) => Some(spec.open()?),
         None => None,
     };
+    // ChatGPT review #4: parse the user's SQL once. If it fits
+    // the simple-WHERE grammar our pruner handles, we can
+    // range-read only the row groups whose stats might match.
+    // On anything the pruner can't parse (joins, OR, subqueries,
+    // …) `extract_conjunctive_predicates` returns None and we
+    // drop back to the full-extract path. Pruning is pure speed;
+    // soundness-critical corners all vote "keep the row group".
+    let preds = crate::parquet_prune::extract_conjunctive_predicates(&opts.sql);
     let mut temps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(archives.len());
+    let mut total_rgs: usize = 0;
+    let mut kept_rgs: usize = 0;
     for spec in &archives {
         let mut archive =
             crate::reader::open_archive_with_cache(spec, cache_arc.clone())
                 .with_context(|| format!("open archive {}", spec))?;
-        // Phase-5b: pull the base sidecar AND every `.segN`
-        // sibling. DuckDB's `read_parquet([...])` UNIONs them
-        // transparently as long as the schemas align (they do,
-        // because Phase-5b appends reuse the base schema via
-        // Arrow metadata — see `ColumnarSchema::from_parquet_bytes`).
-        let payloads = extract_columnar_segment_bodies(&mut archive, opts.password.as_deref())
-            .with_context(|| format!("extract columnar sidecar from {}", spec))?;
-        if payloads.is_empty() {
+        let ranges = archive.columnar_segment_ranges();
+        if ranges.is_empty() {
             bail!(
                 "archive {} has no columnar sidecar entry ({}). \
                  Re-create with `tzip create --write-columnar schema.json` to add one.",
@@ -115,17 +119,57 @@ pub fn run(opts: QueryOpts) -> Result<()> {
                 crate::columnar::INDEX_ENTRY_NAME,
             );
         }
-        for payload in payloads {
+
+        for (seg_idx, maybe_range) in ranges.iter().enumerate() {
             let tmp = tempfile::Builder::new()
                 .prefix("tzip-columnar-")
                 .suffix(".parquet")
                 .tempfile()
                 .context("create temp file for columnar sidecar")?;
-            tmp.as_file()
-                .write_all_at_zero(&payload)
-                .context("write columnar sidecar to temp file")?;
+
+            // Try the range-read prune path when (a) the SQL
+            // parsed into a non-trivial predicate list, (b) the
+            // sidecar entry is Store + unencrypted (otherwise
+            // its body bytes aren't the raw Parquet). Fall back
+            // to the full-body extract on any ambiguity.
+            let did_prune = match (&preds, maybe_range) {
+                (Some(ps), Some((_, body_off, body_len))) if !ps.is_empty() => {
+                    try_prune_segment(spec, *body_off, *body_len, ps, tmp.path())
+                        .context("range-read prune")?
+                }
+                _ => None,
+            };
+
+            match did_prune {
+                Some((kept, total)) => {
+                    kept_rgs += kept;
+                    total_rgs += total;
+                }
+                None => {
+                    // Fallback: read the whole body and write
+                    // to the temp file. For segments past the
+                    // first we still do one full body read, but
+                    // the cache will reuse it on repeat queries.
+                    let payloads = archive.columnar_segment_bodies();
+                    let payload = payloads
+                        .into_iter()
+                        .nth(seg_idx)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("columnar segment {} vanished", seg_idx)
+                        })?;
+                    tmp.as_file()
+                        .write_all_at_zero(&payload)
+                        .context("write columnar sidecar to temp file")?;
+                }
+            }
             temps.push(tmp);
         }
+    }
+    if preds.as_ref().is_some_and(|p| !p.is_empty()) && total_rgs > 0 {
+        eprintln!(
+            "tzip: query prune — {}/{} row groups kept after WHERE push-down",
+            kept_rgs, total_rgs
+        );
     }
 
     if which_duckdb().is_none() {
@@ -149,11 +193,39 @@ pub fn run(opts: QueryOpts) -> Result<()> {
 /// columnar sidecars are always Store-method unencrypted entries —
 /// but carried in the signature so future AES-sealed sidecars
 /// won't need a call-site refactor.
+#[allow(dead_code)]
 fn extract_columnar_segment_bodies(
     archive: &mut Archive,
     _password: Option<&str>,
 ) -> Result<Vec<Vec<u8>>> {
     Ok(archive.columnar_segment_bodies())
+}
+
+/// Open a fresh `ReadSeek` source for `spec`, wrap the sidecar's
+/// `[body_off, body_off + body_len)` byte range in a
+/// `ChunkReader`, prune row groups, and write the pruned
+/// Parquet to `tmp`. Returns:
+/// - `Ok(Some((kept, total)))` on a successful partial prune.
+/// - `Ok(None)` when every row group matches (caller does the
+///   full-body extract so the final file is byte-identical to
+///   what DuckDB would read anyway).
+fn try_prune_segment(
+    spec: &str,
+    body_off: u64,
+    body_len: u64,
+    preds: &[crate::parquet_prune::Predicate],
+    tmp: &Path,
+) -> Result<Option<(usize, usize)>> {
+    let source =
+        crate::reader::open_source_for_with_hint(spec, None).with_context(|| {
+            format!("open raw source for prune range-read on {}", spec)
+        })?;
+    let slice = crate::parquet_prune::ArchiveEntrySlice::new(source, body_off, body_len);
+    let report = crate::parquet_prune::prune_from_slice(slice, preds, tmp)?;
+    match report.pruned {
+        Some(kept) => Ok(Some((kept, report.total))),
+        None => Ok(None),
+    }
 }
 
 /// Portable "write at offset 0" — using plain `Write::write_all` on

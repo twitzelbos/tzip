@@ -473,6 +473,53 @@ impl Archive {
         self.read_segment_bodies(crate::columnar::INDEX_ENTRY_NAME)
     }
 
+    /// `(name, body_offset, body_len)` triples for every columnar
+    /// sidecar segment the archive carries, in segment-number
+    /// order. Used by `tzip query --sql`'s range-read prune path
+    /// (ChatGPT review #4) — it lets the pruner open a fresh
+    /// `ReadSeek` source and range-read just the footer + the
+    /// row groups that survived predicate pruning, instead of
+    /// pulling every sidecar byte off the wire through
+    /// `columnar_segment_bodies`.
+    ///
+    /// Returns `None` for any segment whose entry is compressed
+    /// or encrypted — the range-read trick only works on Store
+    /// entries (the body bytes are the raw Parquet file), so the
+    /// caller falls back to the full-body path for those.
+    pub fn columnar_segment_ranges(&mut self) -> Vec<Option<(String, u64, u64)>> {
+        let seg_prefix = format!("{}.seg", crate::columnar::INDEX_ENTRY_NAME);
+        let base = crate::columnar::INDEX_ENTRY_NAME;
+        let mut hits: Vec<(u32, usize)> = Vec::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.name == base {
+                hits.push((0, i));
+            } else if let Some(rest) = e.name.strip_prefix(&seg_prefix) {
+                if let Ok(n) = rest.parse::<u32>() {
+                    if n > 0 {
+                        hits.push((n, i));
+                    }
+                }
+            }
+        }
+        hits.sort_by_key(|(n, _)| *n);
+        let mut out: Vec<Option<(String, u64, u64)>> = Vec::with_capacity(hits.len());
+        for (_, idx) in hits {
+            // Need the LFH size before we can compute body offset.
+            if self.lfh_total_size_of(idx).is_err() {
+                out.push(None);
+                continue;
+            }
+            let re = &self.entries[idx];
+            if re.method_on_wire != 0 || re.encrypted {
+                out.push(None);
+                continue;
+            }
+            let body_off = re.lfh_offset + re.lfh_total_size as u64;
+            out.push(Some((re.name.clone(), body_off, re.comp_size)));
+        }
+        out
+    }
+
     /// For each unsuffixed base name `.tzip/*.v1`, return the
     /// bodies of the base entry and every `.segN` sibling in
     /// segment-number order. Readers parse each into whatever

@@ -60,6 +60,8 @@ pub mod facets;
 pub mod indexcache;
 #[path = "index/nameidx.rs"]
 pub mod nameidx;
+#[path = "index/parquet_prune.rs"]
+pub mod parquet_prune;
 #[path = "index/query.rs"]
 pub mod query;
 #[path = "index/shards.rs"]

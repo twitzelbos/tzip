@@ -83,6 +83,8 @@ pub mod find;
 pub mod grep;
 #[path = "cmd/hash.rs"]
 pub mod hash;
+#[path = "cmd/jq.rs"]
+pub mod jq;
 #[path = "cmd/reader.rs"]
 pub mod reader;
 

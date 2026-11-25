@@ -656,12 +656,38 @@ pub fn run(opts: Options) -> Result<()> {
     // builder reuses the same plaintext-body feed as facets — a body
     // that's shipped for facet aggregation is also JSON that the
     // columnar extractor can walk.
+    //
+    // Phase 5c: `--write-columnar` with an empty path is the
+    // auto-infer sentinel (set by cli when the user passes the bool
+    // flag with no `--columnar-schema SCHEMA.json` override). In
+    // that case we sample the first N JSON entries matching
+    // `--index-terms` and derive a `ColumnarSchema` from them.
     let (want_columnar, columnar_builder) = match &opts.write_columnar {
-        Some(schema_path) => {
+        Some(schema_path) if !schema_path.as_os_str().is_empty() => {
             let bytes = std::fs::read(schema_path).with_context(|| {
                 format!("read columnar schema {}", schema_path.display())
             })?;
             let schema = crate::columnar::ColumnarSchema::parse(&bytes)?;
+            (true, Some(crate::columnar::ColumnarBuilder::new(schema)))
+        }
+        Some(_) => {
+            // Auto-infer. Needs `--index-terms` to know which entries
+            // are JSON-shaped — without it we'd be guessing.
+            if opts.index_terms.is_empty() {
+                anyhow::bail!(
+                    "columnar auto-infer requires at least one `--index-terms GLOB` so tzip knows which entries are JSON. \
+                     Pass `--index-terms '*.json'` (and/or any other globs), or hand-author a schema with `--columnar-schema SCHEMA.json`."
+                );
+            }
+            let schema = infer_columnar_schema(&opts)?;
+            if !opts.quiet {
+                let cols: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+                eprintln!(
+                    "tzip create: inferred columnar schema with {} column(s): {}",
+                    cols.len(),
+                    cols.join(", "),
+                );
+            }
             (true, Some(crate::columnar::ColumnarBuilder::new(schema)))
         }
         None => (false, None),
@@ -1009,6 +1035,47 @@ pub fn run(opts: Options) -> Result<()> {
 }
 
 /// Pick BufWriter capacity for the output based on filesystem info.
+/// Phase 5c helper: sample the first N JSON-shaped files from the
+/// input tree and derive a `ColumnarSchema` from them. Scanner uses
+/// the walker's own output so filter semantics (globs, exclude,
+/// basename-only) match what the encode pass will see. Only runs
+/// when the user passed `--write-columnar` without an explicit
+/// schema path; the schema-from-file path stays untouched.
+fn infer_columnar_schema(opts: &Options) -> Result<crate::columnar::ColumnarSchema> {
+    const SAMPLE_SIZE: usize = 128;
+    let items = walker::walk(walker::WalkOpts {
+        roots: &opts.paths,
+        exclude: &opts.exclude,
+        sort: false,
+        walk_threads: opts.walk_jobs.max(1),
+        basename_only: opts.basename_only,
+    })?;
+    let globs = &opts.index_terms;
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(SAMPLE_SIZE);
+    for item in items {
+        if bodies.len() >= SAMPLE_SIZE {
+            break;
+        }
+        if !globs
+            .iter()
+            .any(|g| walker::is_excluded(&item.name_in_archive, std::slice::from_ref(g)))
+        {
+            continue;
+        }
+        if let Ok(b) = std::fs::read(&item.path) {
+            bodies.push(b);
+        }
+    }
+    if bodies.is_empty() {
+        anyhow::bail!(
+            "columnar auto-infer: no entries matched `--index-terms`. \
+             Check the glob patterns, or pass `--columnar-schema SCHEMA.json` explicitly."
+        );
+    }
+    let slices: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
+    crate::columnar::ColumnarSchema::infer(&slices)
+}
+
 fn choose_writer_capacity(info: Option<&platform::FsInfo>) -> usize {
     const MIN: usize = 4 * 1024 * 1024;
     const EXFAT_CAP: usize = 16 * 1024 * 1024;

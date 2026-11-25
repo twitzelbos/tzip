@@ -154,6 +154,113 @@ impl ColumnarSchema {
         Ok(Self { fields })
     }
 
+    /// Phase-5c schema inference. Scan a batch of JSON entry bodies
+    /// (produced by walking + matching `--index-terms` globs at
+    /// create time) and derive a `ColumnarSchema` from their
+    /// top-level fields. The intent is "I passed `--write-columnar`
+    /// without specifying a schema; just do the sensible thing."
+    ///
+    /// Rules:
+    ///
+    /// - Only top-level scalar fields. Nested objects / arrays are
+    ///   skipped — users with nested columns author a schema.json
+    ///   by hand.
+    /// - Type is picked by first observed scalar type per field;
+    ///   subsequent samples with a conflicting scalar type widen
+    ///   the type (int → float on conflict, anything → string as
+    ///   the universal fallback). Null values don't vote.
+    /// - Column order is the order fields first appeared in the
+    ///   sample — reproducible when samples arrive in deterministic
+    ///   order (which the walker arranges for).
+    /// - Bodies that aren't valid JSON are skipped silently; they
+    ///   just don't contribute to the inference.
+    ///
+    /// `--write-columnar` with zero usable samples is a user error
+    /// (we can't fabricate columns out of nothing); `infer` returns
+    /// an `Err` the caller surfaces as a clear "no schema could be
+    /// inferred, pass one explicitly or make sure --index-terms
+    /// matches JSON entries."
+    pub fn infer(sample_bodies: &[&[u8]]) -> Result<Self> {
+        use serde_json::Value;
+
+        /// Per-field inference state.
+        struct Field {
+            insertion_order: usize,
+            ty: FieldType,
+        }
+
+        let mut by_name: std::collections::HashMap<String, Field> =
+            std::collections::HashMap::new();
+        let mut next_order = 0usize;
+        let mut usable_samples = 0usize;
+
+        for body in sample_bodies {
+            let v: Value = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let obj = match v {
+                Value::Object(m) => m,
+                _ => continue, // arrays / scalars at top-level aren't rows
+            };
+            usable_samples += 1;
+            for (k, val) in obj.iter() {
+                let observed = match observed_type(val) {
+                    Some(t) => t,
+                    None => continue, // null / nested — doesn't contribute
+                };
+                match by_name.get_mut(k) {
+                    Some(existing) => {
+                        existing.ty = widen(existing.ty, observed);
+                    }
+                    None => {
+                        by_name.insert(
+                            k.clone(),
+                            Field {
+                                insertion_order: next_order,
+                                ty: observed,
+                            },
+                        );
+                        next_order += 1;
+                    }
+                }
+            }
+        }
+
+        if usable_samples == 0 {
+            bail!(
+                "columnar auto-infer: no valid JSON samples. Pass \
+                 `--columnar-schema SCHEMA.json` explicitly, or check \
+                 that `--index-terms` matches JSON-shaped entries."
+            );
+        }
+        if by_name.is_empty() {
+            bail!(
+                "columnar auto-infer: {} JSON sample(s) had no top-level \
+                 scalar fields to infer from (nested-only objects aren't \
+                 supported). Pass `--columnar-schema SCHEMA.json` with \
+                 explicit paths.",
+                usable_samples
+            );
+        }
+
+        // Sort fields by first-appearance order so the generated
+        // schema is deterministic across runs.
+        let mut ordered: Vec<(String, Field)> = by_name.into_iter().collect();
+        ordered.sort_by_key(|(_, f)| f.insertion_order);
+        let mut fields = Vec::with_capacity(ordered.len());
+        for (name, f) in ordered {
+            // Field path = top-level `.<name>` for inferred columns.
+            let path = FieldPath::parse(&format!(".{}", name))?;
+            fields.push(ColumnField {
+                name,
+                ty: f.ty,
+                path,
+            });
+        }
+        Ok(Self { fields })
+    }
+
     /// Arrow schema for the declared columns (all nullable) with
     /// the tzip schema JSON embedded as file-level metadata under
     /// `SCHEMA_METADATA_KEY`. Phase-5b append-mode `tzip u`
@@ -375,6 +482,44 @@ impl ColumnBuilder {
     }
 }
 
+/// Return the scalar `FieldType` for a JSON value, or `None` for
+/// null / object / array (values that shouldn't influence
+/// inference). Used by `ColumnarSchema::infer`.
+fn observed_type(v: &serde_json::Value) -> Option<FieldType> {
+    use serde_json::Value;
+    match v {
+        Value::String(_) => Some(FieldType::String),
+        Value::Bool(_) => Some(FieldType::Bool),
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                Some(FieldType::Int64)
+            } else {
+                Some(FieldType::Float64)
+            }
+        }
+        Value::Null | Value::Object(_) | Value::Array(_) => None,
+    }
+}
+
+/// Widen a column's existing inferred type when a new sample
+/// contradicts it. The lattice:
+///
+/// - Int widens to Float on first non-integer number.
+/// - Any mismatch between non-number types (String ↔ Bool,
+///   String ↔ Number, Bool ↔ Number) widens to String — safe
+///   because every JSON scalar has a string form.
+///
+/// Called per-sample-per-field; cheap, no allocations.
+fn widen(current: FieldType, observed: FieldType) -> FieldType {
+    match (current, observed) {
+        (a, b) if a == b => a,
+        (FieldType::Int64, FieldType::Float64) | (FieldType::Float64, FieldType::Int64) => {
+            FieldType::Float64
+        }
+        _ => FieldType::String,
+    }
+}
+
 /// Walk `path` through `value`, returning a reference to the scalar
 /// at the leaf. Nested non-scalar nodes or missing paths return
 /// `None`. Mirrors `FieldPath::lookup` but returns the Value
@@ -497,6 +642,71 @@ mod tests {
         let last = recovered.fields.last().unwrap();
         let path: Vec<&str> = last.path.segments().collect();
         assert_eq!(path, vec!["event", "cached"]);
+    }
+
+    #[test]
+    fn infer_picks_types_and_preserves_first_seen_order() {
+        let samples: [&[u8]; 3] = [
+            br#"{"ts":"2026-11-25","status_code":200,"latency_ms":1.2,"cached":true}"#,
+            br#"{"ts":"2026-11-25","status_code":500,"latency_ms":9.9,"cached":false}"#,
+            br#"{"ts":"2026-11-25","status_code":404,"latency_ms":3.1,"cached":true}"#,
+        ];
+        let schema = ColumnarSchema::infer(&samples).unwrap();
+        // Order mirrors first-appearance.
+        let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["ts", "status_code", "latency_ms", "cached"]);
+        assert_eq!(schema.fields[0].ty, FieldType::String);
+        assert_eq!(schema.fields[1].ty, FieldType::Int64);
+        assert_eq!(schema.fields[2].ty, FieldType::Float64);
+        assert_eq!(schema.fields[3].ty, FieldType::Bool);
+    }
+
+    #[test]
+    fn infer_widens_int_to_float_when_sample_has_decimal() {
+        let samples: [&[u8]; 2] = [
+            br#"{"latency":10}"#,
+            br#"{"latency":10.5}"#,
+        ];
+        let schema = ColumnarSchema::infer(&samples).unwrap();
+        assert_eq!(schema.fields[0].ty, FieldType::Float64);
+    }
+
+    #[test]
+    fn infer_falls_back_to_string_on_mixed_types() {
+        let samples: [&[u8]; 2] = [
+            br#"{"status":"ok"}"#,
+            br#"{"status":200}"#,
+        ];
+        let schema = ColumnarSchema::infer(&samples).unwrap();
+        assert_eq!(schema.fields[0].ty, FieldType::String);
+    }
+
+    #[test]
+    fn infer_skips_nested_and_null_fields() {
+        let samples: [&[u8]; 2] = [
+            br#"{"ts":"t","nested":{"x":1},"maybe":null,"n":1}"#,
+            br#"{"ts":"t","nested":{"x":2},"maybe":null,"n":2}"#,
+        ];
+        let schema = ColumnarSchema::infer(&samples).unwrap();
+        let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        // `nested` + `maybe` get dropped; only scalar `ts` + `n` survive.
+        assert_eq!(names, vec!["ts", "n"]);
+    }
+
+    #[test]
+    fn infer_errors_when_no_usable_samples() {
+        let samples: [&[u8]; 2] = [b"not json", b"[]"];
+        let err = ColumnarSchema::infer(&samples).unwrap_err();
+        assert!(format!("{}", err).contains("no valid JSON samples"));
+    }
+
+    #[test]
+    fn infer_errors_on_null_only_fields() {
+        // JSON parses OK but every field is null / nested → no
+        // top-level scalars to infer from.
+        let samples: [&[u8]; 1] = [br#"{"x":null,"y":[1,2]}"#];
+        let err = ColumnarSchema::infer(&samples).unwrap_err();
+        assert!(format!("{}", err).contains("no top-level scalar fields"));
     }
 
     #[test]

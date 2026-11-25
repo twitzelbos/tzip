@@ -146,24 +146,46 @@ impl FacetBuilder {
         self.path.short_name()
     }
 
-    /// Consume one JSON entry body, extract the field, increment
-    /// the corresponding counter. Malformed JSON or missing paths
-    /// go to the `__missing__` bucket (so count totals match entry
-    /// counts).
+    /// Consume one entry body, extract the field, increment the
+    /// corresponding counter. Handles both single-record JSON and
+    /// NDJSON (one JSON value per line) uniformly via
+    /// `serde_json`'s stream deserialiser — a `.jsonl` log with
+    /// 10,000 rows now contributes 10,000 counts, not 1.
+    /// Malformed JSON or missing paths go to the `__missing__`
+    /// bucket. `total` counts emitted records, not entries, so
+    /// `aggregate` reports match the record-level reality.
     pub fn add_body(&mut self, body: &[u8]) {
-        self.total += 1;
-        let value: serde_json::Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(_) => {
-                *self.counts.entry(MISSING_VALUE.to_vec()).or_insert(0) += 1;
-                return;
+        let mut any_record = false;
+        let stream = serde_json::Deserializer::from_slice(body).into_iter::<serde_json::Value>();
+        for value in stream {
+            match value {
+                Ok(v) => {
+                    any_record = true;
+                    self.total += 1;
+                    let bucket = self
+                        .path
+                        .lookup(&v)
+                        .unwrap_or_else(|| MISSING_VALUE.to_vec());
+                    *self.counts.entry(bucket).or_insert(0) += 1;
+                }
+                Err(_) => {
+                    // Malformed record (or malformed byte somewhere
+                    // in the middle of an otherwise-good NDJSON
+                    // stream). Count once as `__missing__` and
+                    // stop iterating — serde_json won't recover
+                    // past a parse error.
+                    self.total += 1;
+                    *self.counts.entry(MISSING_VALUE.to_vec()).or_insert(0) += 1;
+                    return;
+                }
             }
-        };
-        let bucket = self
-            .path
-            .lookup(&value)
-            .unwrap_or_else(|| MISSING_VALUE.to_vec());
-        *self.counts.entry(bucket).or_insert(0) += 1;
+        }
+        // Empty body: count a single `__missing__` so entry count
+        // and record count agree on empty inputs.
+        if !any_record {
+            self.total += 1;
+            *self.counts.entry(MISSING_VALUE.to_vec()).or_insert(0) += 1;
+        }
     }
 
     /// Serialise as a `.tzip/facets.v1/<field>` payload.
@@ -294,6 +316,42 @@ mod tests {
         let top = f.top_n(2);
         assert_eq!(top[0], (b"click".as_ref(), 2));
         assert_eq!(top[1], (b"scroll".as_ref(), 1));
+    }
+
+    #[test]
+    fn ndjson_body_expands_into_many_records() {
+        let mut b = FacetBuilder::new(".status_code").unwrap();
+        // A single entry carrying three JSON records, one per line.
+        b.add_body(
+            b"{\"status_code\":200}\n{\"status_code\":200}\n{\"status_code\":500}\n",
+        );
+        let blob = b.finish().unwrap();
+        let f = Facet::parse(&blob).unwrap();
+        // 3 records total; 2 of status 200, 1 of 500.
+        assert_eq!(f.total, 3);
+        assert_eq!(*f.counts.get(b"200".as_ref()).unwrap(), 2);
+        assert_eq!(*f.counts.get(b"500".as_ref()).unwrap(), 1);
+    }
+
+    #[test]
+    fn ndjson_body_without_trailing_newline_still_works() {
+        let mut b = FacetBuilder::new(".status_code").unwrap();
+        b.add_body(b"{\"status_code\":200}\n{\"status_code\":500}");
+        let blob = b.finish().unwrap();
+        let f = Facet::parse(&blob).unwrap();
+        assert_eq!(f.total, 2);
+    }
+
+    #[test]
+    fn single_record_body_still_counts_as_one() {
+        // Pre-fix behaviour should hold for standard single-JSON
+        // entries — regression guard against double-counting the
+        // lone record as "no-newline NDJSON" or similar.
+        let mut b = FacetBuilder::new(".status_code").unwrap();
+        b.add_body(br#"{"status_code":200}"#);
+        let blob = b.finish().unwrap();
+        let f = Facet::parse(&blob).unwrap();
+        assert_eq!(f.total, 1);
     }
 
     #[test]

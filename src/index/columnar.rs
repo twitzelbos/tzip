@@ -195,33 +195,40 @@ impl ColumnarSchema {
         let mut usable_samples = 0usize;
 
         for body in sample_bodies {
-            let v: Value = match serde_json::from_slice(body) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let obj = match v {
-                Value::Object(m) => m,
-                _ => continue, // arrays / scalars at top-level aren't rows
-            };
-            usable_samples += 1;
-            for (k, val) in obj.iter() {
-                let observed = match observed_type(val) {
-                    Some(t) => t,
-                    None => continue, // null / nested — doesn't contribute
+            // NDJSON-aware: one body may contain many records. The
+            // stream deserialiser yields each top-level JSON value
+            // in sequence; standard JSON is just the N=1 case.
+            let stream =
+                serde_json::Deserializer::from_slice(body).into_iter::<Value>();
+            for value in stream {
+                let v = match value {
+                    Ok(v) => v,
+                    Err(_) => continue,
                 };
-                match by_name.get_mut(k) {
-                    Some(existing) => {
-                        existing.ty = widen(existing.ty, observed);
-                    }
-                    None => {
-                        by_name.insert(
-                            k.clone(),
-                            Field {
-                                insertion_order: next_order,
-                                ty: observed,
-                            },
-                        );
-                        next_order += 1;
+                let obj = match v {
+                    Value::Object(m) => m,
+                    _ => continue,
+                };
+                usable_samples += 1;
+                for (k, val) in obj.iter() {
+                    let observed = match observed_type(val) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    match by_name.get_mut(k) {
+                        Some(existing) => {
+                            existing.ty = widen(existing.ty, observed);
+                        }
+                        None => {
+                            by_name.insert(
+                                k.clone(),
+                                Field {
+                                    insertion_order: next_order,
+                                    ty: observed,
+                                },
+                            );
+                            next_order += 1;
+                        }
                     }
                 }
             }
@@ -370,25 +377,45 @@ impl ColumnarBuilder {
         self.rows
     }
 
-    /// Consume one entry body. JSON parse errors or missing paths
-    /// produce `NULL` for every column of that row — the row count
-    /// still advances so columns stay aligned with the sidecar's
-    /// notion of "N entries contributed to the archive."
+    /// Consume one entry body. Handles both single-record JSON and
+    /// NDJSON (one JSON value per line) uniformly via
+    /// `serde_json`'s stream deserialiser — a `.jsonl` log with
+    /// 10,000 rows now produces 10,000 Parquet rows, not 1. JSON
+    /// parse errors or missing paths produce `NULL` for every
+    /// column of that row; the row count still advances so columns
+    /// stay aligned with the sidecar's notion of "N records
+    /// contributed to the archive."
     pub fn add_body(&mut self, body: &[u8]) {
-        self.rows += 1;
-        let value: serde_json::Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(_) => {
-                for col in &mut self.cols {
-                    col.push_null();
+        let mut any_record = false;
+        let stream = serde_json::Deserializer::from_slice(body).into_iter::<serde_json::Value>();
+        for value in stream {
+            match value {
+                Ok(v) => {
+                    any_record = true;
+                    self.rows += 1;
+                    for (i, col) in self.cols.iter_mut().enumerate() {
+                        let field = &self.schema.fields[i];
+                        let probed = walk_path(&v, &field.path);
+                        col.push_from_json(field.ty, probed);
+                    }
                 }
-                return;
+                Err(_) => {
+                    // Malformed record — emit one all-null row and
+                    // stop. serde_json doesn't recover from a mid-
+                    // stream parse error.
+                    self.rows += 1;
+                    for col in &mut self.cols {
+                        col.push_null();
+                    }
+                    return;
+                }
             }
-        };
-        for (i, col) in self.cols.iter_mut().enumerate() {
-            let field = &self.schema.fields[i];
-            let probed = walk_path(&value, &field.path);
-            col.push_from_json(field.ty, probed);
+        }
+        if !any_record {
+            self.rows += 1;
+            for col in &mut self.cols {
+                col.push_null();
+            }
         }
     }
 

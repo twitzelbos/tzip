@@ -56,24 +56,38 @@ const MAGIC: [u8; 4] = *b"TZNI";
 const VERSION: u16 = 1;
 
 /// Build side: returns the serialized `.tzip/names.v1` payload for an
-/// archive whose entries have the given names (in CDR order, so index
-/// `i` into the input slice is the `entry_idx` emitted for that name).
+/// archive whose entries have the given names. The input position
+/// (`i`) of each name is used as its `entry_idx`. Phase 1 passes the
+/// full-archive name list in CDR order so position == CDR position.
+/// For Phase 4 segments that cover only a subset of CDR positions,
+/// use `build_with_positions` instead.
 pub fn build(names: &[&str]) -> Result<Vec<u8>> {
-    if names.is_empty() {
+    let pairs: Vec<(&str, u32)> = names
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n, i as u32))
+        .collect();
+    build_with_positions(&pairs)
+}
+
+/// Build with explicit `(name, entry_idx)` pairs. `entry_idx` is the
+/// absolute CDR position the name resolves to in the final archive
+/// — matters for `tzip u` segments covering positions `[N, N+k)`.
+pub fn build_with_positions(pairs: &[(&str, u32)]) -> Result<Vec<u8>> {
+    if pairs.is_empty() {
         bail!("name index must have at least one entry");
     }
     // Build the MPH over the raw name bytes. `gamma = 1.7` is boomphf's
     // documented sweet spot: ~1.0× overhead on build time for ~2% less
     // table size vs 2.0.
-    let keys: Vec<Vec<u8>> = names.iter().map(|n| n.as_bytes().to_vec()).collect();
+    let keys: Vec<Vec<u8>> = pairs.iter().map(|(n, _)| n.as_bytes().to_vec()).collect();
     let mph = Mphf::new(1.7, &keys);
 
     // Verification table: for each name, find its MPH slot and store
     // the canonical name at that slot. Lookup later compares the probed
     // name against this table.
-    let mut slots: Vec<(Vec<u8>, u32)> = Vec::with_capacity(names.len());
-    slots.resize(names.len(), (Vec::new(), 0));
-    for (idx, k) in keys.iter().enumerate() {
+    let mut slots: Vec<(Vec<u8>, u32)> = vec![(Vec::new(), 0); pairs.len()];
+    for ((_, pos), k) in pairs.iter().zip(keys.iter()) {
         let slot = mph
             .try_hash(k)
             .ok_or_else(|| anyhow!("MPH build dropped key {:?}", String::from_utf8_lossy(k)))?
@@ -81,15 +95,15 @@ pub fn build(names: &[&str]) -> Result<Vec<u8>> {
         if slot >= slots.len() {
             bail!("MPH slot {} out of range (len {})", slot, slots.len());
         }
-        slots[slot] = (k.clone(), idx as u32);
+        slots[slot] = (k.clone(), *pos);
     }
 
     // Serialize.
     let mph_blob = bincode::serialize(&mph).context("serialize MPH")?;
-    let mut out: Vec<u8> = Vec::with_capacity(4 + 2 + 4 + 4 + mph_blob.len() + names.len() * 32);
+    let mut out: Vec<u8> = Vec::with_capacity(4 + 2 + 4 + 4 + mph_blob.len() + pairs.len() * 32);
     out.write_all(&MAGIC)?;
     out.write_u16::<LittleEndian>(VERSION)?;
-    out.write_u32::<LittleEndian>(names.len() as u32)?;
+    out.write_u32::<LittleEndian>(pairs.len() as u32)?;
     out.write_u32::<LittleEndian>(mph_blob.len() as u32)?;
     out.write_all(&mph_blob)?;
     for (name, idx) in &slots {

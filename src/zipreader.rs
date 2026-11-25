@@ -114,20 +114,18 @@ pub struct Archive {
     /// parallel readers against the same archive can use this instead
     /// of re-probing the EOCD themselves.
     disk_count: usize,
-    /// Parsed `.tzip/names.v1` MPH index, when the archive carries one.
-    /// `lookup_entry_idx` consults this first and falls back to a
-    /// linear CDR scan when absent — index entries are strictly
-    /// additive and archives without them keep working identically.
-    name_index: Option<crate::nameidx::NameIndex>,
-    /// Parsed `.tzip/terms.v1` hashed inverted term index. `tzip grep`
-    /// uses it to narrow candidate entries for literal-token
-    /// queries before running the regex scan.
-    term_index: Option<crate::termidx::TermIndex>,
-    /// Parsed `.tzip/facets.v1/<leaf>` per-field facet indices,
-    /// keyed by `<leaf>` (the short name of the facet path).
-    /// `tzip aggregate --by <leaf> --count` reads these to emit
-    /// count-by-value tables without decoding any entry body.
-    facet_indices: std::collections::HashMap<String, crate::facets::Facet>,
+    /// Parsed name-index segments (`.tzip/names.v1`, `.tzip/names.v1.seg1`,
+    /// `.tzip/names.v1.seg2`, ...). Initial create emits the
+    /// unsuffixed form; `tzip u` adds `.segN` segments covering the
+    /// entries each append brought in. `lookup_entry_idx` walks all
+    /// segments in order. Empty when no index present.
+    name_segments: Vec<crate::nameidx::NameIndex>,
+    /// Term-index segments. `tzip grep` queries union the posting
+    /// lists from every segment before narrowing candidates.
+    term_segments: Vec<crate::termidx::TermIndex>,
+    /// Per-field facet segments. Each field maps to one or more
+    /// `Facet` instances; `facet()` merges counts across them.
+    facet_segments: std::collections::HashMap<String, Vec<crate::facets::Facet>>,
 }
 
 impl Archive {
@@ -291,13 +289,13 @@ impl Archive {
             tail_size,
             archive_comment,
             disk_count: 1,
-            name_index: None,
-            term_index: None,
-            facet_indices: std::collections::HashMap::new(),
+            name_segments: Vec::new(),
+            term_segments: Vec::new(),
+            facet_segments: std::collections::HashMap::new(),
         };
-        arch.try_load_name_index();
-        arch.try_load_term_index();
-        arch.try_load_facet_indices();
+        arch.try_load_name_segments();
+        arch.try_load_term_segments();
+        arch.try_load_facet_segments();
         Ok(arch)
     }
 
@@ -395,13 +393,13 @@ impl Archive {
             tail_size,
             archive_comment,
             disk_count,
-            name_index: None,
-            term_index: None,
-            facet_indices: std::collections::HashMap::new(),
+            name_segments: Vec::new(),
+            term_segments: Vec::new(),
+            facet_segments: std::collections::HashMap::new(),
         };
-        arch.try_load_name_index();
-        arch.try_load_term_index();
-        arch.try_load_facet_indices();
+        arch.try_load_name_segments();
+        arch.try_load_term_segments();
+        arch.try_load_facet_segments();
         Ok(arch)
     }
 
@@ -409,40 +407,74 @@ impl Archive {
     /// standard single-file ZIP; `n ≥ 2` only for multi-disk archives
     /// opened through `Archive::open`. Lets extract/grep skip a
     /// redundant EOCD probe when fanning out worker sources.
-    /// Look up an entry index by name in `O(1)` when a
-    /// `.tzip/names.v1` MPH index is present, otherwise fall back to
-    /// an `O(N)` linear scan over the CDR. Archives built without
-    /// `tzip create --index-names` always take the fallback.
+    /// Look up an entry index by name. Walks every name-index
+    /// segment in append-order; returns the first hit. Falls back
+    /// to a linear CDR scan when no segment matches (strictly
+    /// correct for archives without any name index). `tzip u`
+    /// appends segments as new entries land, so lookups stay
+    /// coherent across incremental updates.
     pub fn lookup_entry_idx(&self, name: &str) -> Option<usize> {
-        if let Some(idx) = &self.name_index {
-            return idx.lookup(name).map(|u| u as usize);
+        for seg in &self.name_segments {
+            if let Some(idx) = seg.lookup(name) {
+                return Some(idx as usize);
+            }
         }
         self.entries.iter().position(|e| e.name == name)
     }
 
-    /// Try to load `.tzip/names.v1` as a `NameIndex`. Silently
-    /// leaves `self.name_index = None` on any failure — the lookup
-    /// path falls back to linear scan, which is strictly correct.
-    fn try_load_name_index(&mut self) {
-        let body = match self.read_index_body(crate::nameidx::INDEX_ENTRY_NAME) {
-            Some(b) => b,
-            None => return,
-        };
-        if let Ok(ni) = crate::nameidx::NameIndex::parse(&body) {
-            self.name_index = Some(ni);
+    /// Enumerate name-index segments: the unsuffixed
+    /// `.tzip/names.v1` from the initial create, plus any
+    /// `.tzip/names.v1.segN` written by subsequent `tzip u` calls,
+    /// sorted by segment number.
+    fn try_load_name_segments(&mut self) {
+        let bodies = self.read_segment_bodies(crate::nameidx::INDEX_ENTRY_NAME);
+        for body in bodies {
+            if let Ok(ni) = crate::nameidx::NameIndex::parse(&body) {
+                self.name_segments.push(ni);
+            }
         }
     }
 
-    /// Try to load `.tzip/terms.v1` as a `TermIndex`. Same silent-
-    /// fallback policy as `try_load_name_index`.
-    fn try_load_term_index(&mut self) {
-        let body = match self.read_index_body(crate::termidx::INDEX_ENTRY_NAME) {
-            Some(b) => b,
-            None => return,
-        };
-        if let Ok(ti) = crate::termidx::TermIndex::parse(&body) {
-            self.term_index = Some(ti);
+    /// Same for term-index segments. Each segment is independently
+    /// built; a query unions posting lists across segments to get
+    /// the final candidate set.
+    fn try_load_term_segments(&mut self) {
+        let bodies = self.read_segment_bodies(crate::termidx::INDEX_ENTRY_NAME);
+        for body in bodies {
+            if let Ok(ti) = crate::termidx::TermIndex::parse(&body) {
+                self.term_segments.push(ti);
+            }
         }
+    }
+
+    /// For each unsuffixed base name `.tzip/*.v1`, return the
+    /// bodies of the base entry and every `.segN` sibling in
+    /// segment-number order. Readers parse each into whatever
+    /// typed index they manage.
+    fn read_segment_bodies(&mut self, base: &str) -> Vec<Vec<u8>> {
+        let seg_prefix = format!("{}.seg", base);
+        let mut hits: Vec<(u32, String)> = Vec::new();
+        for e in &self.entries {
+            if e.name == base {
+                hits.push((0, e.name.clone()));
+            } else if let Some(rest) = e.name.strip_prefix(&seg_prefix) {
+                if let Ok(n) = rest.parse::<u32>() {
+                    // seg0 is reserved for the unsuffixed form;
+                    // explicit .seg0 collides. Skip to avoid duplicates.
+                    if n > 0 {
+                        hits.push((n, e.name.clone()));
+                    }
+                }
+            }
+        }
+        hits.sort_by_key(|(n, _)| *n);
+        let mut bodies = Vec::with_capacity(hits.len());
+        for (_, name) in hits {
+            if let Some(body) = self.read_index_body(&name) {
+                bodies.push(body);
+            }
+        }
+        bodies
     }
 
     /// Shared reader for `.tzip/*.v1` sentinel entries. They're always
@@ -466,52 +498,119 @@ impl Archive {
         Some(body)
     }
 
-    /// Try to load every `.tzip/facets.v1/<leaf>` entry as a Facet
-    /// and stash by leaf. Silent-fallback on parse errors (reader
-    /// still works, just without that facet).
-    fn try_load_facet_indices(&mut self) {
-        // Snapshot indices first — we need both `self.entries` immutable
-        // and `self.source` mutable to read each body.
-        let targets: Vec<usize> = (0..self.entries.len())
-            .filter(|&i| crate::facets::is_facet_entry_name(&self.entries[i].name))
+    /// Try to load every `.tzip/facets.v1/<leaf>[.segN]` entry as a
+    /// Facet and group them by leaf. Multiple segments per field
+    /// are summed on-demand at query time.
+    fn try_load_facet_segments(&mut self) {
+        // Snapshot the list of facet entry names before taking a
+        // mutable borrow on `self.source` to read bodies.
+        let targets: Vec<(usize, String)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| crate::facets::is_facet_entry_name(&e.name))
+            .map(|(i, e)| (i, e.name.clone()))
             .collect();
-        for i in targets {
-            let name = self.entries[i].name.clone();
-            let body = match self.read_index_body(&name) {
-                Some(b) => b,
+        // Group by base-leaf and sort by `.segN` suffix so segments
+        // merge in deterministic order.
+        let mut by_leaf: std::collections::HashMap<String, Vec<(u32, String)>> =
+            std::collections::HashMap::new();
+        for (_i, name) in &targets {
+            // Strip `.tzip/facets.v1/` prefix to get `<leaf>` or
+            // `<leaf>.segN`.
+            let after_prefix = match name.strip_prefix(".tzip/facets.v1/") {
+                Some(s) => s,
                 None => continue,
             };
-            if let Ok(f) = crate::facets::Facet::parse(&body) {
-                self.facet_indices.insert(f.field.clone(), f);
+            let (leaf, seg) = match after_prefix.rsplit_once(".seg") {
+                Some((leaf, num)) => match num.parse::<u32>() {
+                    Ok(n) => (leaf.to_string(), n),
+                    Err(_) => (after_prefix.to_string(), 0),
+                },
+                None => (after_prefix.to_string(), 0),
+            };
+            by_leaf
+                .entry(leaf)
+                .or_insert_with(Vec::new)
+                .push((seg, name.clone()));
+        }
+        for (leaf, mut segs) in by_leaf {
+            segs.sort_by_key(|(n, _)| *n);
+            let mut facets: Vec<crate::facets::Facet> = Vec::with_capacity(segs.len());
+            for (_, name) in &segs {
+                if let Some(body) = self.read_index_body(name) {
+                    if let Ok(f) = crate::facets::Facet::parse(&body) {
+                        facets.push(f);
+                    }
+                }
+            }
+            if !facets.is_empty() {
+                self.facet_segments.insert(leaf, facets);
             }
         }
     }
 
-    /// Available facet field names (the leaf part of each
-    /// `.tzip/facets.v1/<leaf>`), in alphabetic order.
+    /// Available facet field names (leaves), alphabetic order.
     pub fn facet_fields(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.facet_indices.keys().cloned().collect();
+        let mut names: Vec<String> = self.facet_segments.keys().cloned().collect();
         names.sort();
         names
     }
 
-    /// Get a specific facet by field name (short / leaf name).
-    pub fn facet(&self, field: &str) -> Option<&crate::facets::Facet> {
-        self.facet_indices.get(field)
+    /// Return a merged `Facet` for `field`, summing counts across
+    /// every segment this archive carries. `None` if no segment has
+    /// the field. Appendable-safe: `tzip u` can write additional
+    /// `.segN` entries and they fold into the returned total.
+    pub fn facet(&self, field: &str) -> Option<crate::facets::Facet> {
+        let segs = self.facet_segments.get(field)?;
+        if segs.is_empty() {
+            return None;
+        }
+        let mut merged = crate::facets::Facet {
+            field: field.to_string(),
+            total: 0,
+            counts: std::collections::HashMap::new(),
+        };
+        for s in segs {
+            merged.total += s.total;
+            for (k, v) in &s.counts {
+                *merged.counts.entry(k.clone()).or_insert(0) += *v;
+            }
+        }
+        Some(merged)
     }
 
     /// Entry indices that could contain every literal token in
-    /// `query`, if the archive carries a `.tzip/terms.v1` index and
-    /// the query has indexable tokens. Returns:
-    /// - `Some(Some(set))` when the index applies; `set` may be
-    ///   empty if no entry has any of the query's tokens.
-    /// - `Some(None)` when the index applies but `query` has no
-    ///   usable tokens (all too short / punctuation-only) — caller
-    ///   should fall through to full linear scan.
+    /// `query`. Unions candidate sets from every term-index segment
+    /// (each segment covers a disjoint range of CDR positions, by
+    /// construction of the append flow). Returns:
+    /// - `Some(Some(set))` when at least one segment applied.
+    /// - `Some(None)` when every segment said the query has no
+    ///   usable tokens — caller should fall through to full scan.
     /// - `None` when the archive has no term index at all.
     pub fn term_candidates(&self, query: &str) -> Option<Option<std::collections::HashSet<u32>>> {
-        let ti = self.term_index.as_ref()?;
-        Some(ti.candidates(query))
+        if self.term_segments.is_empty() {
+            return None;
+        }
+        let mut any_usable = false;
+        let mut merged: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for seg in &self.term_segments {
+            match seg.candidates(query) {
+                Some(set) => {
+                    any_usable = true;
+                    for v in set {
+                        merged.insert(v);
+                    }
+                }
+                None => {
+                    // This segment can't help (no usable tokens).
+                    // Other segments might still help for the same
+                    // query (no reason they would with the same
+                    // tokenizer, but leave the check honest).
+                }
+            }
+        }
+        Some(if any_usable { Some(merged) } else { None })
     }
 
     pub fn disk_count(&self) -> usize {

@@ -343,6 +343,25 @@ pub struct UpdateArgs {
     /// already carries SHA-256 hashes on existing entries.
     #[arg(long)]
     pub write_sha256: bool,
+
+    /// Append a new MPH-over-names segment covering the newly added
+    /// entries. Readers walk every `.tzip/names.v1.segN` in order
+    /// and fall back to linear scan — behaviour-compatible with
+    /// non-segmented archives.
+    #[arg(long)]
+    pub index_names: bool,
+
+    /// Append a new term-index segment covering newly added entries
+    /// whose name matches `glob` (repeatable). `tzip grep` unions
+    /// posting lists from every segment before narrowing candidates.
+    #[arg(long, value_name = "GLOB")]
+    pub index_terms: Vec<String>,
+
+    /// Append a new facet segment accumulating counts on added
+    /// entries for jq-style field path. Multiple segments per
+    /// field are summed at `tzip aggregate` time.
+    #[arg(long, value_name = "PATH")]
+    pub facet: Vec<String>,
 }
 
 // ── Reader (ls / cat / x) ──────────────────────────────────────────────────
@@ -980,13 +999,15 @@ impl UpdateArgs {
             // archive's existing format.
             write_md5: self.write_md5,
             write_sha256: self.write_sha256,
-            // `tzip u` on an archive that already has a `.tzip/names.v1`
-            // index invalidates it (new entries' indices shift). Phase 4
-            // of the roadmap handles segmented index updates; for now
-            // we skip index emission on update.
-            index_names: false,
-            index_terms: Vec::new(),
-            facet: Vec::new(),
+            // `tzip u`'s indexing flags land as a new `.segN` for
+            // each requested index kind (Phase 4). Append-mode
+            // specifically only rewrites the index segment covering
+            // the added entries; existing segments stay untouched.
+            // Rebuild mode treats these like a fresh create (full
+            // index over the merged entry set).
+            index_names: self.index_names,
+            index_terms: self.index_terms,
+            facet: self.facet,
         })
     }
 }

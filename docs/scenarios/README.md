@@ -10,6 +10,7 @@ today — and in published cloud pricing / disk-level numbers.
 - [Logs: grep across a year of daily archives without rehydrating](log-archive-grep.md)
 - [CI/CD: build-artifact distribution for 50 engineers](ci-artifact-distribution.md)
 - [Cold storage: Glacier Deep Archive economics for small-file corpora](glacier-deep-archive.md)
+- [S3: pulling one 1 KB entry out of a 100 GB archive](s3-huge-archive-single-entry.md) (transfer-cost analysis)
 - [The archive IS the database: six Elastic-replacement scenarios](elastic-replacement.md) (Phases 1–7 + 5b)
 
 Each story covers:

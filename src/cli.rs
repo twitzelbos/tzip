@@ -643,6 +643,11 @@ pub struct GrepArgs {
     #[arg(long, value_name = "MB", default_value_t = 256u64)]
     pub cache_size_mb: u64,
 
+    /// Phase-6b RAM-tier cap. `0` disables the in-process LRU
+    /// (disk-only). Omitted → 64 MB default.
+    #[arg(long, value_name = "MB")]
+    pub cache_ram_mb: Option<u64>,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
@@ -1105,7 +1110,11 @@ impl GrepArgs {
             checkpoint: self.checkpoint,
             resume: self.resume,
             password,
-            cache: cache_spec_from_flags(self.cache_dir, self.cache_size_mb),
+            cache: cache_spec_from_flags_with_ram(
+                self.cache_dir,
+                self.cache_size_mb,
+                self.cache_ram_mb,
+            ),
             quiet: self.quiet,
             verbose: self.verbose,
         })
@@ -1345,6 +1354,11 @@ pub struct AggregateArgs {
     #[arg(long, value_name = "MB", default_value_t = 256u64)]
     pub cache_size_mb: u64,
 
+    /// Phase-6b RAM-tier cap. `0` disables the in-process LRU
+    /// (disk-only). Omitted → 64 MB default.
+    #[arg(long, value_name = "MB")]
+    pub cache_ram_mb: Option<u64>,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
     #[arg(short = 'v', long)]
@@ -1374,7 +1388,11 @@ impl AggregateArgs {
             fields: self.fields,
             top: self.top,
             json: self.json,
-            cache: cache_spec_from_flags(self.cache_dir, self.cache_size_mb),
+            cache: cache_spec_from_flags_with_ram(
+                self.cache_dir,
+                self.cache_size_mb,
+                self.cache_ram_mb,
+            ),
             quiet: self.quiet,
             verbose: self.verbose,
         })
@@ -1427,6 +1445,11 @@ pub struct QueryArgs {
     #[arg(long, value_name = "MB", default_value_t = 256u64)]
     pub cache_size_mb: u64,
 
+    /// Phase-6b RAM-tier cap. `0` disables the in-process LRU
+    /// (disk-only). Omitted → 64 MB default.
+    #[arg(long, value_name = "MB")]
+    pub cache_ram_mb: Option<u64>,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
     #[arg(short = 'v', long)]
@@ -1452,7 +1475,11 @@ impl QueryArgs {
             sql: self.sql,
             format,
             password: self.password,
-            cache: cache_spec_from_flags(self.cache_dir, self.cache_size_mb),
+            cache: cache_spec_from_flags_with_ram(
+                self.cache_dir,
+                self.cache_size_mb,
+                self.cache_ram_mb,
+            ),
         })
     }
 }
@@ -1499,6 +1526,11 @@ pub struct JqArgs {
     #[arg(long, value_name = "MB", default_value_t = 256u64)]
     pub cache_size_mb: u64,
 
+    /// Phase-6b RAM-tier cap. `0` disables the in-process LRU
+    /// (disk-only). Omitted → 64 MB default.
+    #[arg(long, value_name = "MB")]
+    pub cache_ram_mb: Option<u64>,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
     #[arg(short = 'v', long)]
@@ -1514,7 +1546,11 @@ impl JqArgs {
             raw_output: self.raw_output,
             entry_prefix: self.entry_prefix,
             password: self.password,
-            cache: cache_spec_from_flags(self.cache_dir, self.cache_size_mb),
+            cache: cache_spec_from_flags_with_ram(
+                self.cache_dir,
+                self.cache_size_mb,
+                self.cache_ram_mb,
+            ),
             quiet: self.quiet,
             verbose: self.verbose,
         })
@@ -1529,6 +1565,18 @@ pub(crate) fn cache_spec_from_flags(
     dir: Option<PathBuf>,
     size_mb: u64,
 ) -> Option<crate::indexcache::IndexCacheSpec> {
+    cache_spec_from_flags_with_ram(dir, size_mb, None)
+}
+
+/// Same as `cache_spec_from_flags` but takes an explicit RAM-tier
+/// budget. `ram_mb = Some(0)` disables the RAM tier; `None` uses the
+/// Phase-6b default (64 MB). Called by the subcommands that expose
+/// `--cache-ram-mb`.
+pub(crate) fn cache_spec_from_flags_with_ram(
+    dir: Option<PathBuf>,
+    size_mb: u64,
+    ram_mb: Option<u64>,
+) -> Option<crate::indexcache::IndexCacheSpec> {
     let dir = match dir {
         None => return None,
         Some(p) if p.as_os_str().is_empty() => {
@@ -1539,8 +1587,14 @@ pub(crate) fn cache_spec_from_flags(
         }
         Some(p) => p,
     };
+    let ram_max_bytes = match ram_mb {
+        Some(0) => None,
+        Some(mb) => Some(mb.saturating_mul(1024 * 1024)),
+        None => Some(crate::indexcache::DEFAULT_RAM_MAX_BYTES),
+    };
     Some(crate::indexcache::IndexCacheSpec {
         dir,
         max_bytes: size_mb.saturating_mul(1024 * 1024),
+        ram_max_bytes,
     })
 }

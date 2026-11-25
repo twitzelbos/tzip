@@ -48,6 +48,20 @@
 #   15. post-append     — ls / cat round-trip the new entry.
 #
 # Exit status: 0 iff every step passes; non-zero otherwise.
+#
+# Re-runnability:
+#   - The ~100 K-entry corpus and the PPMd-max archive built on
+#     top of it are expensive. Both are cached under
+#     `${TMPDIR:-/tmp}/tzip-s3-demo-cache-${ENTRIES}/` and reused
+#     verbatim on subsequent runs. Pass `FORCE_REBUILD=1` to
+#     wipe the cache, or set CACHE_DIR to an explicit path.
+#   - The S3 upload is skipped when the live object already
+#     matches the cached archive by size (and re-done otherwise
+#     — e.g. after the previous run's step 15 mutated the live
+#     object with an `appended.json`).
+#   - Step 15 (`tzip u`) is itself idempotent: if the live
+#     object already carries `appended.json`, the append is
+#     skipped and the verification still runs.
 
 set -euo pipefail
 
@@ -55,13 +69,22 @@ set -euo pipefail
 AWS_KEYS_CSV="${AWS_KEYS_CSV:-$HOME/Downloads/twitzel_accessKeys (1).csv}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 BUCKET="${BUCKET:-tzip-demo-bucket}"
-KEY="${KEY:-demo-ppmd-aes-100k.zip}"
 PASSWORD="${PASSWORD:-tzip-demo-pw-2026}"
 TZIP="${TZIP:-$(pwd)/target/release/tzip}"
 ENTRIES="${ENTRIES:-100000}"
-# Seed a known marker string in exactly ONE entry so we can
-# round-trip grep + cat without false positives.
-MARKER="UNIQUE-MARKER-${RANDOM}-${RANDOM}"
+KEY="${KEY:-demo-ppmd-aes-${ENTRIES}.zip}"
+# A FIXED marker string so a cached corpus (see CACHE_DIR
+# below) carries it reproducibly across runs. Grep asserts
+# this exact string, so changing it requires invalidating the
+# cache or setting FORCE_REBUILD=1.
+MARKER="${MARKER:-UNIQUE-MARKER-FOR-TZIP-GREP-TEST}"
+# Cached corpus + prebuilt archive live outside the per-run
+# scratch dir so re-runs skip the 100 K-file + PPMd-max
+# regeneration (which is the slow part by far). Keyed on
+# ENTRIES so bumping the size naturally invalidates the
+# cache. FORCE_REBUILD=1 forces a rebuild.
+CACHE_DIR="${CACHE_DIR:-${TMPDIR:-/tmp}/tzip-s3-demo-cache-${ENTRIES}}"
+FORCE_REBUILD="${FORCE_REBUILD:-0}"
 
 # ── Preflight ─────────────────────────────────────────────────
 if [[ ! -x "$TZIP" ]]; then
@@ -88,11 +111,22 @@ export AWS_ACCESS_KEY_ID
 export AWS_SECRET_ACCESS_KEY
 export AWS_REGION
 
-SCRATCH=$(mktemp -d /tmp/tzip-s3-demo.XXXXXX)
+# Per-run scratch dir — only holds transient artifacts (extract
+# target, appended.json, etc.). The expensive-to-build corpus
+# + archive + schema live in CACHE_DIR and survive across runs.
+SCRATCH=$(mktemp -d /tmp/tzip-s3-demo-run.XXXXXX)
 trap 'rm -rf "$SCRATCH"' EXIT
 cd "$SCRATCH"
 
 S3_URL="s3://${BUCKET}/${KEY}"
+CACHED_ARCHIVE="$CACHE_DIR/local.zip"
+CACHED_CORPUS="$CACHE_DIR/corpus"
+CACHED_SCHEMA="$CACHE_DIR/schema.json"
+# Sentinel file; its presence means "corpus generation
+# finished successfully for this ENTRIES size." Avoids a
+# half-generated corpus being mistaken for a cache hit after
+# a Ctrl-C during the Python loop.
+CACHED_SENTINEL="$CACHE_DIR/.corpus-complete"
 
 banner() {
     local label=$1
@@ -108,47 +142,64 @@ run() {
     time "$@"
 }
 
-# ── 1. Build the synthetic corpus ─────────────────────────────
+# ── 1. Seed the synthetic corpus (lazy — reused across runs) ──
 banner "1/15  seed corpus — ${ENTRIES} synthetic JSON entries"
-mkdir -p corpus
 
-# Keep the corpus deterministic (same hostname produces same
-# content so re-runs of the script produce identical archives)
-# but with enough entropy that PPMd + AES actually have work
-# to do. ~200 bytes per entry; 100 K × 200 B ≈ 20 MB raw.
-python3 - <<PY
-import json, pathlib, random
+if [[ "$FORCE_REBUILD" == "1" ]]; then
+    echo "FORCE_REBUILD=1 — nuking cache at $CACHE_DIR"
+    rm -rf "$CACHE_DIR"
+fi
+
+mkdir -p "$CACHE_DIR"
+
+if [[ -f "$CACHED_SENTINEL" ]]; then
+    N=$(find "$CACHED_CORPUS" -name 'entry-*.json' -maxdepth 1 | wc -l | tr -d ' ')
+    echo "cache hit: $N entries at $CACHED_CORPUS"
+    if [[ "$N" -ne "$ENTRIES" ]]; then
+        echo "  cache entry-count mismatch ($N ≠ $ENTRIES) — rebuilding"
+        rm -rf "$CACHED_CORPUS" "$CACHED_SENTINEL" "$CACHED_ARCHIVE"
+    fi
+fi
+
+if [[ ! -f "$CACHED_SENTINEL" ]]; then
+    echo "cache miss: regenerating $ENTRIES entries at $CACHED_CORPUS"
+    mkdir -p "$CACHED_CORPUS"
+    # Deterministic seed → same bytes on every regen for a
+    # given ENTRIES, which keeps the archive content-addressed
+    # across runs. The MARKER lands in a fixed slot so grep
+    # asserts the same value every time.
+    python3 - "$CACHED_CORPUS" "$ENTRIES" "$MARKER" <<'PY'
+import json, pathlib, random, sys
+out, entries, marker = pathlib.Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 random.seed(42)
-regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-south-1", "sa-east-1"]
+regions  = ["us-east-1", "us-west-2", "eu-west-1", "ap-south-1", "sa-east-1"]
 statuses = [200, 201, 301, 400, 404, 500, 503]
 users    = [f"user-{i:04d}" for i in range(500)]
-out = pathlib.Path("corpus")
-for i in range(${ENTRIES}):
-    row = {
+for i in range(entries):
+    (out / f"entry-{i:06d}.json").write_text(json.dumps({
         "id":     i,
         "ts":     f"2026-11-{random.randint(1,28):02d}T{random.randint(0,23):02d}:{random.randint(0,59):02d}:{random.randint(0,59):02d}Z",
         "region": random.choice(regions),
         "status": random.choice(statuses),
         "user":   random.choice(users),
         "msg":    f"request body {random.randint(0, 1<<30):x}",
-    }
-    (out / f"entry-{i:06d}.json").write_text(json.dumps(row))
-# One entry carries the unique marker so later grep can find it.
-marker_idx = ${ENTRIES} // 3
-with (out / f"entry-{marker_idx:06d}.json").open("w") as fh:
-    json.dump({
-        "id": marker_idx, "ts": "2026-11-25T00:00:00Z",
-        "region": "us-east-1", "status": 500,
-        "user": "marker-user",
-        "msg": "${MARKER}",
-    }, fh)
-print(f"seeded {${ENTRIES}} entries; marker in entry-{marker_idx:06d}.json")
+    }))
+# Fixed marker slot so grep's assertion is cache-stable.
+marker_idx = entries // 3
+(out / f"entry-{marker_idx:06d}.json").write_text(json.dumps({
+    "id": marker_idx, "ts": "2026-11-25T00:00:00Z",
+    "region": "us-east-1", "status": 500,
+    "user": "marker-user",
+    "msg": marker,
+}))
+print(f"seeded {entries} entries; marker in entry-{marker_idx:06d}.json")
 PY
+    touch "$CACHED_SENTINEL"
+fi
 
-# Schema for the columnar sidecar — matches what the Python
-# generator above writes. Int64 for status, strings for the
-# rest; `region` is deliberately in the facet set below.
-cat >schema.json <<'JSON'
+# Schema for the columnar sidecar; cheap to regenerate but
+# lives in the cache dir so the whole seed set is one place.
+cat >"$CACHED_SCHEMA" <<'JSON'
 { "fields": [
     { "name": "id",     "type": "int64",  "path": ".id" },
     { "name": "ts",     "type": "string", "path": ".ts" },
@@ -158,22 +209,44 @@ cat >schema.json <<'JSON'
 ] }
 JSON
 
-# ── 2. Create the archive: PPMd-max + AES-256 + full indexing ─
+# ── 2. Build the archive (lazy — reused across runs) ──────────
 banner "2/15  tzip create — PPMd level 9, AES-256, all indices"
-run "create" "$TZIP" create local.zip corpus \
-    -m ppmd -x 9 \
-    -p "$PASSWORD" \
-    --index-names \
-    --index-terms '*.json' \
-    --facet '.region' \
-    --facet '.status' \
-    --write-columnar \
-    --columnar-schema schema.json
-ls -la local.zip
+if [[ -f "$CACHED_ARCHIVE" ]]; then
+    echo "cache hit: $CACHED_ARCHIVE ($(du -h "$CACHED_ARCHIVE" | cut -f1))"
+else
+    echo "cache miss: building archive from $CACHED_CORPUS"
+    # `tzip create` wants input paths relative to its cwd —
+    # jump into CACHE_DIR so `corpus` resolves correctly, then
+    # jump back.
+    (
+        cd "$CACHE_DIR"
+        "$TZIP" create local.zip corpus \
+            -m ppmd -x 9 \
+            -p "$PASSWORD" \
+            --index-names \
+            --index-terms '*.json' \
+            --facet '.region' \
+            --facet '.status' \
+            --write-columnar \
+            --columnar-schema schema.json
+    )
+fi
+ls -la "$CACHED_ARCHIVE"
 
-# ── Upload ────────────────────────────────────────────────────
-banner "3/15  aws s3 cp — seed the test key"
-run "upload" aws s3 cp local.zip "$S3_URL"
+# ── Upload (lazy — reuse an already-published object) ─────────
+banner "3/15  aws s3 cp — publish to the test key (if missing)"
+if aws s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null 2>&1; then
+    REMOTE_SIZE=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --query 'ContentLength' --output text)
+    LOCAL_SIZE=$(stat -f%z "$CACHED_ARCHIVE" 2>/dev/null || stat -c%s "$CACHED_ARCHIVE")
+    if [[ "$REMOTE_SIZE" == "$LOCAL_SIZE" ]]; then
+        echo "remote object s3://${BUCKET}/${KEY} already matches local size ($LOCAL_SIZE) — skipping upload"
+    else
+        echo "remote object size $REMOTE_SIZE ≠ local $LOCAL_SIZE — re-uploading"
+        run "upload" aws s3 cp "$CACHED_ARCHIVE" "$S3_URL"
+    fi
+else
+    run "upload" aws s3 cp "$CACHED_ARCHIVE" "$S3_URL"
+fi
 
 # ── READ PHASE ────────────────────────────────────────────────
 banner "4/15  tzip ls (no password — names are plaintext in CDR)"
@@ -246,10 +319,21 @@ run "jq-regions" bash -c \
 
 # ── WRITE PHASE (PR #70) ──────────────────────────────────────
 banner "15/15  tzip u — append one new entry via S3 multipart"
-printf '{"appended":"via tzip u","ts":"%s","from":"s3-full-demo.sh"}\n' \
-    "$(date -u +%FT%TZ)" > appended.json
 
-run "append" "$TZIP" u "$S3_URL" appended.json -p "$PASSWORD"
+# Re-runnable: the previous script invocation may have left
+# `appended.json` on the live object. tzip u's pure-add scope
+# (issue #68 v1) rejects collisions, so bail out of the append
+# call itself but keep the verification. If the previous run
+# also re-uploaded the clean archive in step 3 (size-mismatch
+# path) then the live object no longer has `appended.json` and
+# we do a fresh append here.
+if "$TZIP" ls "$S3_URL" | grep -qE "[[:space:]]appended\.json$|^appended\.json$"; then
+    echo "live object already has appended.json (left by a prior run) — skipping append"
+else
+    printf '{"appended":"via tzip u","ts":"%s","from":"s3-full-demo.sh"}\n' \
+        "$(date -u +%FT%TZ)" > appended.json
+    run "append" "$TZIP" u "$S3_URL" appended.json -p "$PASSWORD"
+fi
 
 echo
 echo "verifying the appended entry is visible on the live object:"

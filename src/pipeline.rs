@@ -856,32 +856,10 @@ pub fn run(opts: Options) -> Result<()> {
         if payload.is_empty() {
             continue;
         }
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&payload);
-        let crc = hasher.finalize();
-        let body_len = payload.len() as u64;
-        let e = crate::zipwriter::EncodedEntry {
-            index: u64::MAX,
-            name: name.clone(),
-            body: payload,
-            uncompressed_size: body_len,
-            crc32: crc,
-            method_on_wire: 0,
-            inner_method: 0,
-            encrypted: false,
-            gp_bit1: false,
-            version_needed: 20,
-            mtime: (0, 0),
-            external_attr: 0o100644u32 << 16,
-            md5_digest: None,
-            sha256_digest: None,
-            index_terms: None,
-            facet_body: None,
-        };
         if opts.index_names {
-            indexed_names.push(name);
+            indexed_names.push(name.clone());
         }
-        zw.write_entry(e)?;
+        crate::update::emit_sentinel_entry(&mut zw, &opts, &name, payload)?;
     }
 
     // --write-columnar: emit `.tzip/columnar.v1.parquet` (Phase 5).
@@ -892,32 +870,11 @@ pub fn run(opts: Options) -> Result<()> {
     if let Some(cb) = columnar_builder.take() {
         if cb.row_count() > 0 {
             let payload = cb.finish()?;
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&payload);
-            let crc = hasher.finalize();
-            let body_len = payload.len() as u64;
-            let e = crate::zipwriter::EncodedEntry {
-                index: u64::MAX,
-                name: crate::columnar::INDEX_ENTRY_NAME.to_string(),
-                body: payload,
-                uncompressed_size: body_len,
-                crc32: crc,
-                method_on_wire: 0,
-                inner_method: 0,
-                encrypted: false,
-                gp_bit1: false,
-                version_needed: 20,
-                mtime: (0, 0),
-                external_attr: 0o100644u32 << 16,
-                md5_digest: None,
-                sha256_digest: None,
-                index_terms: None,
-                facet_body: None,
-            };
+            let name = crate::columnar::INDEX_ENTRY_NAME.to_string();
             if opts.index_names {
-                indexed_names.push(e.name.clone());
+                indexed_names.push(name.clone());
             }
-            zw.write_entry(e)?;
+            crate::update::emit_sentinel_entry(&mut zw, &opts, &name, payload)?;
         }
     }
 
@@ -927,36 +884,15 @@ pub fn run(opts: Options) -> Result<()> {
     if !opts.index_terms.is_empty() {
         let payload = term_builder.finish()?;
         if !payload.is_empty() {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&payload);
-            let crc = hasher.finalize();
-            let body_len = payload.len() as u64;
-            let e = crate::zipwriter::EncodedEntry {
-                index: u64::MAX,
-                name: crate::termidx::INDEX_ENTRY_NAME.to_string(),
-                body: payload,
-                uncompressed_size: body_len,
-                crc32: crc,
-                method_on_wire: 0,
-                inner_method: 0,
-                encrypted: false,
-                gp_bit1: false,
-                version_needed: 20,
-                mtime: (0, 0),
-                external_attr: 0o100644u32 << 16,
-                md5_digest: None,
-                sha256_digest: None,
-                index_terms: None,
-                facet_body: None,
-            };
+            let name = crate::termidx::INDEX_ENTRY_NAME.to_string();
             if opts.index_names {
-                indexed_names.push(e.name.clone());
+                indexed_names.push(name.clone());
             }
-            zw.write_entry(e)?;
+            crate::update::emit_sentinel_entry(&mut zw, &opts, &name, payload)?;
         }
     }
 
-    // --index-names: emit one synthetic STORE entry after all user
+    // --index-names: emit one synthetic entry after all user
     // entries carrying the MPH over the names we just wrote. Readers
     // that know about `.tzip/names.v1` pick it up; readers that don't
     // see a normal (small) ZIP entry.
@@ -964,33 +900,8 @@ pub fn run(opts: Options) -> Result<()> {
         let payload = crate::nameidx::build(
             &indexed_names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         )?;
-        let name_idx_entry = crate::zipwriter::EncodedEntry {
-            index: u64::MAX,
-            name: crate::nameidx::INDEX_ENTRY_NAME.to_string(),
-            body: payload,
-            uncompressed_size: 0, // set below
-            crc32: 0,              // set below
-            method_on_wire: 0,     // Store
-            inner_method: 0,
-            encrypted: false,
-            gp_bit1: false,
-            version_needed: 20,
-            mtime: (0, 0),
-            external_attr: 0o100644u32 << 16,
-            md5_digest: None,
-            sha256_digest: None,
-            index_terms: None,
-            facet_body: None,
-        };
-        // Fix up size / crc for the synthetic entry.
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&name_idx_entry.body);
-        let crc = hasher.finalize();
-        let body_len = name_idx_entry.body.len() as u64;
-        let mut e = name_idx_entry;
-        e.uncompressed_size = body_len;
-        e.crc32 = crc;
-        zw.write_entry(e)?;
+        let name = crate::nameidx::INDEX_ENTRY_NAME.to_string();
+        crate::update::emit_sentinel_entry(&mut zw, &opts, &name, payload)?;
     }
 
     profile(profile_on, "main_write_loop", t_mainloop);

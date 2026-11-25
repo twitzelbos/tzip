@@ -34,6 +34,27 @@ pub const MAC_KEY_LEN: usize = 32; // HMAC-SHA1 key size per WinZIP AES
 /// Overhead bytes added to a plaintext body when it is AE-2 encrypted.
 pub const AE2_OVERHEAD: usize = SALT_LEN + VERIFY_LEN + MAC_LEN;
 
+/// Wrap a plaintext payload in a WinZIP AES-256 AE-2 envelope.
+///
+/// Used by both the create-mode pipeline for user entries (via the
+/// in-place single-alloc path) and — new in the ChatGPT review
+/// fix pass — by the sentinel emitters for `.tzip/*.v1` index
+/// entries. Pre-fix, index payloads were written with
+/// `encrypted: false` on AES archives, letting any reader
+/// enumerate entry names, index terms, facet values, and columnar
+/// contents without the password. The index is content-derived;
+/// if the content is secret, the index is too.
+///
+/// Returns a buffer of length `plaintext.len() + AE2_OVERHEAD`.
+pub fn wrap_ae2(password: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(plaintext.len() + AE2_OVERHEAD);
+    let prefix = SALT_LEN + VERIFY_LEN;
+    buf.resize(plaintext.len() + AE2_OVERHEAD, 0);
+    buf[prefix..prefix + plaintext.len()].copy_from_slice(plaintext);
+    encrypt_ae2_in_place(password, &mut buf, plaintext.len())?;
+    Ok(buf)
+}
+
 /// Encrypted payload with all envelope bytes already assembled.
 pub struct AesPayload {
     /// salt || pw_verify || ciphertext || mac10

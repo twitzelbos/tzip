@@ -1,0 +1,853 @@
+//! End-to-end tests for `tzip u s3://...` against a mock S3 server
+//! (issue #68). The mock implements the subset of the S3 API that
+//! the append path exercises:
+//!
+//! - `GET /<bucket>/<key>` (Range + full), returning ETag
+//! - `POST /<bucket>/<key>?uploads` → CreateMultipartUpload
+//! - `PUT /<bucket>/<key>?partNumber=N&uploadId=U` → UploadPart
+//! - `PUT /<bucket>/<key>?partNumber=N&uploadId=U` with
+//!   `x-amz-copy-source` + `x-amz-copy-source-range` + optional
+//!   `x-amz-copy-source-if-match` → UploadPartCopy (server-side)
+//! - `POST /<bucket>/<key>?uploadId=U` with an XML body + optional
+//!   `If-Match` → CompleteMultipartUpload (atomic CAS; 412 on
+//!   mismatch)
+//! - `DELETE /<bucket>/<key>?uploadId=U` → AbortMultipartUpload
+//! - `PUT /<bucket>/<key>` with optional `If-Match` → PutObject
+//!   (single-PUT fallback for small archives)
+//!
+//! State is held in a `Mutex<ServerState>`: the current object
+//! body + ETag, and a map of in-progress uploads (each a map of
+//! part number → bytes). CompleteMultipartUpload concatenates the
+//! parts in order under the If-Match lock, swapping the object
+//! atomically from the mock's perspective.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Read;
+use std::net::{SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
+
+fn tzip_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_tzip"))
+}
+
+fn run_tzip_create(cwd: &Path, args: &[&str]) {
+    let out = Command::new(tzip_bin())
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("run tzip create");
+    assert!(
+        out.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn run_tzip(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (bool, Vec<u8>, String) {
+    let mut cmd = Command::new(tzip_bin());
+    cmd.current_dir(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run tzip");
+    (
+        out.status.success(),
+        out.stdout,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+// ── Mock state ─────────────────────────────────────────────────────────────
+
+struct Upload {
+    parts: BTreeMap<u32, Vec<u8>>,
+}
+
+struct ServerState {
+    bucket: String,
+    key: String,
+    body: Vec<u8>,
+    etag: String,
+    uploads: BTreeMap<String, Upload>,
+    /// Monotonic counter for synthesising ETags — the real S3
+    /// hashes the body; we just need a stable, unique opaque
+    /// handle.
+    etag_counter: u64,
+}
+
+impl ServerState {
+    fn fresh_etag(&mut self) -> String {
+        self.etag_counter += 1;
+        format!("mocketag-{:016x}", self.etag_counter)
+    }
+}
+
+struct ServerGuard {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<ServerState>>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl ServerGuard {
+    fn endpoint(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+    fn current_etag(&self) -> String {
+        self.state.lock().unwrap().etag.clone()
+    }
+    fn upload_count(&self) -> usize {
+        self.state.lock().unwrap().uploads.len()
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// Spin up the mock on an ephemeral port with `fixture` as the
+/// initial object body.
+fn serve_mock_s3_mpu(bucket: &str, key: &str, fixture: Vec<u8>) -> ServerGuard {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let state = Arc::new(Mutex::new(ServerState {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        body: fixture,
+        etag: "mocketag-initial".to_string(),
+        uploads: BTreeMap::new(),
+        etag_counter: 0,
+    }));
+    let state_srv = Arc::clone(&state);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = Arc::clone(&stop);
+    let upload_id_counter = Arc::new(AtomicU64::new(0));
+
+    let join = thread::spawn(move || {
+        let server = tiny_http::Server::from_listener(listener, None)
+            .expect("tiny_http from_listener");
+        loop {
+            if stop2.load(Ordering::SeqCst) {
+                break;
+            }
+            let req = match server.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(_) => break,
+            };
+            handle(req, &state_srv, &upload_id_counter);
+        }
+    });
+
+    ServerGuard {
+        addr,
+        stop,
+        state,
+        join: Some(join),
+    }
+}
+
+fn handle(
+    mut req: tiny_http::Request,
+    state: &Arc<Mutex<ServerState>>,
+    upload_id_counter: &Arc<AtomicU64>,
+) {
+    // Require an Authorization header on every request — sanity
+    // that tzip actually signs things.
+    let has_auth = req
+        .headers()
+        .iter()
+        .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"));
+    if !has_auth {
+        let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(403)));
+        return;
+    }
+
+    let method = req.method().as_str().to_string();
+    let url = req.url().to_string();
+    let (path, query) = split_path_query(&url);
+
+    // Route by the expected `/<bucket>/<key>` path.
+    let want_path = {
+        let s = state.lock().unwrap();
+        format!("/{}/{}", s.bucket, s.key)
+    };
+    if path != want_path {
+        let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(404)));
+        return;
+    }
+
+    match (method.as_str(), query.as_str()) {
+        ("GET", _) => handle_get(req, state),
+        ("POST", q) if q == "uploads" || q == "uploads=" => {
+            handle_create_mpu(req, state, upload_id_counter)
+        }
+        ("PUT", q) if q.contains("partNumber=") && q.contains("uploadId=") => {
+            let q = q.to_string();
+            handle_upload_part(req, state, &q)
+        }
+        ("POST", q) if q.starts_with("uploadId=") => {
+            let q = q.to_string();
+            handle_complete_mpu(req, state, &q)
+        }
+        ("DELETE", q) if q.starts_with("uploadId=") => {
+            let q = q.to_string();
+            handle_abort_mpu(req, state, &q)
+        }
+        ("PUT", "") => handle_put_object(req, state),
+        _ => {
+            let _ = req.respond(
+                tiny_http::Response::empty(tiny_http::StatusCode(400))
+                    .with_header(header("X-Mock-Why", &format!("unhandled {} ?{}", method, query))),
+            );
+        }
+    }
+}
+
+fn handle_get(req: tiny_http::Request, state: &Arc<Mutex<ServerState>>) {
+    use tiny_http::{Response, StatusCode};
+    let (body, etag) = {
+        let s = state.lock().unwrap();
+        (s.body.clone(), s.etag.clone())
+    };
+    let range_hdr = req
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("range"))
+        .map(|h| h.value.as_str().to_string());
+    if let Some(r) = range_hdr {
+        if let Some((start, end)) = parse_bytes_range(&r, body.len() as u64) {
+            let slice = &body[start as usize..=end as usize];
+            let resp = Response::from_data(slice.to_vec())
+                .with_status_code(206)
+                .with_header(header("Content-Length", &slice.len().to_string()))
+                .with_header(header(
+                    "Content-Range",
+                    &format!("bytes {}-{}/{}", start, end, body.len()),
+                ))
+                .with_header(header("ETag", &format!("\"{}\"", etag)))
+                .with_header(header("Accept-Ranges", "bytes"));
+            let _ = req.respond(resp);
+            return;
+        }
+        let _ = req.respond(Response::empty(StatusCode(416)));
+        return;
+    }
+    let resp = Response::from_data(body.clone())
+        .with_status_code(200)
+        .with_header(header("Content-Length", &body.len().to_string()))
+        .with_header(header("ETag", &format!("\"{}\"", etag)))
+        .with_header(header("Accept-Ranges", "bytes"));
+    let _ = req.respond(resp);
+}
+
+fn handle_create_mpu(
+    req: tiny_http::Request,
+    state: &Arc<Mutex<ServerState>>,
+    upload_id_counter: &Arc<AtomicU64>,
+) {
+    let n = upload_id_counter.fetch_add(1, Ordering::SeqCst);
+    let upload_id = format!("mockupload-{:08x}", n);
+    state
+        .lock()
+        .unwrap()
+        .uploads
+        .insert(upload_id.clone(), Upload { parts: BTreeMap::new() });
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult>
+<Bucket>mock</Bucket>
+<Key>mock</Key>
+<UploadId>{}</UploadId>
+</InitiateMultipartUploadResult>"#,
+        upload_id
+    );
+    let _ = req.respond(
+        tiny_http::Response::from_data(body.into_bytes())
+            .with_status_code(200)
+            .with_header(header("Content-Type", "application/xml")),
+    );
+}
+
+fn handle_upload_part(req: tiny_http::Request, state: &Arc<Mutex<ServerState>>, query: &str) {
+    let params = query_params(query);
+    let part_number: u32 = match params.get("partNumber").and_then(|v| v.parse().ok()) {
+        Some(n) => n,
+        None => {
+            let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(400)));
+            return;
+        }
+    };
+    let upload_id = match params.get("uploadId").cloned() {
+        Some(u) => u,
+        None => {
+            let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(400)));
+            return;
+        }
+    };
+
+    // Distinguish UploadPart from UploadPartCopy by presence of
+    // `x-amz-copy-source` header.
+    let copy_source = req
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("x-amz-copy-source"))
+        .map(|h| h.value.as_str().to_string());
+
+    if let Some(_src) = copy_source {
+        handle_upload_part_copy(req, state, &upload_id, part_number);
+    } else {
+        handle_upload_part_body(req, state, &upload_id, part_number);
+    }
+}
+
+fn handle_upload_part_body(
+    mut req: tiny_http::Request,
+    state: &Arc<Mutex<ServerState>>,
+    upload_id: &str,
+    part_number: u32,
+) {
+    let mut body = Vec::new();
+    if req.as_reader().read_to_end(&mut body).is_err() {
+        let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(400)));
+        return;
+    }
+    let etag = {
+        let mut s = state.lock().unwrap();
+        let part_etag = s.fresh_etag();
+        match s.uploads.get_mut(upload_id) {
+            Some(u) => {
+                u.parts.insert(part_number, body);
+            }
+            None => {
+                drop(s);
+                let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(404)));
+                return;
+            }
+        }
+        part_etag
+    };
+    let _ = req.respond(
+        tiny_http::Response::empty(tiny_http::StatusCode(200))
+            .with_header(header("ETag", &format!("\"{}\"", etag))),
+    );
+}
+
+fn handle_upload_part_copy(
+    req: tiny_http::Request,
+    state: &Arc<Mutex<ServerState>>,
+    upload_id: &str,
+    part_number: u32,
+) {
+    // Parse copy-source-range: "bytes=start-end".
+    let range_hdr = req
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("x-amz-copy-source-range"))
+        .map(|h| h.value.as_str().to_string());
+    // Optional If-Match on copy source.
+    let if_match = req
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("x-amz-copy-source-if-match"))
+        .map(|h| normalize_etag(h.value.as_str()));
+
+    let (slice, new_part_etag) = {
+        let mut s = state.lock().unwrap();
+        if let Some(wanted) = if_match {
+            if wanted != s.etag {
+                drop(s);
+                let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(412)));
+                return;
+            }
+        }
+        let body_len = s.body.len() as u64;
+        let slice = match range_hdr.as_deref() {
+            Some(r) => match parse_bytes_range(r, body_len) {
+                Some((start, end)) => s.body[start as usize..=end as usize].to_vec(),
+                None => {
+                    drop(s);
+                    let _ =
+                        req.respond(tiny_http::Response::empty(tiny_http::StatusCode(416)));
+                    return;
+                }
+            },
+            None => s.body.clone(),
+        };
+        let part_etag = s.fresh_etag();
+        match s.uploads.get_mut(upload_id) {
+            Some(u) => {
+                u.parts.insert(part_number, slice.clone());
+            }
+            None => {
+                drop(s);
+                let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(404)));
+                return;
+            }
+        }
+        (slice, part_etag)
+    };
+    let _ = slice; // consumed via u.parts.insert
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<CopyPartResult>
+<ETag>"{}"</ETag>
+</CopyPartResult>"#,
+        new_part_etag
+    );
+    let _ = req.respond(
+        tiny_http::Response::from_data(body.into_bytes())
+            .with_status_code(200)
+            .with_header(header("Content-Type", "application/xml")),
+    );
+}
+
+fn handle_complete_mpu(
+    mut req: tiny_http::Request,
+    state: &Arc<Mutex<ServerState>>,
+    query: &str,
+) {
+    let params = query_params(query);
+    let upload_id = match params.get("uploadId").cloned() {
+        Some(u) => u,
+        None => {
+            let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(400)));
+            return;
+        }
+    };
+    let if_match = req
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("if-match"))
+        .map(|h| normalize_etag(h.value.as_str()));
+    let mut _body = Vec::new();
+    let _ = req.as_reader().read_to_end(&mut _body);
+
+    let result = {
+        let mut s = state.lock().unwrap();
+        if let Some(wanted) = if_match {
+            if wanted != s.etag {
+                drop(s);
+                let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>PreconditionFailed</Code></Error>"#
+                    .to_vec();
+                let resp = tiny_http::Response::from_data(body)
+                    .with_status_code(412)
+                    .with_header(header("Content-Type", "application/xml"));
+                let _ = req.respond(resp);
+                return;
+            }
+        }
+        let upload = match s.uploads.remove(&upload_id) {
+            Some(u) => u,
+            None => {
+                drop(s);
+                let _ =
+                    req.respond(tiny_http::Response::empty(tiny_http::StatusCode(404)));
+                return;
+            }
+        };
+        let mut composed: Vec<u8> = Vec::new();
+        for (_, bytes) in upload.parts {
+            composed.extend_from_slice(&bytes);
+        }
+        let new_etag = s.fresh_etag();
+        s.body = composed;
+        s.etag = new_etag.clone();
+        new_etag
+    };
+
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult>
+<Bucket>mock</Bucket>
+<Key>mock</Key>
+<ETag>"{}"</ETag>
+</CompleteMultipartUploadResult>"#,
+        result
+    );
+    let resp = tiny_http::Response::from_data(body.into_bytes())
+        .with_status_code(200)
+        .with_header(header("Content-Type", "application/xml"))
+        .with_header(header("ETag", &format!("\"{}\"", result)));
+    let _ = req.respond(resp);
+}
+
+fn handle_abort_mpu(req: tiny_http::Request, state: &Arc<Mutex<ServerState>>, query: &str) {
+    let params = query_params(query);
+    if let Some(upload_id) = params.get("uploadId") {
+        state.lock().unwrap().uploads.remove(upload_id);
+    }
+    let _ = req.respond(tiny_http::Response::empty(tiny_http::StatusCode(204)));
+}
+
+fn handle_put_object(mut req: tiny_http::Request, state: &Arc<Mutex<ServerState>>) {
+    let if_match = req
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("if-match"))
+        .map(|h| normalize_etag(h.value.as_str()));
+    let mut body = Vec::new();
+    let _ = req.as_reader().read_to_end(&mut body);
+
+    let new_etag = {
+        let mut s = state.lock().unwrap();
+        if let Some(wanted) = if_match {
+            if wanted != s.etag {
+                drop(s);
+                let _ =
+                    req.respond(tiny_http::Response::empty(tiny_http::StatusCode(412)));
+                return;
+            }
+        }
+        let new_etag = s.fresh_etag();
+        s.body = body;
+        s.etag = new_etag.clone();
+        new_etag
+    };
+    let resp = tiny_http::Response::empty(tiny_http::StatusCode(200))
+        .with_header(header("ETag", &format!("\"{}\"", new_etag)));
+    let _ = req.respond(resp);
+}
+
+// Helpers ─────────────────────────────────────────────────────────────────
+
+fn header(name: &str, value: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid header")
+}
+
+fn parse_bytes_range(raw: &str, total: u64) -> Option<(u64, u64)> {
+    let rest = raw.strip_prefix("bytes=")?;
+    let (s, e) = rest.split_once('-')?;
+    let start: u64 = s.parse().ok()?;
+    let end: u64 = if e.is_empty() {
+        total.saturating_sub(1)
+    } else {
+        e.parse().ok()?
+    };
+    if start >= total || end >= total || start > end {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn split_path_query(url: &str) -> (String, String) {
+    match url.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (url.to_string(), String::new()),
+    }
+}
+
+fn query_params(query: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for part in query.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        let (k, v) = match part.split_once('=') {
+            Some((k, v)) => (k.to_string(), urldecode(v)),
+            None => (part.to_string(), String::new()),
+        };
+        out.insert(k, v);
+    }
+    out
+}
+
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                hex_digit(bytes[i + 1]),
+                hex_digit(bytes[i + 2]),
+            ) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn normalize_etag(raw: &str) -> String {
+    raw.trim_matches('"').to_string()
+}
+
+fn env_s3(server: &ServerGuard) -> Vec<(&'static str, String)> {
+    vec![
+        ("AWS_ENDPOINT_URL", server.endpoint()),
+        ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE".to_string()),
+        (
+            "AWS_SECRET_ACCESS_KEY",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+        ),
+        ("AWS_REGION", "us-east-1".to_string()),
+    ]
+}
+
+fn env_s3_refs<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    v.iter().map(|(k, val)| (*k, val.as_str())).collect()
+}
+
+/// Create a corpus big enough to push `cd_offset` past 5 MiB, so
+/// the multipart (not single-PUT) path is exercised. Exact byte
+/// count doesn't matter as long as the LFH+body region clears
+/// MIN_PART_SIZE.
+fn make_big_corpus(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    // 20 × 400 KiB = 8 MiB of raw bodies.
+    for i in 0u32..20 {
+        let mut body = Vec::with_capacity(400 * 1024);
+        for j in 0..(400 * 1024u32) {
+            body.push((i.wrapping_mul(97).wrapping_add(j)) as u8);
+        }
+        fs::write(root.join(format!("page_{:03}.bin", i)), &body).unwrap();
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn s3_append_mpu_roundtrip() {
+    // Build a local archive, serve it at a mock s3:// URL, run
+    // `tzip u s3://... new.txt`, then verify:
+    //   1. tzip exits 0
+    //   2. mock's stored body advanced (new ETag)
+    //   3. `tzip ls` sees the new entry alongside the old ones
+    //   4. `tzip cat` returns the new entry's content
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = tmp.path().join("corpus");
+    make_big_corpus(&corpus);
+    // `-m store`: our fixture bodies are from a cheap PRNG; the
+    // default deflate would compress them into < 5 MiB and break
+    // the "exercise multipart" invariant. Store keeps the archive
+    // roughly the size of the raw corpus.
+    run_tzip_create(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "store", "-q"],
+    );
+    let initial_body = fs::read(tmp.path().join("out.zip")).unwrap();
+    let initial_len = initial_body.len();
+    assert!(
+        initial_len > 5 * 1024 * 1024,
+        "fixture must exceed 5 MiB to exercise multipart; got {}",
+        initial_len
+    );
+
+    let server = serve_mock_s3_mpu("mybucket", "out.zip", initial_body.clone());
+    let initial_etag = server.current_etag();
+
+    // Write a new file to append.
+    fs::write(tmp.path().join("new.txt"), b"hello from s3 append\n").unwrap();
+
+    let env = env_s3(&server);
+    let env_ref = env_s3_refs(&env);
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["u", "s3://mybucket/out.zip", "new.txt"],
+        &env_ref,
+    );
+    assert!(ok, "s3 u failed: {}", stderr);
+
+    // Object body must have changed.
+    assert_ne!(
+        server.current_etag(),
+        initial_etag,
+        "server etag didn't advance: {}",
+        stderr
+    );
+
+    // Entry list must include the new file plus every old one.
+    let (ok, stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["ls", "s3://mybucket/out.zip"],
+        &env_ref,
+    );
+    assert!(ok, "post-append ls failed: {}", stderr);
+    let out = String::from_utf8(stdout).unwrap();
+    assert!(
+        out.contains("new.txt"),
+        "listing missing new.txt:\n{}",
+        out
+    );
+    assert!(
+        out.contains("corpus/page_000.bin"),
+        "listing dropped old entry:\n{}",
+        out
+    );
+    assert!(
+        out.contains("corpus/page_019.bin"),
+        "listing dropped last old entry:\n{}",
+        out
+    );
+
+    // And cat on the new entry returns exactly what we wrote.
+    let (ok, stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["cat", "s3://mybucket/out.zip", "new.txt"],
+        &env_ref,
+    );
+    assert!(ok, "post-append cat failed: {}", stderr);
+    assert_eq!(stdout, b"hello from s3 append\n");
+}
+
+#[test]
+fn s3_append_small_archive_single_put_fallback() {
+    // cd_offset below 5 MiB — forces the single-PUT branch. One
+    // small entry is enough: the archive will be well under the
+    // MIN_PART_SIZE threshold.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
+    run_tzip_create(tmp.path(), &["create", "out.zip", "a.txt", "-q"]);
+    let initial_body = fs::read(tmp.path().join("out.zip")).unwrap();
+    assert!(initial_body.len() < 5 * 1024 * 1024);
+
+    let server = serve_mock_s3_mpu("mybucket", "out.zip", initial_body);
+    let initial_etag = server.current_etag();
+    fs::write(tmp.path().join("b.txt"), b"b\n").unwrap();
+    let env = env_s3(&server);
+    let env_ref = env_s3_refs(&env);
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["u", "s3://mybucket/out.zip", "b.txt"],
+        &env_ref,
+    );
+    assert!(ok, "small-archive s3 u failed: {}", stderr);
+    assert!(
+        stderr.contains("single-PUT") || stderr.contains("5 MiB"),
+        "expected stderr to mention the single-PUT fallback: {}",
+        stderr
+    );
+    assert_ne!(server.current_etag(), initial_etag);
+
+    let (ok, stdout, _) = run_tzip(
+        tmp.path(),
+        &["ls", "s3://mybucket/out.zip"],
+        &env_ref,
+    );
+    assert!(ok);
+    let out = String::from_utf8(stdout).unwrap();
+    assert!(out.contains("a.txt"));
+    assert!(out.contains("b.txt"));
+}
+
+#[test]
+fn s3_append_leaves_no_in_progress_mpu_after_success() {
+    // Clean-exit invariant: a successful `tzip u s3://...` must
+    // not leave an in-progress multipart upload dangling.
+    // CompleteMultipartUpload removes the upload from the
+    // server's tracker; Abort does the same on error. Either
+    // way, the "in-progress MPUs" count should return to zero.
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = tmp.path().join("corpus");
+    make_big_corpus(&corpus);
+    run_tzip_create(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "store", "-q"],
+    );
+    let initial_body = fs::read(tmp.path().join("out.zip")).unwrap();
+    let server = serve_mock_s3_mpu("mybucket", "out.zip", initial_body);
+
+    fs::write(tmp.path().join("new.txt"), b"hello\n").unwrap();
+    let env = env_s3(&server);
+    let env_ref = env_s3_refs(&env);
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["u", "s3://mybucket/out.zip", "new.txt"],
+        &env_ref,
+    );
+    assert!(ok, "s3 u failed: {}", stderr);
+    assert_eq!(
+        server.upload_count(),
+        0,
+        "multipart upload tracker not cleaned up after success"
+    );
+}
+
+#[test]
+fn s3_append_rejects_delete_sort_atomic_and_name_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
+    run_tzip_create(tmp.path(), &["create", "out.zip", "a.txt", "-q"]);
+    let initial_body = fs::read(tmp.path().join("out.zip")).unwrap();
+
+    let server = serve_mock_s3_mpu("mybucket", "out.zip", initial_body);
+    let env = env_s3(&server);
+    let env_ref = env_s3_refs(&env);
+
+    // --delete: unsupported in v1.
+    fs::write(tmp.path().join("new.txt"), b"new\n").unwrap();
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["u", "--delete", "a.txt", "s3://mybucket/out.zip", "new.txt"],
+        &env_ref,
+    );
+    assert!(!ok);
+    assert!(
+        stderr.contains("--delete") && stderr.contains("not supported"),
+        "expected --delete rejection: {}",
+        stderr
+    );
+
+    // --sort: unsupported.
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["u", "--sort", "s3://mybucket/out.zip", "new.txt"],
+        &env_ref,
+    );
+    assert!(!ok);
+    assert!(
+        stderr.contains("--sort") && stderr.contains("not supported"),
+        "expected --sort rejection: {}",
+        stderr
+    );
+
+    // Collision with existing entry name.
+    fs::write(tmp.path().join("a.txt"), b"replacement\n").unwrap();
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["u", "s3://mybucket/out.zip", "a.txt"],
+        &env_ref,
+    );
+    assert!(!ok);
+    assert!(
+        stderr.contains("already exists"),
+        "expected collision rejection: {}",
+        stderr
+    );
+}
+
+#[allow(dead_code)]
+fn _touch() -> usize {
+    std::io::empty().read(&mut [0u8; 1]).unwrap_or(0)
+}

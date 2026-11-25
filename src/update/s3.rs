@@ -316,17 +316,15 @@ fn encode_new_tail(
 
     let mut inner = zw.finish()?;
     inner.flush()?;
-    let final_pos = inner.get_mut().stream_position()?;
+    // `ZipWriter::new_at(..., cd_offset)` stamps absolute offsets
+    // on LFH / CDR records assuming the first byte it writes
+    // lands at the *logical* offset `cd_offset` in the final
+    // composed object. On disk we're still writing into a temp
+    // file that starts at position 0, so the tail's length is
+    // whatever the *inner* BufWriter position is now — not the
+    // logical ZipWriter position.
+    let tail_len = inner.get_mut().stream_position()?;
     drop(inner);
-
-    // `ZipWriter::new_at(..., cd_offset)` set the logical cursor
-    // at `cd_offset`, so the tail's on-disk length is
-    // `final_pos - cd_offset`. The temp file's seek position is
-    // at `final_pos - cd_offset` because the underlying File
-    // started at 0.
-    let tail_len = final_pos
-        .checked_sub(cd_offset)
-        .ok_or_else(|| anyhow!("zip writer wound back past cd_offset"))?;
     progress.finish("tail encoded");
     Ok(tail_len)
 }

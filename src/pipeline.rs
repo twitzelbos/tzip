@@ -714,6 +714,22 @@ pub fn run(opts: Options) -> Result<()> {
     let index_terms_globs: std::sync::Arc<Vec<String>> =
         std::sync::Arc::new(opts.index_terms.clone());
     let want_facet = !opts.facet.is_empty();
+    // Phase 5 columnar sidecar: parse the schema up front so a bad
+    // schema fails the create before any bodies get encoded. The
+    // builder reuses the same plaintext-body feed as facets — a body
+    // that's shipped for facet aggregation is also JSON that the
+    // columnar extractor can walk.
+    let (want_columnar, columnar_builder) = match &opts.write_columnar {
+        Some(schema_path) => {
+            let bytes = std::fs::read(schema_path).with_context(|| {
+                format!("read columnar schema {}", schema_path.display())
+            })?;
+            let schema = crate::columnar::ColumnarSchema::parse(&bytes)?;
+            (true, Some(crate::columnar::ColumnarBuilder::new(schema)))
+        }
+        None => (false, None),
+    };
+    let mut columnar_builder = columnar_builder;
     // Auto parallel-block DEFLATE when a single large file dominates the
     // workload. In streaming mode we don't know the count up front, so we
     // gate on the batched total. If unset (streaming), the CPU worker will
@@ -741,10 +757,10 @@ pub fn run(opts: Options) -> Result<()> {
                         .iter()
                         .any(|g| crate::walker::is_excluded(&raw.item.name_in_archive, std::slice::from_ref(g)));
                 // Only ship plaintext up to the main thread when
-                // facet extraction is on AND the name matched the
-                // term-index glob (bodies on this glob are assumed
-                // JSON for facet purposes).
-                let want_facet_body = want_facet && index_terms_match;
+                // facet or columnar extraction is on AND the name
+                // matched the term-index glob (bodies on this glob
+                // are assumed JSON for structured-field purposes).
+                let want_facet_body = (want_facet || want_columnar) && index_terms_match;
                 let entry = encode_one(
                     raw,
                     method,
@@ -828,6 +844,9 @@ pub fn run(opts: Options) -> Result<()> {
                     for fb in &mut facet_builders {
                         fb.add_body(&body);
                     }
+                    if let Some(cb) = columnar_builder.as_mut() {
+                        cb.add_body(&body);
+                    }
                 }
                 zw.write_entry(e)?;
                 progress.inc(plain_size);
@@ -854,6 +873,9 @@ pub fn run(opts: Options) -> Result<()> {
             if let Some(body) = entry.facet_body.take() {
                 for fb in &mut facet_builders {
                     fb.add_body(&body);
+                }
+                if let Some(cb) = columnar_builder.as_mut() {
+                    cb.add_body(&body);
                 }
             }
             zw.write_entry(entry)?;
@@ -897,6 +919,43 @@ pub fn run(opts: Options) -> Result<()> {
             indexed_names.push(name);
         }
         zw.write_entry(e)?;
+    }
+
+    // --write-columnar: emit `.tzip/columnar.v1.parquet` (Phase 5).
+    // Built from the same JSON bodies that fed the facets; shared
+    // plaintext snapshot keeps the extra extraction cost ~zero when
+    // facets are already on. Emitted before the term index so the
+    // name-index MPH covers all sentinels.
+    if let Some(cb) = columnar_builder.take() {
+        if cb.row_count() > 0 {
+            let payload = cb.finish()?;
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&payload);
+            let crc = hasher.finalize();
+            let body_len = payload.len() as u64;
+            let e = crate::zipwriter::EncodedEntry {
+                index: u64::MAX,
+                name: crate::columnar::INDEX_ENTRY_NAME.to_string(),
+                body: payload,
+                uncompressed_size: body_len,
+                crc32: crc,
+                method_on_wire: 0,
+                inner_method: 0,
+                encrypted: false,
+                gp_bit1: false,
+                version_needed: 20,
+                mtime: (0, 0),
+                external_attr: 0o100644u32 << 16,
+                md5_digest: None,
+                sha256_digest: None,
+                index_terms: None,
+                facet_body: None,
+            };
+            if opts.index_names {
+                indexed_names.push(e.name.clone());
+            }
+            zw.write_entry(e)?;
+        }
     }
 
     // --index-terms: emit the `.tzip/terms.v1` entry if we collected

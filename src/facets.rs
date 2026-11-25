@@ -100,6 +100,12 @@ impl FieldPath {
         self.0.last().map(|s| s.as_str()).unwrap_or("")
     }
 
+    /// Iterator over path segments (`.a.b.c` → `["a", "b", "c"]`),
+    /// used by the columnar sidecar's typed path walker.
+    pub fn segments(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|s| s.as_str())
+    }
+
     /// Walk the path through `value`, returning the scalar at the
     /// leaf as owned bytes. Nested non-scalar nodes, missing paths,
     /// or null values return `None` → the builder tallies a

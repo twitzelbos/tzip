@@ -8,6 +8,7 @@
 pub mod aggregate;
 pub mod bench;
 pub mod cli;
+pub mod columnar;
 pub mod compress;
 pub mod crypto;
 pub mod decompress;
@@ -19,6 +20,7 @@ pub mod grep;
 pub mod hash;
 pub mod facets;
 pub mod nameidx;
+pub mod query;
 pub mod termidx;
 pub mod mount;
 pub mod pipeline;

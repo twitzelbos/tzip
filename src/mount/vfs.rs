@@ -960,6 +960,7 @@ impl VirtualFs {
             index_names: false,
             index_terms: Vec::new(),
             facet: Vec::new(),
+            write_columnar: None,
         })
     }
 }

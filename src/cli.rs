@@ -128,6 +128,14 @@ pub enum Cmd {
     /// available facets.
     #[command(alias = "agg")]
     Aggregate(AggregateArgs),
+
+    /// Run a SQL query against an archive's columnar sidecar built
+    /// by `tzip create --write-columnar schema.json`. Dispatches to
+    /// the system `duckdb` CLI with the Parquet entry registered as
+    /// a view named `tzip`. Handles everything Elastic's aggregation
+    /// DSL does (grouping, histograms via date_trunc, percentiles,
+    /// joins) and more. Requires `duckdb` on PATH (brew/apt install).
+    Query(QueryArgs),
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -269,6 +277,17 @@ pub struct CreateArgs {
     /// bucket so totals always equal entry counts.
     #[arg(long, value_name = "PATH")]
     pub facet: Vec<String>,
+
+    /// Build a Parquet columnar sidecar over JSON entries whose name
+    /// matches `--index-terms`. Argument is a path to a JSON schema
+    /// file listing the columns to extract (name / type / jq-style
+    /// path). Stored as `.tzip/columnar.v1.parquet` inside the
+    /// archive. Enables deep SQL aggregations via
+    /// `tzip query --sql "..." archive.zip`, which dispatches to the
+    /// system `duckdb` CLI. See `src/columnar.rs` for the schema
+    /// format.
+    #[arg(long, value_name = "SCHEMA.json")]
+    pub write_columnar: Option<PathBuf>,
 }
 
 // ── Update ─────────────────────────────────────────────────────────────────
@@ -762,6 +781,11 @@ pub struct Options {
     /// becomes a `.tzip/facets.v1/<leaf>` entry. Only JSON entries
     /// matching `index_terms` glob contribute.
     pub facet: Vec<String>,
+    /// Path to a columnar-schema JSON file. When set, the pipeline
+    /// extracts the declared fields from every JSON entry matching
+    /// `index_terms` and emits a `.tzip/columnar.v1.parquet`
+    /// sidecar. `tzip query --sql` queries it via DuckDB.
+    pub write_columnar: Option<PathBuf>,
 }
 
 /// Which reader op is running and what it needs.
@@ -929,6 +953,7 @@ impl CreateArgs {
             index_names: self.index_names,
             index_terms: self.index_terms,
             facet: self.facet,
+            write_columnar: self.write_columnar,
         })
     }
 }
@@ -1008,6 +1033,14 @@ impl UpdateArgs {
             index_names: self.index_names,
             index_terms: self.index_terms,
             facet: self.facet,
+            // Phase 5 columnar sidecar isn't appendable yet — the
+            // rebuild path (triggered by --delete / --replace or
+            // explicit --mode rebuild) would re-emit it, but
+            // append-mode leaves the existing Parquet entry intact.
+            // Expose the flag so rebuild-mode `tzip u` can refresh
+            // the sidecar; append-mode update_pipeline simply ignores
+            // it.
+            write_columnar: None,
         })
     }
 }
@@ -1369,6 +1402,62 @@ impl AggregateArgs {
             json: self.json,
             quiet: self.quiet,
             verbose: self.verbose,
+        })
+    }
+}
+
+// ── Query (SQL via DuckDB) ─────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+pub struct QueryArgs {
+    /// Archive to query. Only local paths for now — DuckDB reads the
+    /// extracted Parquet sidecar from a temp file.
+    pub archive: PathBuf,
+
+    /// SQL to run. The columnar sidecar is registered as a view
+    /// named `tzip`, so `SELECT status, COUNT(*) FROM tzip GROUP BY
+    /// status` is the most common shape. Multiple statements are
+    /// allowed; terminate each with `;`.
+    #[arg(short = 's', long = "sql", value_name = "SQL")]
+    pub sql: String,
+
+    /// Output format. `box` (default): DuckDB's box-drawing tabular
+    /// output. `json`: one JSON record per row. `csv`: CSV with a
+    /// header row.
+    #[arg(long, value_enum, default_value_t = QueryFormatArg::Box)]
+    pub format: QueryFormatArg,
+
+    /// Password for AES-encrypted archives. The sidecar itself is a
+    /// Store entry and typically not encrypted, but the archive's
+    /// EOCD / CDR parse paths still need it on AES-sealed archives.
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub enum QueryFormatArg {
+    Box,
+    Json,
+    Csv,
+}
+
+impl QueryArgs {
+    pub fn into_options(self) -> Result<crate::query::QueryOpts> {
+        let format = match self.format {
+            QueryFormatArg::Box => crate::query::QueryFormat::Box,
+            QueryFormatArg::Json => crate::query::QueryFormat::Json,
+            QueryFormatArg::Csv => crate::query::QueryFormat::Csv,
+        };
+        Ok(crate::query::QueryOpts {
+            archive: self.archive,
+            sql: self.sql,
+            format,
+            password: self.password,
         })
     }
 }

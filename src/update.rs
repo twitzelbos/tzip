@@ -44,6 +44,206 @@ use crate::zipwriter::{EncodedEntry, ZipWriter};
 const UNDO_MAGIC: &[u8; 8] = b"TZIPUNDO";
 const UNDO_VERSION: u32 = 1;
 
+/// Scan `existing` (CDR entries of the archive BEFORE this append)
+/// and determine which `.segN` number to use for the fresh segment
+/// of each index kind. Returns:
+/// - `name_seg` — next segment number for `.tzip/names.v1.segN`
+/// - `term_seg` — next segment number for `.tzip/terms.v1.segN`
+/// - `facet_segs` — next segment number per `--facet` leaf name
+fn next_segment_numbers(
+    existing: &[ReadEntry],
+    facet_specs: &[String],
+) -> (u32, u32, Vec<u32>) {
+    let mut name_max: u32 = 0;
+    let mut term_max: u32 = 0;
+    let mut facet_max: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    for e in existing {
+        let n = &e.name;
+        if n == crate::nameidx::INDEX_ENTRY_NAME {
+            name_max = name_max.max(0);
+        } else if let Some(rest) = n.strip_prefix(".tzip/names.v1.seg") {
+            if let Ok(k) = rest.parse::<u32>() {
+                name_max = name_max.max(k);
+            }
+        } else if n == crate::termidx::INDEX_ENTRY_NAME {
+            term_max = term_max.max(0);
+        } else if let Some(rest) = n.strip_prefix(".tzip/terms.v1.seg") {
+            if let Ok(k) = rest.parse::<u32>() {
+                term_max = term_max.max(k);
+            }
+        } else if let Some(rest) = n.strip_prefix(".tzip/facets.v1/") {
+            let (leaf, seg) = match rest.rsplit_once(".seg") {
+                Some((leaf, num)) => match num.parse::<u32>() {
+                    Ok(k) => (leaf.to_string(), k),
+                    Err(_) => (rest.to_string(), 0),
+                },
+                None => (rest.to_string(), 0),
+            };
+            let entry = facet_max.entry(leaf).or_insert(0);
+            *entry = (*entry).max(seg);
+        }
+    }
+    // Next segment = max + 1, always ≥ 1 so we never collide with
+    // the Phase-1/2/3 unsuffixed base entries.
+    let name_seg = name_max + 1;
+    let term_seg = term_max + 1;
+    let facet_segs: Vec<u32> = facet_specs
+        .iter()
+        .map(|spec| {
+            let short = crate::facets::FieldPath::parse(spec)
+                .map(|p| p.short_name().to_string())
+                .unwrap_or_else(|_| String::new());
+            facet_max.get(&short).copied().unwrap_or(0) + 1
+        })
+        .collect();
+    (name_seg, term_seg, facet_segs)
+}
+
+/// Serialize each index-segment builder in `seg` and write it into
+/// `zw` as a Store entry under the segment-numbered name. Posting
+/// IDs in the name-index payload are absolute CDR positions
+/// (`base_idx + k` for the `k`-th name in `seg.names`), so lookups
+/// against the finished archive resolve to the right entry
+/// regardless of how many segments precede this one.
+fn write_index_segment_entries<W: Write + Seek>(
+    zw: &mut ZipWriter<W>,
+    seg: &mut IndexSegment,
+    opts: &Options,
+    name_seg_n: u32,
+    term_seg_n: u32,
+    facet_seg_ns: &[u32],
+) -> Result<()> {
+    // `seg.names` currently has the K payload-entry names (new
+    // files). They occupy CDR positions `[base_idx, base_idx+K)`.
+    // Sentinel entries emitted below (facet / term / names
+    // themselves) also take CDR positions; we track those via the
+    // running `zw.entry_count()` so their posting IDs are correct
+    // too when `--index-names` is on.
+    let mut named: Vec<(String, u32)> = Vec::with_capacity(seg.names.len() + 1);
+    for (i, name) in seg.names.iter().enumerate() {
+        named.push((name.clone(), seg.base_idx + i as u32));
+    }
+
+    // Facets go first — their payload bytes don't depend on names
+    // so their CDR position comes right after the payload entries.
+    for (fb, seg_n) in seg.facet_builders.drain(..).zip(facet_seg_ns.iter().copied()) {
+        let field = fb.field_name().to_string();
+        let payload = fb.finish()?;
+        if payload.is_empty() {
+            continue;
+        }
+        let name = format!(
+            "{}.seg{}",
+            crate::facets::entry_name_for(&field),
+            seg_n
+        );
+        let pos = zw.entry_count() as u32;
+        emit_sentinel_entry(zw, &name, payload)?;
+        if opts.index_names {
+            named.push((name, pos));
+        }
+    }
+    if let Some(tb) = seg.term_builder.take() {
+        let payload = tb.finish()?;
+        if !payload.is_empty() {
+            let name = format!("{}.seg{}", crate::termidx::INDEX_ENTRY_NAME, term_seg_n);
+            let pos = zw.entry_count() as u32;
+            emit_sentinel_entry(zw, &name, payload)?;
+            if opts.index_names {
+                named.push((name, pos));
+            }
+        }
+    }
+    if opts.index_names && !named.is_empty() {
+        let pairs: Vec<(&str, u32)> =
+            named.iter().map(|(n, p)| (n.as_str(), *p)).collect();
+        let payload = crate::nameidx::build_with_positions(&pairs)?;
+        let name = format!("{}.seg{}", crate::nameidx::INDEX_ENTRY_NAME, name_seg_n);
+        emit_sentinel_entry(zw, &name, payload)?;
+    }
+    Ok(())
+}
+
+/// Write one Store-method sentinel entry (`.tzip/*`) via `zw`.
+fn emit_sentinel_entry<W: Write + Seek>(
+    zw: &mut ZipWriter<W>,
+    name: &str,
+    body: Vec<u8>,
+) -> Result<()> {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&body);
+    let crc = hasher.finalize();
+    let body_len = body.len() as u64;
+    let e = crate::zipwriter::EncodedEntry {
+        index: u64::MAX,
+        name: name.to_string(),
+        body,
+        uncompressed_size: body_len,
+        crc32: crc,
+        method_on_wire: 0,
+        inner_method: 0,
+        encrypted: false,
+        gp_bit1: false,
+        version_needed: 20,
+        mtime: (0, 0),
+        external_attr: 0o100644u32 << 16,
+        md5_digest: None,
+        sha256_digest: None,
+        index_terms: None,
+        facet_body: None,
+    };
+    zw.write_entry(e)
+}
+
+/// Per-invocation index-building state for `tzip u` indexing flags.
+/// Passed through `encode_items_into_writer`; the caller decides
+/// which segment number the resulting payloads land as.
+struct IndexSegment {
+    /// First absolute CDR position this segment covers — the writer
+    /// position just before the encoder pass starts emitting new
+    /// entries. Posting IDs in the finished segment are offsets
+    /// from this base.
+    base_idx: u32,
+    /// Running count of entries added via this segment pass.
+    local_count: u32,
+    /// Entry names collected as they land, in CDR order. Fed into a
+    /// `NameIndex` if `--index-names` was set.
+    names: Vec<String>,
+    /// Term builder (empty / unused when `--index-terms` wasn't set).
+    term_builder: Option<crate::termidx::TermIndexBuilder>,
+    /// One builder per `--facet` path.
+    facet_builders: Vec<crate::facets::FacetBuilder>,
+    /// Pre-compiled `--index-terms` globs, matched per-entry to
+    /// decide whether to tokenize.
+    index_terms_globs: Arc<Vec<String>>,
+}
+
+impl IndexSegment {
+    fn new(opts: &Options, base_idx: u32) -> Result<Self> {
+        Ok(Self {
+            base_idx,
+            local_count: 0,
+            names: Vec::new(),
+            term_builder: if opts.index_terms.is_empty() {
+                None
+            } else {
+                Some(crate::termidx::TermIndexBuilder::new())
+            },
+            facet_builders: opts
+                .facet
+                .iter()
+                .map(|s| crate::facets::FacetBuilder::new(s))
+                .collect::<Result<_>>()?,
+            index_terms_globs: Arc::new(opts.index_terms.clone()),
+        })
+    }
+
+    fn want_facet(&self) -> bool {
+        !self.facet_builders.is_empty()
+    }
+}
+
 pub fn run_update(mut opts: Options) -> Result<()> {
     // Recover from a prior interrupted append-mode update, if any.
     attempt_recover_undo(&opts.archive)?;
@@ -250,7 +450,10 @@ fn run_update_append(
     }
 
     // 4. Run the reader/CPU pool on the new items; writes land at the end
-    //    of the appended region.
+    //    of the appended region. Also construct a Phase-4 index segment
+    //    so new entries' names / terms / facets flow into fresh
+    //    `.segN` sentinels at the base of CDR position
+    //    = existing count (which records_existing has already placed).
     let total_new_bytes: u64 = new_items.iter().map(|i| i.size).sum();
     let total_new_files = new_items.len() as u64;
     let progress = Arc::new(Progress::new(
@@ -258,13 +461,39 @@ fn run_update_append(
         total_new_files,
         opts.quiet || opts.tui,
     ));
-    let result = encode_items_into_writer(opts, new_items, &mut zw, &progress);
+    let base_idx = existing.len() as u32;
+    let want_any_segment =
+        opts.index_names || !opts.index_terms.is_empty() || !opts.facet.is_empty();
+    let mut seg = if want_any_segment {
+        Some(IndexSegment::new(opts, base_idx)?)
+    } else {
+        None
+    };
+    let result =
+        encode_items_into_writer(opts, new_items, &mut zw, &progress, seg.as_mut());
 
     if let Err(e) = result {
         // Try to restore via undo. If restore fails, leave the undo file in
         // place so the next tzip -u can retry.
         let _ = restore_from_undo(&opts.archive, &undo_path);
         return Err(e.context("append-mode update failed"));
+    }
+
+    // 4b. Emit Phase-4 index segments for the newly added entries.
+    //     Segment number = (max existing segment of this kind) + 1;
+    //     1 if no existing segment, so segments never collide with
+    //     the Phase-1/2/3 unsuffixed base entries.
+    if let Some(mut s) = seg.take() {
+        let (name_seg_n, term_seg_n, facet_seg_ns) =
+            next_segment_numbers(&existing, &opts.facet);
+        write_index_segment_entries(
+            &mut zw,
+            &mut s,
+            opts,
+            name_seg_n,
+            term_seg_n,
+            &facet_seg_ns,
+        )?;
     }
 
     // 5. Finish + fsync + delete undo. Order matters — we must know the
@@ -397,7 +626,14 @@ fn run_update_rebuild(
                 progress.set_msg(format!("carried {}", re.name));
             }
             // Phase 2: parallel encode of new items.
-            encode_items_into_writer(opts, new_items, &mut zw, &progress)?;
+            // Rebuild mode writes a fresh archive so indices here
+            // land as the Phase-1/2/3 unsuffixed base entries (via
+            // the create-mode pipeline). For now we don't
+            // re-emit indices during rebuild — users that want that
+            // should re-run `tzip create ... --index-names ...` on
+            // the output. Phase 4's segmented path only covers
+            // append mode.
+            encode_items_into_writer(opts, new_items, &mut zw, &progress, None)?;
         }
 
         let mut inner = zw.finish()?;
@@ -463,6 +699,7 @@ fn encode_items_into_writer<W: Write + Seek>(
     items: Vec<WorkItem>,
     zw: &mut ZipWriter<W>,
     progress: &Arc<Progress>,
+    index_seg: Option<&mut IndexSegment>,
 ) -> Result<()> {
     if items.is_empty() {
         return Ok(());
@@ -519,6 +756,18 @@ fn encode_items_into_writer<W: Write + Seek>(
     let password = opts.password.clone();
     let want_md5 = opts.write_md5;
     let want_sha256 = opts.write_sha256;
+    // Workers inspect this to decide whether to tokenize (for the
+    // term segment) and whether to ship plaintext (for facet
+    // builders). Both default off when the caller didn't supply an
+    // `IndexSegment`.
+    let index_globs_for_workers: Arc<Vec<String>> = match &index_seg {
+        Some(seg) => Arc::clone(&seg.index_terms_globs),
+        None => Arc::new(Vec::new()),
+    };
+    let want_facet_for_workers = index_seg
+        .as_ref()
+        .map(|s| s.want_facet())
+        .unwrap_or(false);
     let single_file_parallel = matches!(method, Method::Deflate)
         && total_files == 1
         && total_bytes >= compress::PARALLEL_DEFLATE_THRESHOLD;
@@ -528,9 +777,15 @@ fn encode_items_into_writer<W: Write + Seek>(
         let raw_rx = raw_rx.clone();
         let enc_tx = enc_tx.clone();
         let password = password.clone();
+        let index_globs = Arc::clone(&index_globs_for_workers);
         cpu_handles.push(thread::spawn(move || -> Result<()> {
             let mut scratch = Scratch::new();
             while let Ok(raw) = raw_rx.recv() {
+                let index_terms_match = !index_globs.is_empty()
+                    && index_globs
+                        .iter()
+                        .any(|g| walker::is_excluded(&raw.item.name_in_archive, std::slice::from_ref(g)));
+                let want_facet_body = want_facet_for_workers && index_terms_match;
                 let entry = pipeline::encode_item(
                     raw,
                     method,
@@ -540,8 +795,8 @@ fn encode_items_into_writer<W: Write + Seek>(
                     single_file_parallel,
                     want_md5,
                     want_sha256,
-                    false, // update mode doesn't index terms (see Phase 4)
-                    false, // facets likewise deferred to Phase 4
+                    index_terms_match,
+                    want_facet_body,
                 )?;
                 if enc_tx.send(entry).is_err() {
                     break;
@@ -554,14 +809,30 @@ fn encode_items_into_writer<W: Write + Seek>(
     drop(enc_tx);
 
     let mut wrote = 0u64;
-    while let Ok(entry) = enc_rx.recv() {
+    // Reborrow so the closure doesn't move `index_seg`.
+    let mut seg = index_seg;
+    while let Ok(mut entry) = enc_rx.recv() {
         wrote += 1;
         let plain = entry.uncompressed_size;
-        // Build the strings that borrow `entry.name` BEFORE handing
-        // ownership to `write_entry` — avoids a `name.clone()` per entry.
         let msg = format!("{}/{} — {}", wrote, total_files, entry.name);
         if opts.verbose {
             eprintln!("added {}", entry.name);
+        }
+        // Drain index-segment payloads BEFORE `write_entry` consumes
+        // `entry`. Posting IDs are absolute CDR positions
+        // (`base_idx + local_count`).
+        if let Some(s) = seg.as_deref_mut() {
+            let abs_pos = s.base_idx + s.local_count;
+            s.names.push(entry.name.clone());
+            if let (Some(tokens), Some(tb)) = (entry.index_terms.take(), s.term_builder.as_mut()) {
+                tb.add_prepared(abs_pos, tokens);
+            }
+            if let Some(body) = entry.facet_body.take() {
+                for fb in &mut s.facet_builders {
+                    fb.add_body(&body);
+                }
+            }
+            s.local_count += 1;
         }
         zw.write_entry(entry)?;
         progress.inc(plain);

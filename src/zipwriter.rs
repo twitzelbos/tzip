@@ -141,6 +141,14 @@ impl<W: Write + Seek> ZipWriter<W> {
     ///   the LFH + body are untouched on disk.
     /// - `carry_existing_entry`: internally, after writing the LFH+body
     ///   at `self.pos`, pass the pre-write offset.
+    /// How many entries have been recorded (via `record_existing` or
+    /// written via `write_entry`) so far. Used by `tzip u`'s
+    /// Phase-4 index-segment writer so a sentinel entry's CDR
+    /// position is known at emit time for the name-index MPH.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     pub fn record_existing(&mut self, re: &ReadEntry, lfh_offset: u64) {
         self.entries.push(CentralEntry {
             name: re.name_bytes.clone(),

@@ -67,10 +67,20 @@ pub struct Archive {
     name_segments: Vec<crate::nameidx::NameIndex>,
     /// Term-index segments. `tzip grep` queries union the posting
     /// lists from every segment before narrowing candidates.
+    /// Loaded lazily on first `term_candidates` / `term_coverage`
+    /// call — see `term_segments_loaded`; ChatGPT review #5.
     term_segments: Vec<crate::termidx::TermIndex>,
+    /// `true` once `try_load_term_segments` has run. Guards the
+    /// lazy populate so we don't re-scan the CDR + source every
+    /// call. Stays `false` on archives that never run grep.
+    term_segments_loaded: bool,
     /// Per-field facet segments. Each field maps to one or more
     /// `Facet` instances; `facet()` merges counts across them.
+    /// Loaded lazily — ChatGPT review #5. Only `tzip aggregate`
+    /// touches facets, so eager loading was dead I/O for every
+    /// other op (which was most of them).
     facet_segments: std::collections::HashMap<String, Vec<crate::facets::Facet>>,
+    facet_segments_loaded: bool,
     /// Phase 6 index cache binding. Set via `attach_cache`.
     /// `None` on local archives (no payoff — body-reads are already
     /// a local file-seek) and on remote archives opened without an
@@ -84,6 +94,24 @@ pub struct Archive {
 struct CacheCtx {
     cache: std::sync::Arc<crate::indexcache::IndexCache>,
     archive_id: crate::indexcache::ArchiveId,
+}
+
+/// Was a CDR entry covered by the term index when it was built?
+/// Used by `tzip grep` to decide whether the candidate set from
+/// `term_candidates` is authoritative for that entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermCoverage {
+    /// At least one segment recorded this entry in its coverage
+    /// trailer. Grep can trust the candidate set — if `idx` isn't
+    /// in it, the entry can't match a literal query.
+    Covered,
+    /// Every segment with a trailer explicitly excluded this
+    /// entry (e.g. `.log` in a corpus built with `--index-terms
+    /// '*.json'`). Grep must scan it linearly.
+    NotCovered,
+    /// Legacy segment without a trailer (pre-fix format) OR no
+    /// term index at all. Grep must scan conservatively.
+    Unknown,
 }
 
 impl Archive {
@@ -268,12 +296,16 @@ impl Archive {
             disk_count: 1,
             name_segments: Vec::new(),
             term_segments: Vec::new(),
+            term_segments_loaded: false,
             facet_segments: std::collections::HashMap::new(),
+            facet_segments_loaded: false,
             cache_ctx: cache_binding.map(|(cache, archive_id)| CacheCtx { cache, archive_id }),
         };
         arch.try_load_name_segments();
-        arch.try_load_term_segments();
-        arch.try_load_facet_segments();
+        // term + facet segments load lazily on first access —
+        // ChatGPT review #5. Most ops (`ls`, `x`, `cat`, `query`)
+        // never touch them; eager loading was pure dead I/O on
+        // remote archives.
         Ok(arch)
     }
 
@@ -373,12 +405,14 @@ impl Archive {
             disk_count,
             name_segments: Vec::new(),
             term_segments: Vec::new(),
+            term_segments_loaded: false,
             facet_segments: std::collections::HashMap::new(),
+            facet_segments_loaded: false,
             cache_ctx: None,
         };
         arch.try_load_name_segments();
-        arch.try_load_term_segments();
-        arch.try_load_facet_segments();
+        // See primary `open_source_with_cache` for why term + facet
+        // are not eagerly loaded here either.
         Ok(arch)
     }
 
@@ -573,8 +607,27 @@ impl Archive {
         }
     }
 
+    /// Lazy-load the facet segments if they haven't been yet. Idempotent.
+    /// Callers that need facets go through this (directly or via `facet*`);
+    /// callers that don't pay nothing at open time. ChatGPT review #5.
+    fn ensure_facet_segments(&mut self) {
+        if !self.facet_segments_loaded {
+            self.try_load_facet_segments();
+            self.facet_segments_loaded = true;
+        }
+    }
+
+    /// Lazy-load the term segments if they haven't been yet. Idempotent.
+    fn ensure_term_segments(&mut self) {
+        if !self.term_segments_loaded {
+            self.try_load_term_segments();
+            self.term_segments_loaded = true;
+        }
+    }
+
     /// Available facet field names (leaves), alphabetic order.
-    pub fn facet_fields(&self) -> Vec<String> {
+    pub fn facet_fields(&mut self) -> Vec<String> {
+        self.ensure_facet_segments();
         let mut names: Vec<String> = self.facet_segments.keys().cloned().collect();
         names.sort();
         names
@@ -584,7 +637,8 @@ impl Archive {
     /// every segment this archive carries. `None` if no segment has
     /// the field. Appendable-safe: `tzip u` can write additional
     /// `.segN` entries and they fold into the returned total.
-    pub fn facet(&self, field: &str) -> Option<crate::facets::Facet> {
+    pub fn facet(&mut self, field: &str) -> Option<crate::facets::Facet> {
+        self.ensure_facet_segments();
         let segs = self.facet_segments.get(field)?;
         if segs.is_empty() {
             return None;
@@ -611,7 +665,11 @@ impl Archive {
     /// - `Some(None)` when every segment said the query has no
     ///   usable tokens — caller should fall through to full scan.
     /// - `None` when the archive has no term index at all.
-    pub fn term_candidates(&self, query: &str) -> Option<Option<std::collections::HashSet<u32>>> {
+    pub fn term_candidates(
+        &mut self,
+        query: &str,
+    ) -> Option<Option<std::collections::HashSet<u32>>> {
+        self.ensure_term_segments();
         if self.term_segments.is_empty() {
             return None;
         }
@@ -634,6 +692,47 @@ impl Archive {
             }
         }
         Some(if any_usable { Some(merged) } else { None })
+    }
+
+    /// Does the term index actually cover CDR entry `idx`? Phase-2
+    /// indices only ingested bodies matching `--index-terms` at
+    /// create time, so a `.log` entry in a corpus built with
+    /// `--index-terms '*.json'` is never mentioned in any posting
+    /// list — but it still exists in the archive and must be
+    /// scanned for literal matches. `term_candidates` alone would
+    /// silently exclude it.
+    ///
+    /// Returns:
+    ///
+    /// - `Coverage::Covered` when at least one term segment
+    ///   recorded `idx` in its coverage trailer.
+    /// - `Coverage::NotCovered` when every segment that carried a
+    ///   trailer explicitly excluded `idx` (and no segment was
+    ///   legacy).
+    /// - `Coverage::Unknown` when any segment predates the
+    ///   trailer, or when the archive has no term index at all —
+    ///   the caller must scan `idx` conservatively.
+    pub fn term_coverage(&mut self, idx: u32) -> TermCoverage {
+        self.ensure_term_segments();
+        if self.term_segments.is_empty() {
+            return TermCoverage::Unknown;
+        }
+        let mut any_covered = false;
+        let mut any_legacy = false;
+        for seg in &self.term_segments {
+            match seg.covers(idx) {
+                Some(true) => any_covered = true,
+                Some(false) => {}
+                None => any_legacy = true,
+            }
+        }
+        if any_covered {
+            TermCoverage::Covered
+        } else if any_legacy {
+            TermCoverage::Unknown
+        } else {
+            TermCoverage::NotCovered
+        }
     }
 
     pub fn disk_count(&self) -> usize {

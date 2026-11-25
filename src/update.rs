@@ -150,7 +150,7 @@ fn write_index_segment_entries<W: Write + Seek>(
             seg_n
         );
         let pos = zw.entry_count() as u32;
-        emit_sentinel_entry(zw, &name, payload)?;
+        crate::sentinel::emit(zw, opts, &name, payload)?;
         if opts.index_names {
             named.push((name, pos));
         }
@@ -166,7 +166,7 @@ fn write_index_segment_entries<W: Write + Seek>(
                     columnar_seg_n
                 );
                 let pos = zw.entry_count() as u32;
-                emit_sentinel_entry(zw, &name, payload)?;
+                crate::sentinel::emit(zw, opts, &name, payload)?;
                 if opts.index_names {
                     named.push((name, pos));
                 }
@@ -178,7 +178,7 @@ fn write_index_segment_entries<W: Write + Seek>(
         if !payload.is_empty() {
             let name = format!("{}.seg{}", crate::termidx::INDEX_ENTRY_NAME, term_seg_n);
             let pos = zw.entry_count() as u32;
-            emit_sentinel_entry(zw, &name, payload)?;
+            crate::sentinel::emit(zw, opts, &name, payload)?;
             if opts.index_names {
                 named.push((name, pos));
             }
@@ -189,7 +189,7 @@ fn write_index_segment_entries<W: Write + Seek>(
             named.iter().map(|(n, p)| (n.as_str(), *p)).collect();
         let payload = crate::nameidx::build_with_positions(&pairs)?;
         let name = format!("{}.seg{}", crate::nameidx::INDEX_ENTRY_NAME, name_seg_n);
-        emit_sentinel_entry(zw, &name, payload)?;
+        crate::sentinel::emit(zw, opts, &name, payload)?;
     }
     Ok(())
 }
@@ -227,37 +227,6 @@ fn resolve_columnar_schema_for_update(
         )
     })?;
     Ok(Some(crate::columnar::ColumnarSchema::from_parquet_bytes(&base)?))
-}
-
-/// Write one Store-method sentinel entry (`.tzip/*`) via `zw`.
-fn emit_sentinel_entry<W: Write + Seek>(
-    zw: &mut ZipWriter<W>,
-    name: &str,
-    body: Vec<u8>,
-) -> Result<()> {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&body);
-    let crc = hasher.finalize();
-    let body_len = body.len() as u64;
-    let e = crate::zipwriter::EncodedEntry {
-        index: u64::MAX,
-        name: name.to_string(),
-        body,
-        uncompressed_size: body_len,
-        crc32: crc,
-        method_on_wire: 0,
-        inner_method: 0,
-        encrypted: false,
-        gp_bit1: false,
-        version_needed: 20,
-        mtime: (0, 0),
-        external_attr: 0o100644u32 << 16,
-        md5_digest: None,
-        sha256_digest: None,
-        index_terms: None,
-        facet_body: None,
-    };
-    zw.write_entry(e)
 }
 
 /// Per-invocation index-building state for `tzip u` indexing flags.
@@ -598,9 +567,47 @@ fn run_update_append(
 fn run_update_rebuild(
     opts: &Options,
     mut arch: Archive,
-    kept: Vec<ReadEntry>,
+    mut kept: Vec<ReadEntry>,
     new_items: Vec<WorkItem>,
 ) -> Result<()> {
+    // ChatGPT review #6: stale `.tzip/*` sentinels carried from the
+    // source archive reference entries by their CDR index. After a
+    // rebuild (replace / delete / --atomic / --sort) the final CDR
+    // layout differs, so those indices point at the wrong rows —
+    // false positives, false negatives, and `nameidx::lookup`
+    // returning offsets inside unrelated entries. Strip them.
+    //
+    // We re-emit `.tzip/names.v1` from the final (kept + new) name
+    // set since that is cheap (just filenames). For term / facet /
+    // columnar indices the only correct source is re-tokenising the
+    // kept entries' plaintext bodies, which costs full decompression
+    // (and decrypt, for AES archives) — bigger than a bug fix should
+    // reach. Users who need those indices after a rebuild should
+    // re-run `tzip create ... --index-terms ... --facet ...` or
+    // append-only updates (which keep segmented indices coherent).
+    let mut dropped_stale_names = false;
+    let mut dropped_stale_other = false;
+    kept.retain(|e| {
+        if !e.name.starts_with(".tzip/") {
+            return true;
+        }
+        if e.name == crate::nameidx::INDEX_ENTRY_NAME
+            || e.name.starts_with(".tzip/names.v1.seg")
+        {
+            dropped_stale_names = true;
+        } else {
+            dropped_stale_other = true;
+        }
+        false
+    });
+    let want_regen_names = dropped_stale_names || opts.index_names;
+    if dropped_stale_other && !opts.quiet {
+        eprintln!(
+            "tzip: rebuild dropped stale .tzip/* indices (term / facet / columnar). \
+             Re-run `tzip create --index-terms / --facet / --write-columnar` to \
+             regenerate them."
+        );
+    }
     let pid = std::process::id();
     let tmp_name = format!(
         "{}.tzip-tmp-{}",
@@ -710,14 +717,29 @@ fn run_update_rebuild(
                 progress.set_msg(format!("carried {}", display_name));
             }
             // Phase 2: parallel encode of new items.
-            // Rebuild mode writes a fresh archive so indices here
-            // land as the Phase-1/2/3 unsuffixed base entries (via
-            // the create-mode pipeline). For now we don't
-            // re-emit indices during rebuild — users that want that
-            // should re-run `tzip create ... --index-names ...` on
-            // the output. Phase 4's segmented path only covers
-            // append mode.
             encode_items_into_writer(opts, new_items, &mut zw, &progress, None)?;
+        }
+
+        // ChatGPT review #6: if the source had `.tzip/names.v1`
+        // (or the user explicitly asked for it this run), emit a
+        // fresh one covering the final kept + new name set. Term /
+        // facet / columnar indices were dropped earlier — they
+        // need re-tokenisation of plaintext bodies to rebuild
+        // correctly, which costs full decompression of kept
+        // entries; left for a dedicated `tzip reindex` pass.
+        if want_regen_names {
+            let names = zw.entry_names();
+            if !names.is_empty() {
+                let payload = crate::nameidx::build(
+                    &names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )?;
+                crate::sentinel::emit(
+                    &mut zw,
+                    opts,
+                    crate::nameidx::INDEX_ENTRY_NAME,
+                    payload,
+                )?;
+            }
         }
 
         let mut inner = zw.finish()?;
@@ -915,7 +937,7 @@ fn encode_items_into_writer<W: Write + Seek>(
                     fb.add_body(&body);
                 }
                 if let Some(cb) = s.columnar_builder.as_mut() {
-                    cb.add_body(&body);
+                    cb.add_body(&body)?;
                 }
             }
             s.local_count += 1;

@@ -43,6 +43,8 @@ pub mod zipformat;
 pub mod zipreader;
 #[path = "zip/zipwriter.rs"]
 pub mod zipwriter;
+#[path = "zip/sentinel.rs"]
+pub mod sentinel;
 
 // ── Index features (`src/index/`) ─────────────────────────────────────────
 #[path = "index/aggregate.rs"]

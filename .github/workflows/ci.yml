@@ -11,8 +11,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Architectural lint: narrow interfaces + no module cycles +
+  # bounded directory sizes. Keeps the structural gains from PR
+  # #62 (the big deslop refactor) from drifting back as the
+  # codebase grows. Pinned to a crates.io version so CI stays
+  # deterministic. Runs once on the cheapest runner and gates the
+  # per-OS test matrix — the module graph is platform-agnostic, so
+  # doubling this across OSes just doubled the CI cost.
+  deslop:
+    name: deslop-please
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # `rust-analyzer` is the backend deslop-please uses to
+          # index the crate's module graph + fields. It ships as an
+          # optional rustup component, not a separate binary.
+          components: rust-analyzer
+      - uses: Swatinem/rust-cache@v2
+      - name: Install deslop-please
+        run: cargo install --locked deslop-please@0.1.4
+      - name: Run deslop-please
+        run: deslop-please
+
   test:
     name: test (${{ matrix.os }})
+    needs: deslop
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -22,11 +47,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          # `rust-analyzer` is the backend deslop-please uses to
-          # index the crate's module graph + fields. It ships as an
-          # optional rustup component, not a separate binary.
-          components: rust-analyzer
 
       - uses: Swatinem/rust-cache@v2
 
@@ -71,15 +91,3 @@ jobs:
 
       - name: cargo test
         run: cargo test --verbose
-
-      # Architectural lint: narrow interfaces + no module cycles +
-      # bounded directory sizes. Keeps the structural gains from PR
-      # #62 (the big deslop refactor) from drifting back as the
-      # codebase grows. Pinned to a crates.io version so CI stays
-      # deterministic; runs on both OSes because `--target` /
-      # `#[cfg]`-gated modules differ between macOS and Linux and
-      # the lint re-indexes per configuration.
-      - name: Install deslop-please
-        run: cargo install --locked deslop-please@0.1.4
-      - name: Run deslop-please
-        run: deslop-please

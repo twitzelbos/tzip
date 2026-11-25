@@ -407,6 +407,81 @@ fn write_fake_undo_matching_archive(archive: &Path, undo: &Path) {
     fs::write(undo, &u).unwrap();
 }
 
+#[test]
+fn rebuild_drops_stale_indices_and_regenerates_names() {
+    // ChatGPT review #6: before the fix, replace/delete rebuilds
+    // byte-copied the stale `.tzip/*` sentinels from the source.
+    // Those sentinels indexed entries by CDR position, so the
+    // rebuilt archive had an index pointing at the wrong rows
+    // (and, for `.tzip/names.v1`, a lookup table whose string
+    // values decoded into the middle of a different entry's LFH).
+    //
+    // After the fix every `.tzip/*` is stripped at rebuild time;
+    // `.tzip/names.v1` is regenerated automatically over the final
+    // kept + new entry list. Term / facet / columnar sidecars are
+    // dropped with a stderr note (not re-emitted; would require
+    // re-tokenising kept bodies).
+    let tmp = tempfile::tempdir().unwrap();
+    for n in ["a.json", "b.json", "c.json"] {
+        fs::write(
+            tmp.path().join(n),
+            format!("{{\"name\":\"{}\",\"val\":1}}\n", n).as_bytes(),
+        )
+        .unwrap();
+    }
+    run_tzip(
+        tmp.path(),
+        &[
+            "create",
+            "out.zip",
+            "a.json",
+            "b.json",
+            "c.json",
+            "--index-names",
+            "--index-terms",
+            "*.json",
+            "-q",
+        ],
+    );
+    let before = entry_names(&tmp.path().join("out.zip"));
+    assert!(before.iter().any(|n| n == ".tzip/names.v1"));
+    assert!(before.iter().any(|n| n == ".tzip/terms.v1"));
+
+    // --delete forces rebuild mode. The rebuilt archive must not
+    // carry the old terms sentinel (its positions now reference
+    // the wrong rows) and must carry a *fresh* names sentinel.
+    run_tzip(tmp.path(), &["u", "--delete", "b.json", "out.zip"]);
+
+    let after = entry_names(&tmp.path().join("out.zip"));
+    assert!(
+        !after.iter().any(|n| n == ".tzip/terms.v1"),
+        "rebuild left a stale .tzip/terms.v1 behind: {:?}",
+        after
+    );
+    assert!(
+        after.iter().any(|n| n == ".tzip/names.v1"),
+        "rebuild failed to regenerate .tzip/names.v1: {:?}",
+        after
+    );
+    assert!(after.iter().any(|n| n == "a.json"));
+    assert!(after.iter().any(|n| n == "c.json"));
+    assert!(!after.iter().any(|n| n == "b.json"));
+
+    // And the regenerated name index actually resolves to the
+    // final entries (not an off-by-one into a different LFH):
+    // tzip's own `ls` uses the index to find entries.
+    let ls = Command::new(tzip_bin())
+        .current_dir(tmp.path())
+        .args(["ls", "out.zip"])
+        .output()
+        .expect("run tzip ls");
+    assert!(ls.status.success(), "tzip ls failed after rebuild");
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(listing.contains("a.json"));
+    assert!(listing.contains("c.json"));
+    assert!(!listing.contains("b.json"));
+}
+
 /// Minimal EOCD scan: returns (cd_offset, entry_count) from the last 64 KiB
 /// of the archive. Does not handle ZIP64 — fine for the small test archives
 /// we produce.

@@ -24,6 +24,22 @@
 //! query interactively). Pass `--json` to get one JSON record per
 //! row, suitable for piping into jq. Pass `--csv` for CSV with a
 //! header row.
+//!
+//! ## Known limit (ChatGPT review #4): whole-sidecar download
+//!
+//! Each shard's full `.tzip/columnar.v1.parquet` body is extracted
+//! to a temp file before DuckDB starts, even when the query's
+//! predicate would only touch a few row groups. For a 500 MB
+//! sidecar behind `SELECT * ... WHERE day = '2026-11-24'`, that's
+//! ~495 MB of avoidable network I/O on the first run (the Phase 6
+//! index cache makes subsequent runs free). A proper fix is
+//! sketched in `docs/ROADMAP.md`:
+//!   1. Range-read the Parquet footer (last ~1 MB) only.
+//!   2. Parse row-group statistics.
+//!   3. Fetch only the row groups whose min/max intersects the
+//!      predicate.
+//! This needs a Parquet-aware range reader on top of the
+//! `sources::` backends — nontrivial — and is tracked separately.
 
 use anyhow::{bail, Context, Result};
 use std::io::Write;

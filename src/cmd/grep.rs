@@ -140,20 +140,51 @@ fn process_archive(
 
     // Collect candidate indices first so we can mutably probe LFH sizes
     // without holding an immutable borrow of the driver.
-    let candidates: Vec<usize> = (0..driver.len())
-        .filter(|&idx| {
-            let re = driver.entry(idx);
-            if !entry_passes_filters(re, &opts) || url_skip.contains(re.name.as_str()) {
-                return false;
+    //
+    // Term-index narrowing (ChatGPT review #1 fix): when the index
+    // reports `idx` isn't in the candidate set, we only skip the
+    // entry if the index actually *covered* it at build time.
+    // Entries outside the Phase-2 `--index-terms` glob (e.g. `.log`
+    // in a `--index-terms '*.json'` corpus) are `TermCoverage::NotCovered`
+    // and must be scanned conservatively — otherwise literal
+    // matches in those entries disappear. Legacy archives
+    // (`TermCoverage::Unknown`) likewise get scanned.
+    // Two passes: first prefilter immutably on name / globs /
+    // term-index membership, then — for the suspect "not in
+    // candidate set" survivors only — take a mutable borrow to
+    // ask `term_coverage` whether the index actually saw them.
+    // Splitting the borrows lets `term_candidates` and
+    // `term_coverage` stay `&mut self` (they lazy-load the
+    // segments on first call; ChatGPT review #5) without
+    // forcing a `filter` closure to hold two borrows at once.
+    let mut maybe_candidates: Vec<usize> = Vec::new();
+    for idx in 0..driver.len() {
+        let re = driver.entry(idx);
+        if !entry_passes_filters(re, &opts) || url_skip.contains(re.name.as_str()) {
+            continue;
+        }
+        maybe_candidates.push(idx);
+    }
+    let candidates: Vec<usize> = if let Some(ref set) = term_candidates {
+        let mut kept = Vec::with_capacity(maybe_candidates.len());
+        for idx in maybe_candidates {
+            if set.contains(&(idx as u32)) {
+                kept.push(idx);
+                continue;
             }
-            if let Some(ref set) = term_candidates {
-                if !set.contains(&(idx as u32)) {
-                    return false;
-                }
+            // Candidate set says "not a match." Only trust that
+            // when the index actually covered this entry;
+            // otherwise fall through to scan.
+            match driver.term_coverage(idx as u32) {
+                crate::zipreader::TermCoverage::Covered => {}
+                crate::zipreader::TermCoverage::NotCovered
+                | crate::zipreader::TermCoverage::Unknown => kept.push(idx),
             }
-            true
-        })
-        .collect();
+        }
+        kept
+    } else {
+        maybe_candidates
+    };
     let mut filtered: Vec<ReadEntry> = Vec::with_capacity(candidates.len());
     for idx in candidates {
         let name = driver.entry(idx).name.clone();
@@ -502,6 +533,17 @@ fn is_plain_literal(pattern: &str) -> bool {
 }
 
 fn entry_passes_filters(re: &ReadEntry, opts: &GrepOptions) -> bool {
+    // Skip tzip's own index sentinel entries — they're machine-
+    // generated metadata (name MPH, term postings, facet counters,
+    // Parquet sidecar), not user data. Grep matching inside
+    // `.tzip/terms.v1` would surface every indexed token as a
+    // false hit. Users who legitimately want to grep inside them
+    // can pass an explicit `--include '.tzip/*'`.
+    if re.name.starts_with(".tzip/")
+        && !opts.include.iter().any(|g| g.starts_with(".tzip/"))
+    {
+        return false;
+    }
     if !opts.include.is_empty() && !opts.include.iter().any(|g| glob_match(g, &re.name)) {
         return false;
     }

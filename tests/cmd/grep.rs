@@ -633,6 +633,56 @@ fn grep_200_entries_plain_archive_does_not_hang() {
     );
 }
 
+/// Regression test for ChatGPT review finding #1: when an archive
+/// is built with `--index-terms '*.json'` and the corpus has both
+/// `.json` and `.log` entries, `tzip grep` used to silently exclude
+/// the `.log` entries from scanning (they're outside the term
+/// index's coverage set, so the candidate filter dropped them).
+/// Fix: the term index now records which entries it covers; grep
+/// scans entries outside the coverage set conservatively.
+#[test]
+fn grep_scans_entries_outside_term_index_coverage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = tmp.path().join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    write_log(
+        &corpus.join("a.json"),
+        r#"{"status":"ok","note":"nothing special"}"#,
+    );
+    // .log is NOT matched by --index-terms '*.json' → outside the
+    // term index's coverage. Must still be scanned.
+    write_log(
+        &corpus.join("b.log"),
+        "operation status: FAILURE in worker-42",
+    );
+    write_log(&corpus.join("c.log"), "all good");
+    run_tzip_create(
+        tmp.path(),
+        &[
+            "create",
+            "out.zip",
+            "corpus",
+            "-m",
+            "deflate",
+            "--index-terms",
+            "*.json",
+            "-q",
+        ],
+    );
+    let (ok, stdout, stderr) = run_tzip(tmp.path(), &["grep", "status", "out.zip"], &[]);
+    assert!(ok, "grep failed: {stderr}");
+    assert!(stdout.contains("a.json"), "a.json match missing: {stdout}");
+    assert!(
+        stdout.contains("b.log"),
+        "b.log should be scanned even though --index-terms excluded it: {stdout}"
+    );
+    // And we should NOT surface the internal index sentinel.
+    assert!(
+        !stdout.contains(".tzip/"),
+        "`.tzip/*` sentinels must be excluded from user grep: {stdout}"
+    );
+}
+
 // Satisfy std::io::Read import.
 #[allow(dead_code)]
 fn _touch() -> usize {

@@ -32,7 +32,7 @@ pub fn run(opts: AggregateOptions) -> Result<()> {
     // across shards is an upstream error, not something aggregate
     // tries to patch over.
     if opts.fields {
-        let arch = open_archive_with_cache(&archives[0], cache.clone())
+        let mut arch = open_archive_with_cache(&archives[0], cache.clone())
             .with_context(|| format!("open archive {}", archives[0]))?;
         let mut out = std::io::stdout().lock();
         for name in arch.facet_fields() {
@@ -109,7 +109,7 @@ fn merge_facet_across_shards(
         if verbose {
             eprintln!("tzip aggregate: shard {}", spec);
         }
-        let arch = open_archive_with_cache(spec, cache.clone())
+        let mut arch = open_archive_with_cache(spec, cache.clone())
             .with_context(|| format!("open archive {}", spec))?;
         if available_hint.is_empty() {
             available_hint = arch.facet_fields();

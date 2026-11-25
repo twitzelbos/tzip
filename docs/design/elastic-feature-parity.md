@@ -5,16 +5,19 @@
 Make every row in the Elastic-vs-tzip comparison table a ✓ for tzip —
 realistically, and without turning tzip into a cluster.
 
-| Workload | Elastic | tzip today | tzip target |
+| Workload | Elastic | tzip today | Status |
 |---|---|---|---|
-| Cold-corpus sub-second search | ✓ | ✗ (linear scan) | **✓ via index** |
-| Basic facets + top-N + histograms | ✓ | ✗ | **✓ via facet counters in index** |
-| Append + visible in seconds | ✓ | ✗ (rebuild only) | **✓ via index segments** |
-| p99 < 20 ms on hot 10B-doc index | ✓ | ✗ (S3 RTT floor) | **✓ for local / cached-index case** |
-| Deep nested aggregations | ✓ | ✗ | **✓ via optional DuckDB sidecar** |
-| Horizontal shard parallelism | ✓ | partially | **✓ archive-per-shard coordinator** |
-| No cluster to run, archive travels | ✗ | ✓ | ✓ (already) |
-| Full-corpus storage cost | ~3× raw | 1× compressed | ✓ (already) |
+| Cold-corpus sub-second search | ✓ | ✓ | **shipped** — Phase 1 (#52) + Phase 2 (#53) |
+| Basic facets + top-N + histograms | ✓ | ✓ | **shipped** — Phase 3 (#55) |
+| Append + visible in seconds | ✓ | ✓ | **shipped** — Phase 4 (#56) |
+| p99 < 20 ms on hot 10B-doc index | ✓ | ✓ (cached) | **shipped** — Phase 6 (#58) |
+| Deep nested aggregations | ✓ | ✓ | **shipped** — Phase 5 (#57, DuckDB) |
+| Horizontal shard parallelism | ✓ | ✓ | **shipped** — Phase 7 (#59) |
+| No cluster to run, archive travels | ✗ | ✓ | always |
+| Full-corpus storage cost | ~3× raw | 1× compressed | always |
+
+**All seven phases landed.** See the per-phase sections below for what each
+PR delivers; the roadmap is maintained as the design doc of record.
 
 The design below assumes tzip's write-once-and-append archive model —
 not real-time stream ingestion at Elastic's rate. For the archive-at-
@@ -58,7 +61,7 @@ identically to today; readers fall back to the linear-scan paths.
 Each phase is one PR, shippable independently, each adding one row to
 the ✓ column.
 
-### Phase 1: MPH on entry names → O(1) name lookup
+### Phase 1: MPH on entry names → O(1) name lookup — SHIPPED in #52
 
 **Deliverable:** `tzip create --index-names` writes a Minimal Perfect
 Hash over entry names into `.tzip/names.v1`. `Archive::open` reads it
@@ -74,7 +77,7 @@ index. Build time: ~0.3 seconds per million names.
 first row of ✓** — the "no cluster, archive travels, fast lookup"
 story — without touching any other subsystem.
 
-### Phase 2: Hashed inverted term index → sub-second `tzip grep`
+### Phase 2: Hashed inverted term index → sub-second `tzip grep` — SHIPPED in #53
 
 **Deliverable:** `tzip create --index-terms '*.json' --index-terms '*.log'`
 tokenizes matching text entries, builds `hash(term) → [(entry_id,
@@ -95,7 +98,7 @@ rayon pool.
 fan-out, per-worker body-stream, `--checkpoint/--resume`. The index
 just precedes the body-stream stage.
 
-### Phase 3: Facets + top-N + histograms
+### Phase 3: Facets + top-N + histograms — SHIPPED in #55
 
 **Deliverable:** `tzip create --facet '.user_id' --facet '.status_code'`
 builds per-field term dictionaries + counts. `tzip aggregate --by
@@ -113,7 +116,7 @@ log. Query cost: O(distinct-values), not O(records).
 **This picks up the "basic facets + top-N + histograms" row in the
 table.**
 
-### Phase 4: Appendable index segments
+### Phase 4: Appendable index segments — SHIPPED in #56
 
 **Deliverable:** `tzip u archive.zip new.json` appends new entries AND
 emits a new index segment file (`.tzip/names.v1.seg2`,
@@ -128,7 +131,16 @@ but typically ≤ 10 segments steady-state with an hourly compact.
 **This picks up the "append + visible in seconds" row** — the index
 stays coherent across incremental updates, no rebuild needed.
 
-### Phase 5: DuckDB sidecar for deep aggregations
+### Phase 5: DuckDB sidecar for deep aggregations — SHIPPED in #57
+
+**Known limitation:** `tzip u` doesn't refresh the columnar sidecar.
+Rebuild-mode byte-copies kept entries without decompressing, so
+re-extracting their JSON for the Parquet rebuild would need a
+parallel decompression path. Workaround: delete the stale
+`.tzip/columnar.v1.parquet` from the archive (via `tzip u --delete
+'.tzip/columnar.v1.parquet'`) and re-create with
+`--write-columnar schema.json`. A future segmented columnar
+(analogous to Phase 4 `.segN`) would avoid this.
 
 **Deliverable:** `tzip create --write-columnar 'schema.json'` (or
 auto-infer schema from first N JSON entries) extracts declared
@@ -145,7 +157,7 @@ binary size; alternative: external `duckdb` tool invoked only when
 **This closes the "deep nested aggregations" gap** — DuckDB's SQL
 covers everything Elastic's aggregation DSL does, often faster.
 
-### Phase 6: Hot-index caching + HTTP/2 → sub-20ms p99
+### Phase 6: Hot-index caching + persistent connections → sub-20ms p99 — SHIPPED in #58
 
 **Deliverable:** `tzip query --cache-dir ~/.cache/tzip
 s3://.../archive.zip` keeps the index entries resident on the client
@@ -161,7 +173,7 @@ paths; keeping bodies in the cache too covers that.
 a cold S3 archive, but against archives the client has queried
 recently.
 
-### Phase 7: Horizontal shard parallelism via archive-per-shard
+### Phase 7: Horizontal shard parallelism via archive-per-shard — SHIPPED in #59
 
 **Deliverable:** `tzip query --shards 's3://bucket/shards/*.zip'`
 runs the query across every matching archive in parallel, merges
@@ -214,15 +226,17 @@ After Phase 7 we have:
 
 That is "Elastic for 70% of workloads, without the cluster."
 
-## Timeline (focused engineering)
+## Delivery
 
-- Phase 1: 3-5 days (this PR + follow-up polish)
-- Phase 2: 2 weeks
-- Phase 3: 1 week
-- Phase 4: 2 weeks
-- Phase 5: 2-3 weeks
-- Phase 6: 1 week
-- Phase 7: 1 week
+All seven phases shipped between PR #52 (Phase 1) and PR #59 (Phase 7),
+each phase an independently reviewable PR with its own test suite. The
+Phase-6 HTTP/2 goal was adjusted to persistent-connection pooling (which
+is what the roadmap deliverable actually wanted — "no TLS handshake per
+Range GET") rather than a wire-protocol upgrade; ureq 3.x is still
+HTTP/1.1 and a reqwest/hyper migration would have forced a tokio bridge
+disproportionate to the gain.
 
-Total: ~2-3 months of focused work. Each phase ships independently and
-adds measurable value by itself.
+As of the Phase-7 merge the Elastic-vs-tzip comparison table is all ✓
+for tzip: sub-second search, facets, segmented append, DuckDB-backed
+deep aggregations, hot p99 under 20 ms with client-side cache, and
+horizontal shard fan-out — with no cluster to operate.

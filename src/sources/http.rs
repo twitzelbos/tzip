@@ -11,7 +11,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::time::Duration;
 
 /// How many bytes to over-fetch past a small read. Big enough to cover the
 /// EOCD scan in one GET; small enough that one-off `cat`s don't balloon.
@@ -35,7 +34,7 @@ impl HttpSource {
     /// `Accept-Ranges: bytes`. Falls back to a `Range: bytes=0-0` probe if
     /// the server doesn't answer HEAD well.
     pub fn open(url: &str) -> Result<Self> {
-        let agent = build_agent();
+        let agent = super::shared_agent();
         let (len, supports_ranges, fingerprint) = probe_length_and_ranges(&agent, url)?;
         if !supports_ranges {
             bail!(
@@ -64,7 +63,7 @@ impl HttpSource {
     /// fetch comes back 200-not-206 we'll fail there with the same
     /// error the probe path would have.
     pub fn open_with_len(url: &str, len: u64) -> Result<Self> {
-        let agent = build_agent();
+        let agent = super::shared_agent();
         Ok(Self {
             url: url.to_string(),
             agent,
@@ -172,13 +171,6 @@ impl Seek for HttpSource {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
-
-fn build_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(60))
-        .user_agent(&format!("tzip/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-}
 
 fn probe_length_and_ranges(
     agent: &ureq::Agent,

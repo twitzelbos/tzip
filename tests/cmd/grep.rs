@@ -582,6 +582,57 @@ fn grep_http_parallel_across_archives() {
     assert!(lines.iter().any(|l| l.contains("ERROR b")));
 }
 
+/// Regression test for issue #54: `tzip grep` on a plain
+/// (non-indexed) archive used to hang when the filtered candidate
+/// set exceeded the inner fan-out channel's capacity
+/// (`inner_jobs * 2` slots, default 16). The producer pre-filled
+/// the channel before any worker was spawned, so with ~100+
+/// candidates `tx.send` blocked forever.
+///
+/// Fix: switched the inner fan-out channel from bounded to
+/// unbounded. This test exercises the historical hang threshold
+/// (200 entries) with a hard timeout — pre-fix tzip stalls past
+/// the 30 s cap, post-fix completes in <1 s.
+#[test]
+fn grep_200_entries_plain_archive_does_not_hang() {
+    let tmp = tempfile::tempdir().unwrap();
+    let logs = tmp.path().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    for i in 0..200 {
+        write_log(
+            &logs.join(format!("log_{:06}.json", i)),
+            &format!("normal {}\n", i),
+        );
+    }
+    // One entry carries the target token; everything else is
+    // noise. Without the index, grep scans every body.
+    write_log(&logs.join("log_000042.json"), "OutOfMemoryError in worker\n");
+    run_tzip_create(tmp.path(), &["create", "plain.zip", "logs", "-q"]);
+
+    // Spawn tzip with a hard wall-clock deadline. Without the
+    // fix this would time out at the shell level; with the fix
+    // it finishes in milliseconds.
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let (ok, stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["grep", "OutOfMemoryError", "plain.zip"],
+        &[],
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "grep took {:?} — likely the pre-#54-fix hang: {}",
+        elapsed,
+        stderr
+    );
+    assert!(ok, "grep failed: {stderr}");
+    assert!(
+        stdout.contains("log_000042.json") && stdout.contains("OutOfMemoryError"),
+        "expected one hit, got: {stdout}"
+    );
+}
+
 // Satisfy std::io::Read import.
 #[allow(dead_code)]
 fn _touch() -> usize {

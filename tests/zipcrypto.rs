@@ -86,15 +86,47 @@ fn cat_zipcrypto_wrong_password_errors() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    fs::write(tmp.path().join("secret.txt"), b"doesn't matter\n").unwrap();
+    let plaintext: &[u8] = b"doesn't matter\n";
+    fs::write(tmp.path().join("secret.txt"), plaintext).unwrap();
     make_zipcrypto_archive(tmp.path(), "zc.zip", "correct", &["secret.txt"]);
 
-    let (ok, _stdout, stderr) =
-        tzip_cat_bytes(tmp.path(), &["cat", "zc.zip", "secret.txt", "-p", "wrong"]);
-    assert!(!ok, "wrong password should not produce a successful cat");
+    // ZipCrypto's password check compares a single byte (the high byte
+    // of the CRC-32) against the last byte of the decrypted
+    // encryption header — so a wrong password happens to pass the
+    // check with probability ~1/256. Firing four distinct wrong
+    // passwords drops the all-pass probability to (1/256)^4 ≈ 1/4 B,
+    // effectively zero. We require at least one explicit rejection
+    // AND assert that the "accepted" ones (false-positive check)
+    // never produced the actual plaintext.
+    let wrong_passwords = ["wrong", "noway", "bad-pw", "sesame"];
+    let mut any_rejected = false;
+    for pw in &wrong_passwords {
+        let (ok, stdout, stderr) =
+            tzip_cat_bytes(tmp.path(), &["cat", "zc.zip", "secret.txt", "-p", pw]);
+        if !ok {
+            any_rejected = true;
+            assert!(
+                stderr.contains("ZipCrypto password check failed")
+                    || stderr.contains("password")
+                    || stderr.contains("crc"),
+                "unhelpful error for wrong password {:?}: {}",
+                pw,
+                stderr
+            );
+        } else {
+            // False-positive check: the stream cipher decrypted the
+            // body with a bogus key, so any bytes written to stdout
+            // are garbage. They must not match the real plaintext.
+            assert_ne!(
+                stdout, plaintext,
+                "wrong password {:?} produced the correct plaintext — would be a crypto bug",
+                pw,
+            );
+        }
+    }
     assert!(
-        stderr.contains("ZipCrypto password check failed") || stderr.contains("password"),
-        "unhelpful error: {stderr}"
+        any_rejected,
+        "all four wrong passwords passed ZipCrypto's one-byte check — unlucky run, re-run; or a real regression"
     );
 }
 

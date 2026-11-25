@@ -9,7 +9,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
-use std::time::Duration;
 
 use super::s3::{resolve_credentials, resolve_endpoint, resolve_region, Credentials};
 use super::sigv4::{sign_get, ExtraHeader, SigV4Credentials};
@@ -30,10 +29,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>> {
     let creds = resolve_credentials().context("resolve AWS credentials")?;
     let region = resolve_region();
     let (scheme, host, path_style_prefix) = resolve_endpoint(&bucket, &region)?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(60))
-        .user_agent(&format!("tzip/{}", env!("CARGO_PKG_VERSION")))
-        .build();
+    let agent = super::shared_agent();
 
     let mut keys: Vec<String> = Vec::new();
     let mut continuation: Option<String> = None;

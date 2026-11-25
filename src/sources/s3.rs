@@ -17,7 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::sigv4::{encode_key, sign_get, ExtraHeader, SigV4Credentials};
 
@@ -70,10 +70,7 @@ impl S3Source {
             format!("/{}", encode_key(&key))
         };
 
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(60))
-            .user_agent(&format!("tzip/{}", env!("CARGO_PKG_VERSION")))
-            .build();
+        let agent = super::shared_agent();
 
         // Probe object length via a Range: bytes=0-0 request so we work
         // identically against real S3 + MinIO + LocalStack (HEAD against
@@ -123,10 +120,7 @@ impl S3Source {
         } else {
             format!("/{}", encode_key(&key))
         };
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(60))
-            .user_agent(&format!("tzip/{}", env!("CARGO_PKG_VERSION")))
-            .build();
+        let agent = super::shared_agent();
         Ok(Self {
             agent,
             scheme,

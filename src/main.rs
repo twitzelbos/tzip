@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
 
-use tzip::{aggregate, bench, cli, diff, find, grep, hash, mount, pipeline, query, reader};
+use tzip::{aggregate, bench, cli, diff, find, grep, hash, mount, pipeline, query, reader, update};
 
 fn main() -> Result<()> {
     // Parse via ArgMatches so UserSetFlags::from_matches can distinguish
@@ -20,7 +20,17 @@ fn main() -> Result<()> {
         }
         cli::Cmd::U(args) => {
             let uf = subcommand_user_flags(&matches, "u");
-            pipeline::run(args.into_options(uf)?)
+            let opts = args.into_options(uf)?;
+            // `tzip u` on a non-existent archive falls through to
+            // create (matches `7z u`); the modify path is only
+            // reached when the file already exists. Dispatching
+            // at argv-parse time keeps `pipeline` from depending
+            // on `update`, breaking a long-standing module cycle.
+            if opts.archive.exists() {
+                update::run_update(opts)
+            } else {
+                pipeline::run(opts)
+            }
         }
         cli::Cmd::Ls(args) => reader::run_ls(args.into_options()?),
         cli::Cmd::Cat(args) => reader::run_cat(args.into_options()?),

@@ -30,7 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
 
-use crate::cli::{Method, Options};
+use crate::method::Method;
+use crate::options::Options;
 use crate::compress::{self, Scratch};
 use crate::pipeline::{self, LocalFsSource, RawItem, Source};
 use crate::platform;
@@ -358,8 +359,7 @@ pub fn run_update(mut opts: Options) -> Result<()> {
     // borrowed `HashSet<&str>` scoped to this one check and dropped
     // before we take `&mut arch` later.
     let delete_matches: HashSet<String> = arch
-        .entries()
-        .iter()
+        .iter_entries()
         .filter(|e| walker::is_excluded(&e.name, &opts.delete))
         .map(|e| e.name.clone())
         .collect();
@@ -372,7 +372,7 @@ pub fn run_update(mut opts: Options) -> Result<()> {
     // Scope the borrow so it's dropped before any `&mut arch` work.
     let (has_replace, n_rep) = {
         let old_names: HashSet<&str> =
-            arch.entries().iter().map(|e| e.name.as_str()).collect();
+            arch.iter_entries().map(|e| e.name.as_str()).collect();
         let n_rep = new_names
             .iter()
             .filter(|n| old_names.contains(n.as_str()))
@@ -392,14 +392,12 @@ pub fn run_update(mut opts: Options) -> Result<()> {
     // replaced) — a replaced entry's old digest doesn't tell us the
     // user intends to keep writing that algo.
     let existing_md5 = arch
-        .entries()
-        .iter()
+        .iter_entries()
         .any(|e| e.md5_digest.is_some()
             && !delete_matches.contains(e.name.as_str())
             && !new_names.contains(e.name.as_str()));
     let existing_sha256 = arch
-        .entries()
-        .iter()
+        .iter_entries()
         .any(|e| e.sha256_digest.is_some()
             && !delete_matches.contains(e.name.as_str())
             && !new_names.contains(e.name.as_str()));
@@ -423,14 +421,14 @@ pub fn run_update(mut opts: Options) -> Result<()> {
     // entries in `kept` already carry `lfh_total_size`, so
     // `populate_lfh_size` collapses to a no-op.
     let mut kept: Vec<ReadEntry> = Vec::new();
-    for idx in 0..arch.entries().len() {
-        let name = arch.entries()[idx].name.clone();
+    for idx in 0..arch.len() {
+        let name = arch.entry(idx).name.clone();
         if delete_matches.contains(name.as_str()) || new_names.contains(name.as_str()) {
             continue;
         }
         arch.lfh_total_size_of(idx)
             .with_context(|| format!("probe LFH for carried entry {}", name))?;
-        kept.push(arch.entries()[idx].clone());
+        kept.push(arch.entry(idx).clone());
     }
 
     if new_items.is_empty() && delete_matches.is_empty() {
@@ -681,9 +679,11 @@ fn run_update_rebuild(
                         let mut re = re.clone();
                         let name = re.name.clone();
                         populate_lfh_size(&mut arch, &mut re, name)?;
-                        zw.carry_existing_entry(arch.source_mut(), &re)?;
-                        progress.inc(re.comp_size);
-                        progress.set_msg(format!("carried {}", re.name));
+                        let comp_size = re.comp_size;
+                        let display_name = re.name.clone();
+                        arch.carry_entry_to(&re, &mut zw)?;
+                        progress.inc(comp_size);
+                        progress.set_msg(format!("carried {}", display_name));
                     }
                     Mixed::New(_) => {
                         let e = encoded
@@ -703,9 +703,11 @@ fn run_update_rebuild(
                 let mut re = re.clone();
                 let name = re.name.clone();
                 populate_lfh_size(&mut arch, &mut re, name)?;
-                zw.carry_existing_entry(arch.source_mut(), &re)?;
-                progress.inc(re.comp_size);
-                progress.set_msg(format!("carried {}", re.name));
+                let comp_size = re.comp_size;
+                let display_name = re.name.clone();
+                arch.carry_entry_to(&re, &mut zw)?;
+                progress.inc(comp_size);
+                progress.set_msg(format!("carried {}", display_name));
             }
             // Phase 2: parallel encode of new items.
             // Rebuild mode writes a fresh archive so indices here
@@ -764,11 +766,10 @@ fn populate_lfh_size(arch: &mut Archive, re: &mut ReadEntry, want_name: String) 
     if re.lfh_total_size != 0 {
         return Ok(());
     }
-    // Find the entry index by matching name (cheap: entries aren't huge).
+    // Find the entry index by name (O(1) via MPH when the archive
+    // carries one, otherwise the same linear scan as before).
     let idx = arch
-        .entries()
-        .iter()
-        .position(|e| e.name == want_name)
+        .lookup_entry_idx(&want_name)
         .ok_or_else(|| anyhow!("internal: entry {} vanished from archive", want_name))?;
     re.lfh_total_size = arch.lfh_total_size_of(idx)?;
     Ok(())

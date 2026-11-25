@@ -18,8 +18,8 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::cli::{Method, Options, UserSetFlags};
-use crate::reader::stream_entry_to;
+use crate::method::Method;
+use crate::options::{Options, UserSetFlags};
 use crate::zipreader::Archive;
 
 /// FUSE / FSKit inode. Inode 1 is the root directory by convention.
@@ -319,12 +319,13 @@ impl VirtualFs {
 
     fn decompress_entry(&self, entry_idx: usize) -> Result<Vec<u8>> {
         let mut arch = self.archive.lock().unwrap();
-        let name = arch.entries()[entry_idx].name.clone();
         arch.lfh_total_size_of(entry_idx)?;
-        let re = arch.entries()[entry_idx].clone();
-        let expected = re.uncomp_size as usize;
+        let (name, expected) = {
+            let re = arch.entry(entry_idx);
+            (re.name.clone(), re.uncomp_size as usize)
+        };
         let mut out: Vec<u8> = Vec::with_capacity(expected.min(16 * 1024 * 1024));
-        stream_entry_to(arch.source_mut(), &re, self.password.as_deref(), &mut out)?;
+        arch.stream_entry_to(entry_idx, self.password.as_deref(), &mut out)?;
         if self.verbose && (expected > 16 * 1024 * 1024) {
             eprintln!(
                 "tzip mount: decompressed {} ({} MiB) into cache",
@@ -1033,7 +1034,7 @@ fn build_tree(archive: &Archive) -> (Vec<Node>, HashMap<Inode, Vec<(Vec<u8>, Ino
 
     let mut dir_by_path: HashMap<Vec<u8>, Inode> = HashMap::new();
 
-    for (idx, entry) in archive.entries().iter().enumerate() {
+    for (idx, entry) in archive.iter_entries().enumerate() {
         let full = entry.name.trim_start_matches('/');
         let is_dir_marker = full.ends_with('/');
         let path = full.trim_end_matches('/');

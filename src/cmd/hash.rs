@@ -20,9 +20,9 @@ use std::sync::Mutex;
 
 use crate::cli::{HashAlgo, HashArgs};
 use crate::reader::{
-    hint_from_archive, open_archive, open_source_for_with_hint, stream_entry_to,
+    hint_from_archive, open_archive, open_source_for_with_hint,
 };
-use crate::zipreader::ReadEntry;
+use crate::zipreader::{stream_entry_source_to, ReadEntry};
 
 pub fn run(args: HashArgs) -> Result<()> {
     let password = resolve_password(&args)?;
@@ -37,8 +37,7 @@ pub fn run(args: HashArgs) -> Result<()> {
         args.names.iter().cloned().collect()
     };
     if !selected.is_empty() {
-        let present: HashSet<&str> =
-            arch.entries().iter().map(|e| e.name.as_str()).collect();
+        let present: HashSet<&str> = arch.iter_entries().map(|e| e.name.as_str()).collect();
         let missing: Vec<&String> = selected
             .iter()
             .filter(|n| !present.contains(n.as_str()))
@@ -57,9 +56,9 @@ pub fn run(args: HashArgs) -> Result<()> {
 
     // Collect the entry indices we'll hash, dropping directory entries
     // (empty bodies) because a directory has no meaningful hash.
-    let candidates: Vec<usize> = (0..arch.entries().len())
+    let candidates: Vec<usize> = (0..arch.len())
         .filter(|&i| {
-            let e = &arch.entries()[i];
+            let e = arch.entry(i);
             if e.name.ends_with('/') && e.uncomp_size == 0 {
                 return false;
             }
@@ -79,7 +78,7 @@ pub fn run(args: HashArgs) -> Result<()> {
         let stdout = io::stdout();
         let mut out = stdout.lock();
         for idx in &candidates {
-            let e = &arch.entries()[*idx];
+            let e = arch.entry(*idx);
             emit_line(&mut out, args.algo, &e.name, &format!("{:08x}", e.crc32), args.json)?;
         }
         return Ok(());
@@ -96,7 +95,7 @@ pub fn run(args: HashArgs) -> Result<()> {
     let mut entries: Vec<ReadEntry> = Vec::with_capacity(candidates.len());
     for idx in candidates {
         let (name, stored) = {
-            let e = &arch.entries()[idx];
+            let e = arch.entry(idx);
             let stored = match args.algo {
                 HashAlgo::Md5 => e.md5_digest.map(|d| hex_of(&d)),
                 HashAlgo::Sha256 => e.sha256_digest.map(|d| hex_of(&d)),
@@ -109,7 +108,7 @@ pub fn run(args: HashArgs) -> Result<()> {
             continue;
         }
         arch.lfh_total_size_of(idx)?;
-        entries.push(arch.entries()[idx].clone());
+        entries.push(arch.entry(idx).clone());
     }
     drop(direct_out);
     if entries.is_empty() {
@@ -203,7 +202,7 @@ fn hash_one(
     algo: HashAlgo,
 ) -> Result<String> {
     let mut sink = HashSink::new(algo);
-    stream_entry_to(source, re, password, &mut sink)?;
+    stream_entry_source_to(source, re, password, &mut sink)?;
     Ok(sink.finalize_hex())
 }
 

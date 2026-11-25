@@ -23,7 +23,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::sources::ReadSeek;
-use crate::zipwriter::{
+use crate::zipformat::{
     AES_EXTRA_ID, METHOD_AES, SIG_CDR, SIG_EOCD, SIG_EOCD64, SIG_EOCD64_LOC, SIG_LFH,
     TZIP_HASH_ALGO_MD5, TZIP_HASH_ALGO_SHA256, TZIP_HASH_EXTRA_ID,
 };
@@ -32,68 +32,13 @@ const EOCD_SCAN_WINDOW: u64 = 64 * 1024;
 const EOCD_MIN_SIZE: u64 = 22;
 
 /// A central-directory entry, parsed from an existing archive. Enough to
-/// re-emit as a central entry in a rewritten archive, and enough for the
-/// writer's byte-copy path to locate the original LFH + body on disk.
-#[derive(Clone, Debug)]
-pub struct ReadEntry {
-    pub name: String,
-    pub name_bytes: Vec<u8>,
-    pub method_on_wire: u16,
-    /// Inner compression method when `encrypted` (from the AES extra).
-    /// Equal to `method_on_wire` otherwise.
-    pub inner_method: u16,
-    pub gp_flags: u16,
-    /// "Version made by" — low byte is the ZIP version, high byte is the
-    /// originating host OS. Needed so `external_attr` can be interpreted:
-    /// `host_os == 3` (Unix) ⇒ high 16 bits of external_attr are Unix mode.
-    pub made_by: u16,
-    pub version_needed: u16,
-    pub crc32: u32,
-    pub comp_size: u64,
-    pub uncomp_size: u64,
-    pub lfh_offset: u64,
-    pub mtime: (u16, u16),
-    pub encrypted: bool,
-    /// External file attributes. On Unix-origin archives
-    /// (`host_os(made_by) == 3`), the high 16 bits are the Unix mode
-    /// (including type bits + rwx). On DOS-origin archives the low 8
-    /// bits carry DOS file attributes. See `unix_mode()`.
-    pub external_attr: u32,
-    /// Per-entry comment (raw bytes, decoded from CP437 via `decode_name`
-    /// semantics — same encoding path as the entry name).
-    pub comment: String,
-    /// Raw comment bytes, preserved for round-trip into a rewritten CDR.
-    pub comment_bytes: Vec<u8>,
-    /// On a single-disk archive this is 0. On a multi-disk archive this
-    /// is the disk index the LFH + body live on; `lfh_offset` is
-    /// patched by `Archive::open` to be absolute in the concatenated
-    /// address space, so downstream readers don't need to re-apply this.
-    pub disk_number_start: u16,
-    /// `30 + name_len + extra_len` for this entry's LFH. Zero until the
-    /// first call to `Archive::lfh_total_size_of`, which reads the LFH header
-    /// bytes to learn `extra_len` (not derivable from the CDR).
-    pub lfh_total_size: u32,
-    /// Plaintext MD5 digest lifted from the tzip-native extra field
-    /// (id = `TZIP_HASH_EXTRA_ID`, algo = 1). `None` when the archive
-    /// wasn't created with `--write-md5`.
-    pub md5_digest: Option<[u8; 16]>,
-    /// Same for SHA-256 (algo = 2).
-    pub sha256_digest: Option<[u8; 32]>,
-}
-
-impl ReadEntry {
-    /// Returns the Unix mode bits encoded in `external_attr` when the
-    /// archive was produced on a Unix host (version_made_by byte 1 == 3).
-    /// None for DOS-origin, Windows-origin, Mac-origin archives etc.
-    pub fn unix_mode(&self) -> Option<u32> {
-        let host_os = (self.made_by >> 8) & 0xff;
-        if host_os == 3 {
-            Some(self.external_attr >> 16)
-        } else {
-            None
-        }
-    }
-}
+/// re-emit as a central entry in a rewritten archive, and enough
+/// for the writer's byte-copy path to locate the original LFH +
+/// body on disk. Definition moved into `zipformat` so `zipwriter`
+/// can consume it without re-importing `zipreader`; re-exported
+/// here to keep the historical path (`zipreader::ReadEntry`)
+/// usable by existing callers.
+pub use crate::zipformat::ReadEntry;
 
 pub struct Archive {
     source: Box<dyn ReadSeek>,
@@ -695,20 +640,70 @@ impl Archive {
         self.disk_count
     }
 
-    pub fn entries(&self) -> &[ReadEntry] {
-        &self.entries
-    }
-
     /// Archive-level comment from the EOCD trailer. Empty string if the
     /// archive has no comment.
     pub fn archive_comment(&self) -> &str {
         &self.archive_comment
     }
 
-    /// Mutable access to the underlying source so callers can seek + read
-    /// specific byte ranges (e.g. to stream an entry's LFH + body).
-    pub fn source_mut(&mut self) -> &mut (dyn ReadSeek) {
-        &mut *self.source
+    /// Stream the `idx`-th entry's body — LFH skip + decrypt +
+    /// decompress — into `dst`. Narrow "please read this entry"
+    /// operation that the Archive handles end-to-end; callers
+    /// never touch the underlying source handle.
+    pub fn stream_entry_to<W: std::io::Write>(
+        &mut self,
+        idx: usize,
+        password: Option<&str>,
+        dst: &mut W,
+    ) -> Result<u64> {
+        self.lfh_total_size_of(idx)?;
+        let re = self.entries[idx].clone();
+        stream_entry_source_to(&mut *self.source, &re, password, dst)
+    }
+
+    /// Copy one entry verbatim (LFH + extras + body) into `zw` at
+    /// the writer's current position. Used by rebuild-mode update
+    /// to carry kept entries without decoding them. The Archive
+    /// holds the source; the writer holds the destination; this
+    /// method's the only thing that needs to touch both at once,
+    /// so it owns the end-to-end operation and keeps
+    /// `Archive::source` fully private.
+    pub fn carry_entry_to<W: std::io::Write + std::io::Seek>(
+        &mut self,
+        re: &crate::zipformat::ReadEntry,
+        zw: &mut crate::zipwriter::ZipWriter<W>,
+    ) -> Result<()> {
+        zw.carry_existing_entry(&mut *self.source, re)
+    }
+
+    /// Single-entry view by index, panicking on out-of-range.
+    /// Callers that take a fallible lookup go through
+    /// `lookup_entry_idx` first.
+    pub fn entry(&self, idx: usize) -> &ReadEntry {
+        &self.entries[idx]
+    }
+
+    /// Entry count.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when the archive holds zero entries (empty ZIP).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate every entry in CDR order.
+    pub fn iter_entries(&self) -> impl Iterator<Item = &ReadEntry> {
+        self.entries.iter()
+    }
+
+    /// Names of every entry in CDR order — copies into a Vec so
+    /// callers can hold it without borrowing the archive. Used by
+    /// extract / hash / update to resolve `--include`/`--exclude`
+    /// matches without pulling the full `ReadEntry` out.
+    pub fn names(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.name.clone()).collect()
     }
 
     pub fn cd_offset(&self) -> u64 {
@@ -770,6 +765,103 @@ impl Archive {
         self.entries[idx].lfh_total_size = total;
         Ok(total)
     }
+}
+
+/// Stream one entry's body (decrypted if needed, decompressed) from
+/// an already-open `ReadSeek` source to `dst`. Used by both
+/// `Archive::stream_entry_to` and by parallel grep / extract workers
+/// that hold their own per-worker source handles.
+/// `re.lfh_total_size` must already be populated (via
+/// `Archive::lfh_total_size_of`).
+pub(crate) fn stream_entry_source_to<W: std::io::Write>(
+    source: &mut dyn ReadSeek,
+    re: &ReadEntry,
+    password: Option<&str>,
+    dst: &mut W,
+) -> Result<u64> {
+    let body_offset = re.lfh_offset + re.lfh_total_size as u64;
+    source
+        .seek(SeekFrom::Start(body_offset))
+        .with_context(|| format!("seek to body of {}", re.name))?;
+
+    let inner_method = method_from_id(re.inner_method, re.gp_flags)
+        .ok_or_else(|| anyhow!("unsupported compression method {} on {}", re.inner_method, re.name))?;
+
+    if re.encrypted {
+        let password = password.ok_or_else(|| {
+            anyhow!(
+                "entry {} is encrypted — pass --password / -p (or - to prompt)",
+                re.name
+            )
+        })?;
+        if re.method_on_wire == METHOD_AES {
+            // WinZip AES-256 AE-2.
+            let ciphertext_len = re
+                .comp_size
+                .checked_sub(crate::crypto::AE2_OVERHEAD as u64)
+                .ok_or_else(|| anyhow!("entry {} too small to be AE-2", re.name))?;
+            let mut plaintext: Vec<u8> =
+                Vec::with_capacity(re.uncomp_size.min(64 * 1024 * 1024) as usize);
+            crate::crypto::decrypt_ae2(password, source, ciphertext_len, &mut plaintext)?;
+            crate::decompress::decompress(
+                inner_method,
+                std::io::Cursor::new(&plaintext),
+                re.uncomp_size,
+                dst,
+            )
+        } else {
+            // Traditional PKZIP encryption (ZipCrypto). The 12-byte
+            // encryption header is baked into the comp_size, so
+            // after ZipCryptoReader consumes it the decompressor
+            // sees comp_size - 12 bytes of plaintext.
+            let verify_byte = zipcrypto_verify_byte(re);
+            let bounded = source.take(re.comp_size);
+            let decrypted =
+                crate::zipcrypto::ZipCryptoReader::new(bounded, password.as_bytes(), verify_byte)
+                    .with_context(|| format!("decrypt ZipCrypto entry {}", re.name))?;
+            crate::decompress::decompress(inner_method, decrypted, re.uncomp_size, dst)
+        }
+    } else {
+        let bounded = source.take(re.comp_size);
+        crate::decompress::decompress(inner_method, bounded, re.uncomp_size, dst)
+    }
+}
+
+/// The verify byte ZipCrypto compares against the last plaintext
+/// byte of the 12-byte encryption header.
+fn zipcrypto_verify_byte(re: &ReadEntry) -> u8 {
+    const GP_BIT_STREAMING_DATA_DESCRIPTOR: u16 = 1 << 3;
+    if re.gp_flags & GP_BIT_STREAMING_DATA_DESCRIPTOR != 0 {
+        ((re.mtime.1 >> 8) & 0xff) as u8
+    } else {
+        ((re.crc32 >> 24) & 0xff) as u8
+    }
+}
+
+/// Resolve a ZIP compression method ID + GP flag word to the
+/// read-side enum.
+pub(crate) fn method_from_id(id: u16, gp_flags: u16) -> Option<crate::decompress::ReadMethod> {
+    use crate::decompress::ReadMethod;
+    Some(match id {
+        0 => ReadMethod::Store,
+        1 => ReadMethod::Shrink,
+        2 => ReadMethod::Reduce(1),
+        3 => ReadMethod::Reduce(2),
+        4 => ReadMethod::Reduce(3),
+        5 => ReadMethod::Reduce(4),
+        6 => ReadMethod::Implode {
+            large_window: (gp_flags & 0b0000_0010) != 0,
+            lit_tree: (gp_flags & 0b0000_0100) != 0,
+        },
+        8 => ReadMethod::Deflate,
+        9 => ReadMethod::Deflate64,
+        12 => ReadMethod::Bzip2,
+        14 => ReadMethod::Lzma,
+        93 => ReadMethod::Zstd,
+        95 => ReadMethod::Xz,
+        98 => ReadMethod::Ppmd,
+        _ => return None,
+    })
 }
 
 /// Cheap EOCD probe: given a seekable source and its total size,

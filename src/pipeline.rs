@@ -12,7 +12,8 @@ use std::io::BufWriter;
 use std::sync::Arc;
 use std::thread;
 
-use crate::cli::{Method, Options};
+use crate::method::Method;
+use crate::options::Options;
 use crate::compress::{self, Scratch};
 use crate::crypto;
 use crate::platform;
@@ -21,80 +22,15 @@ use crate::sevenz;
 use crate::tui;
 use crate::walker::{self, WalkOpts, WorkItem};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use crate::zipwriter::{EncodedEntry, ZipWriter, METHOD_AES};
+use crate::zipformat::METHOD_AES;
+use crate::zipwriter::{EncodedEntry, ZipWriter};
 
-/// Abstract "give me the bytes for this item" — the seam where cloud
-/// backends will plug in later. Trait objects live in an Arc so multiple
-/// reader threads can share one instance without cloning per-item state.
-pub trait Source: Send + Sync {
-    fn read(&self, item: &WorkItem) -> Result<platform::ReadBuf>;
-
-    /// Read a whole chunk of items, sending each downstream as a `RawItem`.
-    /// The default just loops `read()` in order; sources that benefit from
-    /// reordering (extent-order / raw-APFS bulk readers) override this to sort
-    /// by physical disk offset first. `index` is carried through untouched so
-    /// the writer's ordering is unaffected.
-    fn read_bulk(
-        &self,
-        items: Vec<(u64, WorkItem)>,
-        raw_tx: crossbeam_channel::Sender<RawItem>,
-    ) -> Result<()> {
-        for (index, item) in items {
-            let bytes = self.read(&item)?;
-            if raw_tx.send(RawItem { index, item, bytes }).is_err() {
-                break;
-            }
-        }
-        Ok(())
-    }
-}
-
-pub struct LocalFsSource {
-    /// If true, keep read blocks in the OS page cache (default: bypass).
-    pub keep_cache: bool,
-}
+pub use crate::source::{LocalFsSource, RawItem, Source};
 
 /// Choose BufWriter capacity for the output based on filesystem info.
 /// Shared with the update module.
 pub(crate) fn writer_capacity_for(info: Option<&platform::FsInfo>) -> usize {
     choose_writer_capacity(info)
-}
-
-impl Source for LocalFsSource {
-    fn read(&self, item: &WorkItem) -> Result<platform::ReadBuf> {
-        // Fast path: openat(dirfd, basename) when the walker gave us a dirfd.
-        // This skips per-component path resolution — a real win on the deep
-        // directory layouts we see in deep hierarchical trees.
-        if let (Some(dirfd), Some(basename)) = (&item.dirfd, &item.basename) {
-            match platform::open_at(dirfd.as_raw(), basename) {
-                Ok(f) => {
-                    return platform::read_from_file(f, item.size, self.keep_cache)
-                        .with_context(|| format!("read {}", item.path.display()));
-                }
-                Err(e) => {
-                    // Fall through to path-based open, e.g. if the dirfd was
-                    // closed by the OS or the file was renamed.
-                    if self.keep_cache {
-                        eprintln!(
-                            "openat failed for {}: {} — falling back to open by path",
-                            item.path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-        platform::read_input(&item.path, item.size, self.keep_cache)
-            .with_context(|| format!("read {}", item.path.display()))
-    }
-}
-
-/// Read stage output — untouched bytes plus enough metadata to identify the
-/// entry downstream.
-pub(crate) struct RawItem {
-    pub(crate) index: u64,
-    pub(crate) item: WorkItem,
-    pub(crate) bytes: platform::ReadBuf,
 }
 
 /// Create and update stay local-only. Reject URL-shaped archive paths
@@ -157,13 +93,14 @@ pub fn run(opts: Options) -> Result<()> {
     let overall_start = std::time::Instant::now();
     reject_remote_archive(&opts.archive)?;
 
-    // --update dispatches to the update-mode entry point when the target
-    // archive already exists. On a non-existent archive, `-u` falls back
-    // to create mode (matches `7z u`). `.7z` is rejected upfront at CLI
-    // validation, so we don't check `opts.solid` again here.
-    if opts.update && opts.archive.exists() {
-        return crate::update::run_update(opts);
-    }
+    // `tzip u` dispatch happens in main.rs now: if the user ran the
+    // `u` subcommand and the archive exists, main calls
+    // `update::run_update` directly; the create-mode pipeline only
+    // runs here when the archive doesn't exist yet (`u` on a
+    // non-existent archive falls through to create, matching
+    // `7z u`). Removing the branch here broke the historical
+    // `pipeline → update` dependency edge that otherwise wedged
+    // the whole lib into one module cycle.
 
     // Optional USB / drive diagnostic — only prints if the workload actually
     // touches a USB-backed filesystem. Cheap when everything is internal.

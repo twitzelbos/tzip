@@ -37,23 +37,34 @@ pub struct SignedRequest {
     pub headers: Vec<(String, String)>,
 }
 
-/// Sign a GET request. `host` is `<bucket>.s3.<region>.amazonaws.com`
-/// (or an override via `AWS_ENDPOINT_URL`). `path` is `/<key>` (URL-encoded
-/// per segment by the caller — S3 object keys may contain characters that
-/// need encoding).
+/// Sign a request. Works for every method the S3 API uses — GET,
+/// PUT (including `UploadPartCopy`'s `x-amz-copy-source` header),
+/// POST (`CreateMultipartUpload` / `CompleteMultipartUpload`),
+/// DELETE (`AbortMultipartUpload`), HEAD.
 ///
-/// `extra_headers` are merged into the signature. `Range` is the common one.
-///
-/// `now` is injected for deterministic unit tests. Production callers pass
-/// `chrono-less` wall-clock via `SystemTime::now()`.
-pub fn sign_get(
+/// Arguments:
+/// - `method`: ASCII uppercase (`"GET"`, `"PUT"`, `"POST"`, `"DELETE"`).
+/// - `host`: `<bucket>.s3.<region>.amazonaws.com` for virtual-hosted
+///   style, or the endpoint host for path-style via `AWS_ENDPOINT_URL`.
+/// - `path`: `/<encoded-key>`; the caller passed it through
+///   `encode_key`.
+/// - `query`: canonical query — sorted by key, URL-encoded per
+///   SigV4 rules, keys without values rendered as `key=` (empty).
+///   May be empty.
+/// - `payload_hash`: lowercase hex SHA-256 of the body, or the
+///   literal string `"UNSIGNED-PAYLOAD"`. S3 PUT / POST accept the
+///   latter over HTTPS.
+/// - `now`: injected for deterministic tests.
+pub fn sign_request(
+    method: &str,
     creds: &SigV4Credentials,
-    scheme: &str, // "https" or "http" (for MinIO / LocalStack)
+    scheme: &str,
     host: &str,
     path: &str,
-    query: &str, // may be empty
+    query: &str,
     extra_headers: &[ExtraHeader],
-    now: (u16, u8, u8, u8, u8, u8), // year, month, day, hour, minute, second UTC
+    payload_hash: &str,
+    now: (u16, u8, u8, u8, u8, u8),
 ) -> Result<SignedRequest> {
     let (yyyy, mm, dd, h, m, s) = now;
     let amz_date = format!(
@@ -61,10 +72,6 @@ pub fn sign_get(
         yyyy, mm, dd, h, m, s
     );
     let date_only = format!("{:04}{:02}{:02}", yyyy, mm, dd);
-
-    // Required S3 header for SigV4. Use UNSIGNED-PAYLOAD for a no-body GET;
-    // S3 accepts this and it avoids hashing an empty request body.
-    let payload_hash = "UNSIGNED-PAYLOAD";
 
     // Collect headers that go into the signature (canonical + signed lists).
     // Required: host, x-amz-content-sha256, x-amz-date.
@@ -92,8 +99,8 @@ pub fn sign_get(
         .join(";");
 
     let canonical_request = format!(
-        "GET\n{}\n{}\n{}\n{}\n{}",
-        path, query, canonical_headers, signed_headers, payload_hash
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method, path, query, canonical_headers, signed_headers, payload_hash
     );
     let hashed_canonical = hex_sha256(canonical_request.as_bytes());
 
@@ -112,10 +119,6 @@ pub fn sign_get(
         creds.access_key, scope, signed_headers, signature
     );
 
-    // Assemble the final request. Host goes into the URL; the Host header
-    // isn't sent explicitly because ureq derives it from the URL — but it
-    // IS part of the signature. (Both sides compute the same canonical
-    // request as long as the URL host matches what we signed.)
     let url = if query.is_empty() {
         format!("{}://{}{}", scheme, host, path)
     } else {
@@ -130,6 +133,30 @@ pub fn sign_get(
     out_headers.push(("Authorization".to_string(), authorization));
 
     Ok(SignedRequest { url, headers: out_headers })
+}
+
+/// Sign a GET. Thin wrapper over `sign_request` for the common
+/// read path. Uses `UNSIGNED-PAYLOAD` for the body hash (no body).
+pub fn sign_get(
+    creds: &SigV4Credentials,
+    scheme: &str,
+    host: &str,
+    path: &str,
+    query: &str,
+    extra_headers: &[ExtraHeader],
+    now: (u16, u8, u8, u8, u8, u8),
+) -> Result<SignedRequest> {
+    sign_request(
+        "GET",
+        creds,
+        scheme,
+        host,
+        path,
+        query,
+        extra_headers,
+        "UNSIGNED-PAYLOAD",
+        now,
+    )
 }
 
 // ── primitives ────────────────────────────────────────────────────────────

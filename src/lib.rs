@@ -19,7 +19,10 @@ pub mod method;
 pub mod options;
 pub mod pipeline;
 pub mod sevenz;
+#[path = "update/local.rs"]
 pub mod update;
+#[path = "update/s3.rs"]
+pub mod update_s3;
 
 // ── OS / platform (`src/platform/mod.rs` is the base platform module) ─────
 pub mod platform;

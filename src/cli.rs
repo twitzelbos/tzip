@@ -624,6 +624,16 @@ pub struct GrepArgs {
     #[arg(long, conflicts_with = "password")]
     pub password_file: Option<PathBuf>,
 
+    /// Phase-6 index cache directory; mirrors `tzip query`'s flag.
+    /// Remote archives populate + consult this cache for
+    /// `.tzip/terms.v1` posting lists. Repeated greps across the
+    /// same remote archive skip the term-index Range GET.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    #[arg(long, value_name = "MB", default_value_t = 256u64)]
+    pub cache_size_mb: u64,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
@@ -824,6 +834,7 @@ pub struct GrepOptions {
     pub checkpoint: Option<PathBuf>,
     pub resume: bool,
     pub password: Option<String>,
+    pub cache: Option<crate::indexcache::IndexCacheSpec>,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -1149,6 +1160,7 @@ impl GrepArgs {
             checkpoint: self.checkpoint,
             resume: self.resume,
             password,
+            cache: cache_spec_from_flags(self.cache_dir, self.cache_size_mb),
             quiet: self.quiet,
             verbose: self.verbose,
         })
@@ -1372,6 +1384,15 @@ pub struct AggregateArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Phase-6 index cache directory; mirrors `tzip query`'s flag.
+    /// Remote archives populate + consult this cache for repeat
+    /// `aggregate` calls. Local archives ignore it.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    #[arg(long, value_name = "MB", default_value_t = 256u64)]
+    pub cache_size_mb: u64,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
     #[arg(short = 'v', long)]
@@ -1385,6 +1406,7 @@ pub struct AggregateOptions {
     pub fields: bool,
     pub top: usize,
     pub json: bool,
+    pub cache: Option<crate::indexcache::IndexCacheSpec>,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -1400,6 +1422,7 @@ impl AggregateArgs {
             fields: self.fields,
             top: self.top,
             json: self.json,
+            cache: cache_spec_from_flags(self.cache_dir, self.cache_size_mb),
             quiet: self.quiet,
             verbose: self.verbose,
         })
@@ -1410,9 +1433,9 @@ impl AggregateArgs {
 
 #[derive(Args, Debug)]
 pub struct QueryArgs {
-    /// Archive to query. Only local paths for now — DuckDB reads the
-    /// extracted Parquet sidecar from a temp file.
-    pub archive: PathBuf,
+    /// Archive to query. Accepts local paths, `http(s)://` URLs,
+    /// and `s3://bucket/key.zip` URLs.
+    pub archive: String,
 
     /// SQL to run. The columnar sidecar is registered as a view
     /// named `tzip`, so `SELECT status, COUNT(*) FROM tzip GROUP BY
@@ -1432,6 +1455,20 @@ pub struct QueryArgs {
     /// EOCD / CDR parse paths still need it on AES-sealed archives.
     #[arg(short = 'p', long)]
     pub password: Option<String>,
+
+    /// Keep index entries (name/term/facet/columnar sidecars) in a
+    /// client-side on-disk LRU cache under this directory. First
+    /// query cold-fetches; subsequent queries against the same
+    /// remote archive hit the cache. Default: platform-standard
+    /// cache dir when `--cache-dir=` is given with an empty value,
+    /// or omit the flag entirely to skip caching.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Cap on the on-disk cache size in megabytes. Oldest entries
+    /// are evicted first when the budget is exceeded. Default 256 MB.
+    #[arg(long, value_name = "MB", default_value_t = 256u64)]
+    pub cache_size_mb: u64,
 
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -1458,6 +1495,31 @@ impl QueryArgs {
             sql: self.sql,
             format,
             password: self.password,
+            cache: cache_spec_from_flags(self.cache_dir, self.cache_size_mb),
         })
     }
+}
+
+/// Resolve the user's `--cache-dir` + `--cache-size-mb` flags into
+/// an `IndexCacheSpec`. `cache_dir = None` → caching disabled;
+/// `cache_dir = Some(empty)` → platform default path; otherwise the
+/// given directory.
+pub(crate) fn cache_spec_from_flags(
+    dir: Option<PathBuf>,
+    size_mb: u64,
+) -> Option<crate::indexcache::IndexCacheSpec> {
+    let dir = match dir {
+        None => return None,
+        Some(p) if p.as_os_str().is_empty() => {
+            match crate::indexcache::IndexCache::default_dir() {
+                Some(d) => d,
+                None => return None,
+            }
+        }
+        Some(p) => p,
+    };
+    Some(crate::indexcache::IndexCacheSpec {
+        dir,
+        max_bytes: size_mb.saturating_mul(1024 * 1024),
+    })
 }

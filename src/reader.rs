@@ -24,20 +24,67 @@ use crate::zipreader::{Archive, ReadEntry};
 /// anything else → local file path. Called by every reader subcommand so
 /// local and remote behave identically downstream of this seam.
 pub(crate) fn open_archive(spec: &str) -> Result<Archive> {
+    open_archive_with_cache(spec, None)
+}
+
+/// Same as `open_archive` but with an optional Phase-6 index cache.
+/// Local archives ignore it (no payoff: index reads are already a
+/// local file seek). Remote archives (http/https/s3) stash + return
+/// the ETag / Last-Modified fingerprint captured at open time;
+/// subsequent `.tzip/*.v1` loads consult the cache first.
+pub(crate) fn open_archive_with_cache(
+    spec: &str,
+    cache: Option<std::sync::Arc<crate::indexcache::IndexCache>>,
+) -> Result<Archive> {
     // Local paths go through `Archive::open` so multi-disk spanned
     // archives get stitched across their sibling `.z01`..`.zip` files.
     // Remote schemes (http/https/s3) don't have sibling disks — they
     // use `open_source_for` + `open_source`, which fails loudly on
     // multi-disk EOCDs rather than silently misinterpreting them.
-    if spec.starts_with("s3://")
-        || spec.starts_with("http://")
-        || spec.starts_with("https://")
-    {
-        let src = open_source_for(spec)?;
-        Archive::open_source(src)
+    if spec.starts_with("s3://") {
+        let rest = &spec["s3://".len()..];
+        let src = crate::sources::s3::S3Source::open(rest)
+            .with_context(|| format!("open S3 source s3://{}", rest))?;
+        let binding = cache_binding_for_remote(spec, src.fingerprint(), src.url().len() as u64, cache);
+        Archive::open_source_with_cache(Box::new(src), binding)
+    } else if spec.starts_with("http://") || spec.starts_with("https://") {
+        let src = crate::sources::http::HttpSource::open(spec)
+            .with_context(|| format!("open HTTP source {}", spec))?;
+        let binding = cache_binding_for_remote(
+            src.url(),
+            src.fingerprint(),
+            // Content-Length is available via Seek(SeekFrom::End(0))
+            // after open; it's used only as a last-ditch fingerprint
+            // when ETag/Last-Modified are absent.
+            0,
+            cache,
+        );
+        Archive::open_source_with_cache(Box::new(src), binding)
     } else {
         Archive::open(Path::new(spec))
     }
+}
+
+/// Build the (cache, archive-id) pair the Archive needs when a
+/// cache is in scope. `ETag` is the strongest fingerprint; falls
+/// back to `Last-Modified` (already encoded into `fingerprint`
+/// by the source) or to a weak `<len>` string when both are
+/// missing. Returns `None` when the caller passed no cache.
+fn cache_binding_for_remote(
+    url: &str,
+    fingerprint: Option<&str>,
+    weak_len: u64,
+    cache: Option<std::sync::Arc<crate::indexcache::IndexCache>>,
+) -> Option<(
+    std::sync::Arc<crate::indexcache::IndexCache>,
+    crate::indexcache::ArchiveId,
+)> {
+    let cache = cache?;
+    let fp: String = match fingerprint {
+        Some(s) => s.to_string(),
+        None => format!("len={}", weak_len),
+    };
+    Some((cache, crate::indexcache::ArchiveId::derive(url, &fp)))
 }
 
 /// Caller-known source hint. When the caller has already opened and
@@ -66,18 +113,9 @@ pub(crate) fn hint_from_archive(spec: &str, arch: &Archive) -> Option<SourceHint
 }
 
 /// Open a raw `Read + Seek + Send` backing source for `spec` without
-/// parsing the archive. Used by `tzip grep`'s inner workers so each
-/// worker holds its own independent source (connection) against the
-/// same archive — avoids contention on one shared fd / connection.
-pub(crate) fn open_source_for(spec: &str) -> Result<Box<dyn crate::sources::ReadSeek>> {
-    open_source_for_with_hint(spec, None)
-}
-
-/// Same as `open_source_for` but with an optional pre-probed hint,
-/// avoiding a second EOCD scan (local) or length-probe HEAD/GET
-/// (remote) per worker when the caller already knows the archive's
-/// shape. Extract/grep hoist the probe to the main thread and hand
-/// `Some(hint)` to each worker.
+/// parsing the archive, taking a pre-probed shape hint so grep /
+/// extract inner workers skip a second EOCD scan (local) or
+/// length-probe HEAD/GET (remote). `None` = unknown, probe.
 pub(crate) fn open_source_for_with_hint(
     spec: &str,
     hint: Option<SourceHint>,

@@ -24,6 +24,10 @@ pub struct HttpSource {
     pos: u64,
     cache_start: u64,
     cache: Vec<u8>,
+    /// ETag (preferred) or `Last-Modified` from the opening probe,
+    /// used by the index cache (Phase 6) as a content-change
+    /// fingerprint. `None` when the server emits neither.
+    fingerprint: Option<String>,
 }
 
 impl HttpSource {
@@ -32,7 +36,7 @@ impl HttpSource {
     /// the server doesn't answer HEAD well.
     pub fn open(url: &str) -> Result<Self> {
         let agent = build_agent();
-        let (len, supports_ranges) = probe_length_and_ranges(&agent, url)?;
+        let (len, supports_ranges, fingerprint) = probe_length_and_ranges(&agent, url)?;
         if !supports_ranges {
             bail!(
                 "server at {} does not support Range requests \
@@ -48,6 +52,7 @@ impl HttpSource {
             pos: 0,
             cache_start: 0,
             cache: Vec::new(),
+            fingerprint,
         })
     }
 
@@ -67,7 +72,21 @@ impl HttpSource {
             pos: 0,
             cache_start: 0,
             cache: Vec::new(),
+            fingerprint: None,
         })
+    }
+
+    /// URL this source was opened against. Used by Phase 6 cache
+    /// code to derive the archive ID.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// ETag / Last-Modified captured at open time. `None` if the
+    /// server didn't emit either (or we came in via
+    /// `open_with_len`'s cold path).
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
     }
 
     fn fetch(&mut self, start: u64, min_len: u64) -> io::Result<()> {
@@ -161,7 +180,10 @@ fn build_agent() -> ureq::Agent {
         .build()
 }
 
-fn probe_length_and_ranges(agent: &ureq::Agent, url: &str) -> Result<(u64, bool)> {
+fn probe_length_and_ranges(
+    agent: &ureq::Agent,
+    url: &str,
+) -> Result<(u64, bool, Option<String>)> {
     // HEAD first.
     match agent.head(url).call() {
         Ok(resp) => {
@@ -172,8 +194,9 @@ fn probe_length_and_ranges(agent: &ureq::Agent, url: &str) -> Result<(u64, bool)
                 .header("Accept-Ranges")
                 .map(|s| s.to_ascii_lowercase());
             let supports_ranges = accepts.as_deref().map(|s| s.contains("bytes")).unwrap_or(false);
+            let fingerprint = pick_fingerprint(&resp);
             if let Some(len) = len {
-                return Ok((len, supports_ranges));
+                return Ok((len, supports_ranges, fingerprint));
             }
         }
         Err(e) => {
@@ -197,11 +220,12 @@ fn probe_length_and_ranges(agent: &ureq::Agent, url: &str) -> Result<(u64, bool)
     if status == 200 {
         // Server ignored our Range header and returned the whole body.
         // That's a "no Range support" signal.
-        return Ok((0, false));
+        return Ok((0, false, None));
     }
     if status != 206 {
         bail!("unexpected status {} on Range probe for {}", status, url);
     }
+    let fingerprint = pick_fingerprint(&resp);
     let content_range = resp
         .header("Content-Range")
         .ok_or_else(|| anyhow!("206 without Content-Range from {}", url))?
@@ -212,7 +236,21 @@ fn probe_length_and_ranges(agent: &ureq::Agent, url: &str) -> Result<(u64, bool)
         .nth(1)
         .and_then(|t| t.parse::<u64>().ok())
         .ok_or_else(|| anyhow!("could not parse Content-Range {:?}", content_range))?;
-    Ok((total, true))
+    Ok((total, true, fingerprint))
+}
+
+/// Pick the strongest "did the archive change" fingerprint the
+/// server exposed. ETag is byte-content, `Last-Modified` is a
+/// coarser timestamp — either works as a cache-invalidation key,
+/// since any change we care about moves both.
+fn pick_fingerprint(resp: &ureq::Response) -> Option<String> {
+    if let Some(e) = resp.header("ETag") {
+        return Some(e.to_string());
+    }
+    if let Some(m) = resp.header("Last-Modified") {
+        return Some(m.to_string());
+    }
+    None
 }
 
 fn ureq_to_io(e: ureq::Error) -> io::Error {

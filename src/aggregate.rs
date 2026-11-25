@@ -5,10 +5,14 @@ use anyhow::{bail, Result};
 use std::io::Write;
 
 use crate::cli::AggregateOptions;
-use crate::reader::open_archive;
+use crate::reader::open_archive_with_cache;
 
 pub fn run(opts: AggregateOptions) -> Result<()> {
-    let arch = open_archive(&opts.archive)?;
+    let cache = match &opts.cache {
+        Some(spec) => Some(spec.open()?),
+        None => None,
+    };
+    let arch = open_archive_with_cache(&opts.archive, cache)?;
 
     if opts.fields {
         let mut out = std::io::stdout().lock();

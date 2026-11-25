@@ -66,3 +66,15 @@ jobs:
 
       - name: cargo test
         run: cargo test --verbose
+
+      # Architectural lint: narrow interfaces + no module cycles +
+      # bounded directory sizes. Keeps the structural gains from PR
+      # #62 (the big deslop refactor) from drifting back as the
+      # codebase grows. Pinned to a crates.io version so CI stays
+      # deterministic; runs on both OSes because `--target` /
+      # `#[cfg]`-gated modules differ between macOS and Linux and
+      # the lint re-indexes per configuration.
+      - name: Install deslop-please
+        run: cargo install --locked deslop-please@0.1.4
+      - name: Run deslop-please
+        run: deslop-please

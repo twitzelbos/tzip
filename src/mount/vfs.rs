@@ -893,10 +893,21 @@ impl VirtualFs {
             format!("chdir into commit staging {}", staging.path().display())
         })?;
         let opts = self.commit_options(&archive_path, std::path::Path::new("."), tombstones)?;
-        let run_result = crate::pipeline::run(opts);
+        // `tzip u` dispatch at this layer: `opts.update == true` and
+        // the archive exists (otherwise we'd be creating from a FUSE
+        // mount, which is nonsensical). Call `update::run_update`
+        // directly rather than going through `pipeline::run` so the
+        // create-mode pipeline doesn't have to know about the update
+        // path (previously was `pipeline → update`, which fed the
+        // module cycle the deslop-please lint fixed).
+        let run_result = if opts.update && opts.archive.exists() {
+            crate::update::run_update(opts)
+        } else {
+            crate::pipeline::run(opts)
+        };
         // Always restore cwd, even on error.
         let _ = std::env::set_current_dir(&original_cwd);
-        run_result.context("commit via pipeline::run")?;
+        run_result.context("commit writeback")?;
 
         if self.verbose {
             eprintln!(

@@ -19,6 +19,7 @@ pub mod find;
 pub mod grep;
 pub mod hash;
 pub mod facets;
+pub mod indexcache;
 pub mod nameidx;
 pub mod query;
 pub mod termidx;

@@ -41,6 +41,11 @@ pub struct S3Source {
     pos: u64,
     cache_start: u64,
     cache: Vec<u8>,
+    /// ETag of the S3 object captured at open time. S3 always emits
+    /// one; absent only if the upstream (MinIO / LocalStack) stripped
+    /// it. Used as the index cache's content-change fingerprint
+    /// (Phase 6).
+    fingerprint: Option<String>,
 }
 
 pub(crate) struct Credentials {
@@ -84,9 +89,22 @@ impl S3Source {
             pos: 0,
             cache_start: 0,
             cache: Vec::new(),
+            fingerprint: None,
         };
         src.probe_len()?;
         Ok(src)
+    }
+
+    /// URL of the opened object (scheme + host + uri path).
+    /// Used by Phase 6 cache code to derive the archive ID.
+    pub fn url(&self) -> String {
+        self.object_url()
+    }
+
+    /// ETag captured at open time; `None` on backends that didn't
+    /// emit one.
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
     }
 
     /// Construct an `S3Source` with a caller-supplied object length,
@@ -120,6 +138,7 @@ impl S3Source {
             pos: 0,
             cache_start: 0,
             cache: Vec::new(),
+            fingerprint: None,
         })
     }
 
@@ -141,6 +160,9 @@ impl S3Source {
             .header("Content-Range")
             .ok_or_else(|| anyhow!("S3 probe response missing Content-Range"))?
             .to_string();
+        // Capture the S3 ETag for the index cache (Phase 6) before
+        // consuming the response body.
+        self.fingerprint = resp.header("ETag").map(|s| s.to_string());
         let total = cr
             .split('/')
             .nth(1)

@@ -31,7 +31,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use crate::cli::GrepOptions;
-use crate::reader::{open_archive, stream_entry_to};
+use crate::reader::{open_archive_with_cache, stream_entry_to};
 use crate::sources::s3_list;
 use crate::zipreader::ReadEntry;
 
@@ -62,7 +62,15 @@ pub fn run(opts: GrepOptions) -> Result<()> {
         .unwrap_or_default();
     let cp_writer: Option<Arc<Mutex<File>>> = checkpoint.as_ref().map(|cp| cp.writer.clone());
 
-    // 4. Outer fan-out: archives in parallel.
+    // 4. Build the Phase-6 index cache once per invocation. Shared
+    //    across all archive workers via Arc — concurrent `tzip grep`s
+    //    against the same URL set share the same on-disk cache.
+    let cache = match &opts.cache {
+        Some(spec) => Some(spec.open()?),
+        None => None,
+    };
+
+    // 5. Outer fan-out: archives in parallel.
     let outer = rayon::ThreadPoolBuilder::new()
         .num_threads(opts.parallel)
         .thread_name(|i| format!("tzip-grep-outer-{}", i))
@@ -85,6 +93,7 @@ pub fn run(opts: GrepOptions) -> Result<()> {
                     Arc::clone(&skip),
                     cp_writer.clone(),
                     Arc::clone(&shared_out),
+                    cache.clone(),
                 )
             })
     })?;
@@ -101,9 +110,10 @@ fn process_archive(
     skip: Arc<HashSet<(String, String)>>,
     cp_writer: Option<Arc<Mutex<File>>>,
     out: Arc<Mutex<Box<dyn Write + Send>>>,
+    cache: Option<Arc<crate::indexcache::IndexCache>>,
 ) -> Result<()> {
     // Phase 1: parse CDR, filter entries, populate lfh_total_size.
-    let mut driver = open_archive(url)
+    let mut driver = open_archive_with_cache(url, cache)
         .with_context(|| format!("open archive {}", url))?;
     // Narrow the global `(url, name)` skip set to the entries we'd
     // actually probe on THIS archive, as a `HashSet<&str>` keyed by

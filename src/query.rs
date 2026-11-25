@@ -40,10 +40,16 @@ pub enum QueryFormat {
 }
 
 pub struct QueryOpts {
-    pub archive: PathBuf,
+    /// Archive spec: local path, `http(s)://` URL, or `s3://` URL.
+    pub archive: String,
     pub sql: String,
     pub format: QueryFormat,
     pub password: Option<String>,
+    /// When set, index entries (including the columnar sidecar)
+    /// extracted from this archive are kept in an on-disk LRU under
+    /// `spec.dir`. Repeat queries against the same remote archive
+    /// then hit the cache instead of re-fetching.
+    pub cache: Option<crate::indexcache::IndexCacheSpec>,
 }
 
 /// Dispatch one SQL query against an archive's columnar sidecar.
@@ -59,8 +65,12 @@ pub fn run(opts: QueryOpts) -> Result<()> {
     // apply, surface the create-side error first — otherwise users
     // follow the install hint and still hit the sidecar error on
     // the next run.
-    let mut archive = Archive::open(&opts.archive)
-        .with_context(|| format!("open archive {}", opts.archive.display()))?;
+    let cache_arc = match &opts.cache {
+        Some(spec) => Some(spec.open()?),
+        None => None,
+    };
+    let mut archive = crate::reader::open_archive_with_cache(&opts.archive, cache_arc)
+        .with_context(|| format!("open archive {}", opts.archive))?;
     let payload = extract_columnar_entry(&mut archive, opts.password.as_deref())?;
 
     if which_duckdb().is_none() {
@@ -69,7 +79,7 @@ pub fn run(opts: QueryOpts) -> Result<()> {
              - macOS:  brew install duckdb\n\
              - Linux:  apt install duckdb  (or download from https://duckdb.org/docs/installation/)\n\
              Alternatively, extract the sidecar with `tzip x {} {}` and query it directly.",
-            opts.archive.display(),
+            opts.archive,
             crate::columnar::INDEX_ENTRY_NAME,
         );
     }

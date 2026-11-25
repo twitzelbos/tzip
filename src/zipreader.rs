@@ -126,6 +126,19 @@ pub struct Archive {
     /// Per-field facet segments. Each field maps to one or more
     /// `Facet` instances; `facet()` merges counts across them.
     facet_segments: std::collections::HashMap<String, Vec<crate::facets::Facet>>,
+    /// Phase 6 index cache binding. Set via `attach_cache`.
+    /// `None` on local archives (no payoff — body-reads are already
+    /// a local file-seek) and on remote archives opened without an
+    /// `--cache-dir`.
+    cache_ctx: Option<CacheCtx>,
+}
+
+/// Per-archive cache binding: shared cache handle + this archive's
+/// identity within it. Cloneable because the cache handle is an Arc.
+#[derive(Clone)]
+struct CacheCtx {
+    cache: std::sync::Arc<crate::indexcache::IndexCache>,
+    archive_id: crate::indexcache::ArchiveId,
 }
 
 impl Archive {
@@ -150,7 +163,7 @@ impl Archive {
             .with_context(|| format!("find EOCD on {}", path.display()))?;
 
         if eocd.this_disk == 0 && eocd.cd_disk == 0 {
-            return Self::finish_parse(Box::new(file), file_size, eocd_pos, eocd)
+            return Self::finish_parse(Box::new(file), file_size, eocd_pos, eocd, None)
                 .with_context(|| format!("parse {}", path.display()));
         }
 
@@ -202,7 +215,7 @@ impl Archive {
         let rw_handle = file
             .try_clone()
             .context("dup archive fd for rw hand-off")?;
-        let arch = Self::finish_parse(Box::new(file), file_size, eocd_pos, eocd)
+        let arch = Self::finish_parse(Box::new(file), file_size, eocd_pos, eocd, None)
             .with_context(|| format!("parse {}", path.display()))?;
         Ok((arch, rw_handle))
     }
@@ -211,7 +224,22 @@ impl Archive {
     /// in-memory cursors — anything implementing `ReadSeek`. The source
     /// must be single-disk; multi-disk archives come through `open`
     /// above (local-only, since sibling disks live on the filesystem).
-    pub fn open_source(mut source: Box<dyn ReadSeek>) -> Result<Self> {
+    pub fn open_source(source: Box<dyn ReadSeek>) -> Result<Self> {
+        Self::open_source_with_cache(source, None)
+    }
+
+    /// Same as `open_source` but with an optional Phase-6 index
+    /// cache + archive identity attached before `.tzip/*.v1` index
+    /// entries get loaded. Passing `Some((cache, id))` turns repeat
+    /// opens of the same remote archive into cache-hit reads —
+    /// no Range GET for already-seen index sentinels.
+    pub fn open_source_with_cache(
+        mut source: Box<dyn ReadSeek>,
+        cache_binding: Option<(
+            std::sync::Arc<crate::indexcache::IndexCache>,
+            crate::indexcache::ArchiveId,
+        )>,
+    ) -> Result<Self> {
         let file_size = source
             .seek(SeekFrom::End(0))
             .context("seek to end of archive source")?;
@@ -231,7 +259,7 @@ impl Archive {
             );
         }
 
-        Self::finish_parse(source, file_size, eocd_pos, eocd)
+        Self::finish_parse(source, file_size, eocd_pos, eocd, cache_binding)
     }
 
     /// Shared tail of `open` and `open_source`: given a source whose EOCD
@@ -245,6 +273,10 @@ impl Archive {
         file_size: u64,
         eocd_pos: u64,
         eocd: Eocd,
+        cache_binding: Option<(
+            std::sync::Arc<crate::indexcache::IndexCache>,
+            crate::indexcache::ArchiveId,
+        )>,
     ) -> Result<Self> {
         let (entry_count, cd_size, cd_offset) = if eocd.needs_zip64() {
             let z64 = find_eocd64(&mut *source, eocd_pos)
@@ -292,6 +324,7 @@ impl Archive {
             name_segments: Vec::new(),
             term_segments: Vec::new(),
             facet_segments: std::collections::HashMap::new(),
+            cache_ctx: cache_binding.map(|(cache, archive_id)| CacheCtx { cache, archive_id }),
         };
         arch.try_load_name_segments();
         arch.try_load_term_segments();
@@ -396,6 +429,7 @@ impl Archive {
             name_segments: Vec::new(),
             term_segments: Vec::new(),
             facet_segments: std::collections::HashMap::new(),
+            cache_ctx: None,
         };
         arch.try_load_name_segments();
         arch.try_load_term_segments();
@@ -482,7 +516,19 @@ impl Archive {
     /// read them directly off the source without going through the
     /// decompress stack. Returns `None` on any failure so callers
     /// just skip the feature.
+    ///
+    /// When an index cache is attached (Phase 6), consults it before
+    /// touching the underlying source and writes back on a miss.
+    /// Cache hits turn `.tzip/*.v1` reads from "Range GET over the
+    /// network" into "fs::read of a local file" — the mechanism that
+    /// gets a repeated remote aggregate / query under the roadmap's
+    /// p99 target.
     fn read_index_body(&mut self, name: &str) -> Option<Vec<u8>> {
+        if let Some(ctx) = &self.cache_ctx {
+            if let Some(body) = ctx.cache.get(&ctx.archive_id, name) {
+                return Some(body);
+            }
+        }
         let idx = self.entries.iter().position(|e| e.name == name)?;
         self.lfh_total_size_of(idx).ok()?;
         let re = &self.entries[idx];
@@ -495,7 +541,26 @@ impl Archive {
             .seek(SeekFrom::Start(body_off))
             .and_then(|_| self.source.read_exact(&mut body))
             .ok()?;
+        if let Some(ctx) = &self.cache_ctx {
+            // Best-effort cache populate. A write failure (disk
+            // full, permissions) doesn't fail the read.
+            let _ = ctx.cache.put(&ctx.archive_id, name, &body);
+        }
         Some(body)
+    }
+
+    /// Attach a Phase-6 index cache to this archive. All subsequent
+    /// `.tzip/*.v1[*.segN]` reads consult the cache first and
+    /// populate on miss. Caller is responsible for deriving the
+    /// `ArchiveId` from the source's URL + content fingerprint
+    /// (ETag / Last-Modified / Content-Length) so stale buckets
+    /// age out instead of serving wrong bytes.
+    pub fn attach_cache(
+        &mut self,
+        cache: std::sync::Arc<crate::indexcache::IndexCache>,
+        archive_id: crate::indexcache::ArchiveId,
+    ) {
+        self.cache_ctx = Some(CacheCtx { cache, archive_id });
     }
 
     /// Try to load every `.tzip/facets.v1/<leaf>[.segN]` entry as a

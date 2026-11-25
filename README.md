@@ -45,7 +45,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [Searching across many archives (`tzip grep`)](#searching-across-many-archives-tzip-grep)
 - [Aggregations over facet indices (`tzip aggregate`)](#aggregations-over-facet-indices-tzip-aggregate)
 - [Streamed JSON filtering (`tzip jq`)](#streamed-json-filtering-tzip-jq)
-- [SQL via embedded DuckDB (`tzip query`)](#sql-via-embedded-duckdb-tzip-query)
+- [SQL via the DuckDB CLI (`tzip query`)](#sql-via-the-duckdb-cli-tzip-query)
 - [Finding entries across archives (`tzip find`)](#finding-entries-across-archives-tzip-find)
 - [Diffing archives (`tzip diff`)](#diffing-archives-tzip-diff)
 - [Mounting archives as a filesystem (`tzip mount`)](#mounting-archives-as-a-filesystem-tzip-mount)
@@ -169,7 +169,7 @@ tzip aggregate --by status_code logs.zip
 # Ad-hoc jq filter — compiled once, applied per entry
 tzip jq -r 'select(.status_code == 500) | "\(.ts) \(.path)"' logs.zip
 
-# SQL via embedded DuckDB on the Parquet sidecar
+# SQL via the DuckDB CLI on the Parquet sidecar
 tzip query -s "SELECT path, AVG(latency_ms) FROM tzip
                GROUP BY path ORDER BY 2 DESC LIMIT 10" logs.zip
 
@@ -827,7 +827,7 @@ aggregates or joins — see [Picking the right verb](#picking-the-right-verb).
 
 ---
 
-## SQL via embedded DuckDB (`tzip query`)
+## SQL via the DuckDB CLI (`tzip query`)
 
 `tzip query -s "SELECT ..." archive.zip` dispatches to the system
 `duckdb` CLI with the archive's `.tzip/columnar.v1.parquet`

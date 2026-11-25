@@ -147,6 +147,15 @@ arrow-schema = "60"
 # `ArrowReaderMetadata::load(&Bytes, ...)`.
 bytes = "1"
 
+# `tzip jq` streamed-JSON filter. jaq is a pure-Rust jq clone that
+# compiles filters once and runs them against arbitrary values —
+# fits naturally with tzip's per-entry stream model. No tokio, no
+# bundled C deps; faster than jq 1.6 on the kinds of ad-hoc queries
+# tzip users run across archive shards.
+jaq-core = "3"
+jaq-std = "3"
+jaq-json = "2"
+
 # Linux io_uring reader (optional, behind the `io-uring` feature) +
 # FUSE3 for `tzip mount`. `fuser` only compiles on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -243,6 +252,9 @@ path = "tests/cmd/grep.rs"
 [[test]]
 name = "reader"
 path = "tests/cmd/reader.rs"
+[[test]]
+name = "jq"
+path = "tests/cmd/jq.rs"
 
 [[test]]
 name = "reader_http"

@@ -111,6 +111,14 @@ pub enum Cmd {
     /// DSL does (grouping, histograms via date_trunc, percentiles,
     /// joins) and more. Requires `duckdb` on PATH (brew/apt install).
     Query(QueryArgs),
+
+    /// Stream JSON entries through a jq filter. For every entry in
+    /// every passed archive matching `--include` (default `*.json`
+    /// + `*.jsonl`), decompresses the body, parses it as JSON,
+    /// applies the filter, and emits each output value on its own
+    /// line. Same `-r/--raw-output` semantic as real jq. Supports
+    /// shard fan-out (local paths, http(s)://, s3://bucket/*.zip).
+    Jq(JqArgs),
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -1426,6 +1434,70 @@ impl QueryArgs {
             format,
             password: self.password,
             cache: cache_spec_from_flags(self.cache_dir, self.cache_size_mb),
+        })
+    }
+}
+
+// ── Jq (streamed JSON filter) ──────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+pub struct JqArgs {
+    /// Filter source, same syntax as `jq`'s. Compiled once;
+    /// executed per JSON entry.
+    pub filter: String,
+
+    /// Archives to stream through the filter (shard fan-out):
+    /// local paths, `http(s)://` URLs, `s3://bucket/key.zip`
+    /// URLs, or `s3://bucket/prefix/*.zip` globs (expanded via
+    /// ListObjectsV2).
+    #[arg(required = true, value_name = "ARCHIVE")]
+    pub archives: Vec<String>,
+
+    /// Entry-name glob(s) to apply the filter to (repeatable).
+    /// Default: `*.json` + `*.jsonl`.
+    #[arg(long, value_name = "GLOB")]
+    pub include: Vec<String>,
+
+    /// Raw output: strings print without their JSON quotes. Same
+    /// semantic as `jq -r`.
+    #[arg(short = 'r', long)]
+    pub raw_output: bool,
+
+    /// Prefix every output line with `<archive>:<entry>\t` so
+    /// cross-shard streams stay traceable to their source.
+    #[arg(long)]
+    pub entry_prefix: bool,
+
+    /// Password for AES-encrypted entries.
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+
+    /// Keep index entries in the client-side on-disk LRU cache
+    /// under this directory. Same semantic as `tzip query`.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    #[arg(long, value_name = "MB", default_value_t = 256u64)]
+    pub cache_size_mb: u64,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+impl JqArgs {
+    pub fn into_options(self) -> Result<crate::jq::JqOpts> {
+        Ok(crate::jq::JqOpts {
+            archives: self.archives,
+            filter: self.filter,
+            include: self.include,
+            raw_output: self.raw_output,
+            entry_prefix: self.entry_prefix,
+            password: self.password,
+            cache: cache_spec_from_flags(self.cache_dir, self.cache_size_mb),
+            quiet: self.quiet,
+            verbose: self.verbose,
         })
     }
 }

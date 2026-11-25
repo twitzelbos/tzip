@@ -269,6 +269,9 @@ path = "tests/remote/reader_http.rs"
 [[test]]
 name = "reader_s3"
 path = "tests/remote/reader_s3.rs"
+[[test]]
+name = "writer_s3"
+path = "tests/remote/writer_s3.rs"
 
 [[test]]
 name = "linux_extent"

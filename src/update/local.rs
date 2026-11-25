@@ -51,7 +51,7 @@ const UNDO_VERSION: u32 = 1;
 /// - `name_seg` — next segment number for `.tzip/names.v1.segN`
 /// - `term_seg` — next segment number for `.tzip/terms.v1.segN`
 /// - `facet_segs` — next segment number per `--facet` leaf name
-fn next_segment_numbers(
+pub(crate) fn next_segment_numbers(
     existing: &[ReadEntry],
     facet_specs: &[String],
 ) -> (u32, u32, Vec<u32>, u32) {
@@ -116,7 +116,7 @@ fn next_segment_numbers(
 /// (`base_idx + k` for the `k`-th name in `seg.names`), so lookups
 /// against the finished archive resolve to the right entry
 /// regardless of how many segments precede this one.
-fn write_index_segment_entries<W: Write + Seek>(
+pub(crate) fn write_index_segment_entries<W: Write + Seek>(
     zw: &mut ZipWriter<W>,
     seg: &mut IndexSegment,
     opts: &Options,
@@ -199,7 +199,7 @@ fn write_index_segment_entries<W: Write + Seek>(
 /// the archive's existing base sidecar, or `None` when the flag
 /// was absent. Separate function so `run_update_append` reads
 /// linearly.
-fn resolve_columnar_schema_for_update(
+pub(crate) fn resolve_columnar_schema_for_update(
     opts: &Options,
     arch: &mut Archive,
 ) -> Result<Option<crate::columnar::ColumnarSchema>> {
@@ -232,7 +232,7 @@ fn resolve_columnar_schema_for_update(
 /// Per-invocation index-building state for `tzip u` indexing flags.
 /// Passed through `encode_items_into_writer`; the caller decides
 /// which segment number the resulting payloads land as.
-struct IndexSegment {
+pub(crate) struct IndexSegment {
     /// First absolute CDR position this segment covers — the writer
     /// position just before the encoder pass starts emitting new
     /// entries. Posting IDs in the finished segment are offsets
@@ -258,7 +258,7 @@ struct IndexSegment {
 }
 
 impl IndexSegment {
-    fn new(
+    pub(crate) fn new(
         opts: &Options,
         base_idx: u32,
         columnar_schema: Option<crate::columnar::ColumnarSchema>,
@@ -799,7 +799,7 @@ fn populate_lfh_size(arch: &mut Archive, re: &mut ReadEntry, want_name: String) 
 
 // ── Encoder helpers ────────────────────────────────────────────────────────
 
-fn encode_items_into_writer<W: Write + Seek>(
+pub(crate) fn encode_items_into_writer<W: Write + Seek>(
     opts: &Options,
     items: Vec<WorkItem>,
     zw: &mut ZipWriter<W>,

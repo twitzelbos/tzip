@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
 
-use tzip::{aggregate, bench, cli, diff, find, grep, hash, jq, mount, pipeline, query, reader, update};
+use tzip::{aggregate, bench, cli, diff, find, grep, hash, jq, mount, pipeline, query, reader, update, update_s3};
 
 fn main() -> Result<()> {
     // Parse via ArgMatches so UserSetFlags::from_matches can distinguish
@@ -26,7 +26,15 @@ fn main() -> Result<()> {
             // reached when the file already exists. Dispatching
             // at argv-parse time keeps `pipeline` from depending
             // on `update`, breaking a long-standing module cycle.
-            if opts.archive.exists() {
+            //
+            // `s3://` archives route to `update_s3::run_update_s3`
+            // (issue #68) — append via S3 multipart upload with
+            // server-side part copy. The live object never enters
+            // a half-written state: `CompleteMultipartUpload` is
+            // the atomic swap, `If-Match` provides the CAS.
+            if update_s3::is_s3_archive(&opts.archive) {
+                update_s3::run_update_s3(opts)
+            } else if opts.archive.exists() {
                 update::run_update(opts)
             } else {
                 pipeline::run(opts)

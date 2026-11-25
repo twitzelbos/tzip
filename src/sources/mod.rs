@@ -25,6 +25,7 @@ pub mod http;
 pub mod multidisk;
 pub mod s3;
 pub mod s3_list;
+pub mod s3_write;
 pub mod sigv4;
 
 /// Lazily-initialised process-global HTTP agent. ureq's `Agent` is an

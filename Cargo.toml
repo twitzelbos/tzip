@@ -132,6 +132,17 @@ security-framework = { version = "2.11", optional = true }
 compcol = { version = "0.8", default-features = false, features = ["zip_shrink", "zip_reduce", "zip_implode", "alloc", "deflate64", "ppmd"] }
 ppmd-rust = "1.5"
 
+# Phase 5 of the Elastic feature-parity work: Parquet columnar sidecar
+# for deep aggregations via DuckDB. `tzip create --write-columnar
+# schema.json` extracts declared fields into a Parquet file stored as
+# `.tzip/columnar.v1.parquet`; `tzip query --sql "..."` shells out to
+# the system `duckdb` CLI (not bundled) to run SQL against it.
+# parquet's `arrow` feature re-uses the arrow-{array,schema,buffer}
+# crates below. `snap` is Snappy, Parquet's default page codec.
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
+arrow-array = "60"
+arrow-schema = "60"
+
 # Linux io_uring reader (optional, behind the `io-uring` feature) +
 # FUSE3 for `tzip mount`. `fuser` only compiles on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]

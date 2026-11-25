@@ -86,6 +86,7 @@ fn build_shard(root: &Path, dir: &str, n: usize, tag: &str) -> PathBuf {
             "--facet",
             ".status_code",
             "--write-columnar",
+            "--columnar-schema",
             schema.file_name().unwrap().to_str().unwrap(),
             "-q",
         ],

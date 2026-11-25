@@ -262,15 +262,24 @@ pub struct CreateArgs {
     pub facet: Vec<String>,
 
     /// Build a Parquet columnar sidecar over JSON entries whose name
-    /// matches `--index-terms`. Argument is a path to a JSON schema
-    /// file listing the columns to extract (name / type / jq-style
-    /// path). Stored as `.tzip/columnar.v1.parquet` inside the
-    /// archive. Enables deep SQL aggregations via
+    /// matches `--index-terms`. Stored as `.tzip/columnar.v1.parquet`
+    /// inside the archive. Enables deep SQL aggregations via
     /// `tzip query --sql "..." archive.zip`, which dispatches to the
-    /// system `duckdb` CLI. See `src/columnar.rs` for the schema
-    /// format.
-    #[arg(long, value_name = "SCHEMA.json")]
-    pub write_columnar: Option<PathBuf>,
+    /// system `duckdb` CLI.
+    ///
+    /// Without `--columnar-schema`, tzip auto-infers the schema from
+    /// the first 128 JSON entries matching `--index-terms` (Phase
+    /// 5c). To hand-author the schema, see `src/index/columnar.rs`
+    /// for the format and pass `--columnar-schema SCHEMA.json`.
+    #[arg(long)]
+    pub write_columnar: bool,
+
+    /// Optional explicit columnar schema for `--write-columnar`.
+    /// When omitted, the schema is auto-inferred from the first
+    /// 128 JSON entries matching `--index-terms`. Only meaningful
+    /// with `--write-columnar`.
+    #[arg(long, value_name = "SCHEMA.json", requires = "write_columnar")]
+    pub columnar_schema: Option<PathBuf>,
 }
 
 // ── Update ─────────────────────────────────────────────────────────────────
@@ -885,7 +894,17 @@ impl CreateArgs {
             index_names: self.index_names,
             index_terms: self.index_terms,
             facet: self.facet,
-            write_columnar: self.write_columnar,
+            // Phase 5c: same mapping as UpdateArgs.
+            //   `--write-columnar` alone              → Some(empty PathBuf) = auto-infer.
+            //   `--write-columnar --columnar-schema P` → Some(P)            = explicit file.
+            //   flag absent                           → None                 = no columnar.
+            // The empty-PathBuf sentinel is recognised by
+            // `pipeline::run` / `infer_columnar_schema`.
+            write_columnar: if self.write_columnar {
+                Some(self.columnar_schema.unwrap_or_default())
+            } else {
+                None
+            },
         })
     }
 }

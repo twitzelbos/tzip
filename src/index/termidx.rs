@@ -52,6 +52,16 @@ pub const INDEX_ENTRY_NAME: &str = ".tzip/terms.v1";
 const MAGIC: [u8; 4] = *b"TZTI";
 const VERSION: u16 = 1;
 
+/// Trailer sub-magic. When the term-index payload has bytes left
+/// after the slot list, those bytes are the "indexed-entries"
+/// trailer: `[sub_magic (4)] [count (u32)] [count × u32]`. Added
+/// post-PR-#68 (ChatGPT review issue #1) so grep knows which
+/// entries the index covers; entries outside the set always get a
+/// linear-scan pass. Old archives (no trailer) → reader reports
+/// `indexed_entries = None` and the caller treats "coverage" as
+/// unknown.
+const TRAILER_MAGIC: [u8; 4] = *b"TZIS";
+
 /// Tokenizer config. Tokens outside `[MIN_TOKEN_LEN, MAX_TOKEN_LEN]`
 /// bytes are skipped. 3-char lower bound filters out "a", "is", "to"
 /// etc. that would blow up index size for no filter value; 64-char
@@ -91,11 +101,21 @@ pub fn tokenize(text: &[u8], out: &mut HashSet<Vec<u8>>) {
 pub struct TermIndexBuilder {
     /// term → sorted-set of entry indices that contain it
     postings: HashMap<Vec<u8>, Vec<u32>>,
+    /// Every entry index that was fed to `add_entry` /
+    /// `add_prepared`, in insertion order. Serialised as the
+    /// index-coverage trailer so grep can distinguish
+    /// "entry-was-indexed-and-didn't-match" from
+    /// "entry-was-never-indexed" at query time (the latter must
+    /// be linearly scanned; the former can be skipped).
+    indexed: Vec<u32>,
 }
 
 impl TermIndexBuilder {
     pub fn new() -> Self {
-        Self { postings: HashMap::new() }
+        Self {
+            postings: HashMap::new(),
+            indexed: Vec::new(),
+        }
     }
 
     pub fn add_entry(&mut self, entry_idx: u32, body: &[u8]) {
@@ -108,6 +128,12 @@ impl TermIndexBuilder {
     /// the encode worker, then shipped to the main thread so posting
     /// indices match CDR-emit order).
     pub fn add_prepared(&mut self, entry_idx: u32, tokens: Vec<Vec<u8>>) {
+        // Record coverage even if the body produced no indexable
+        // tokens — "I was fed to the index" is distinct from "I
+        // had something to contribute."
+        if self.indexed.last() != Some(&entry_idx) {
+            self.indexed.push(entry_idx);
+        }
         for t in tokens {
             // Deduplicate per-entry: a term can appear 1000× in one
             // body but should only contribute one posting entry.
@@ -123,6 +149,7 @@ impl TermIndexBuilder {
     /// zero-posting.
     pub fn finish(self) -> Result<Vec<u8>> {
         let terms: Vec<Vec<u8>> = self.postings.keys().cloned().collect();
+        let mut indexed = self.indexed.clone();
         if terms.is_empty() {
             // Emit a valid "no-terms" index. Reader treats as
             // never-hits.
@@ -131,6 +158,7 @@ impl TermIndexBuilder {
             out.write_u16::<LittleEndian>(VERSION)?;
             out.write_u32::<LittleEndian>(0)?;
             out.write_u32::<LittleEndian>(0)?;
+            append_coverage_trailer(&mut out, &mut indexed)?;
             return Ok(out);
         }
         let mph = Mphf::new(1.7, &terms);
@@ -167,8 +195,29 @@ impl TermIndexBuilder {
                 out.write_u32::<LittleEndian>(*p)?;
             }
         }
+        append_coverage_trailer(&mut out, &mut indexed)?;
         Ok(out)
     }
+}
+
+/// Emit the index-coverage trailer. Shape:
+///
+/// ```text
+/// [TRAILER_MAGIC (4)] [count u32] [count × entry_idx u32]
+/// ```
+///
+/// Readers that encounter the marker consume the trailer; readers
+/// that don't understand it still parse the slot list correctly —
+/// the trailer sits past the point where the mandatory block ends.
+fn append_coverage_trailer(out: &mut Vec<u8>, indexed: &mut Vec<u32>) -> Result<()> {
+    indexed.sort_unstable();
+    indexed.dedup();
+    out.write_all(&TRAILER_MAGIC)?;
+    out.write_u32::<LittleEndian>(indexed.len() as u32)?;
+    for idx in indexed {
+        out.write_u32::<LittleEndian>(*idx)?;
+    }
+    Ok(())
 }
 
 /// Parsed read-side term index.
@@ -178,6 +227,12 @@ pub struct TermIndex {
     /// `(canonical_term, posting_list)`. Empty when `mph` is `None`
     /// (zero-term archive).
     slots: Vec<(Vec<u8>, Vec<u32>)>,
+    /// Which CDR-entry indices this segment was built from.
+    /// `Some(set)` when the trailer was present (post-fix format);
+    /// `None` for old archives that predate the trailer — callers
+    /// must assume coverage is unknown and scan non-candidate
+    /// entries conservatively.
+    indexed: Option<std::collections::HashSet<u32>>,
 }
 
 impl TermIndex {
@@ -195,7 +250,12 @@ impl TermIndex {
         let n = cur.read_u32::<LittleEndian>()? as usize;
         let mph_len = cur.read_u32::<LittleEndian>()? as usize;
         if n == 0 {
-            return Ok(Self { mph: None, slots: Vec::new() });
+            let pos = cur.position() as usize;
+            return Ok(Self {
+                mph: None,
+                slots: Vec::new(),
+                indexed: parse_coverage_trailer(&payload[pos..]),
+            });
         }
         let pos = cur.position() as usize;
         if pos + mph_len > payload.len() {
@@ -203,7 +263,8 @@ impl TermIndex {
         }
         let mph: Mphf<Vec<u8>> =
             bincode::deserialize(&payload[pos..pos + mph_len]).context("parse MPH blob")?;
-        let mut cur = Cursor::new(&payload[pos + mph_len..]);
+        let slot_start = pos + mph_len;
+        let mut cur = Cursor::new(&payload[slot_start..]);
         let mut slots: Vec<(Vec<u8>, Vec<u32>)> = Vec::with_capacity(n);
         for _ in 0..n {
             let tl = cur.read_u16::<LittleEndian>()? as usize;
@@ -216,7 +277,23 @@ impl TermIndex {
             }
             slots.push((term, postings));
         }
-        Ok(Self { mph: Some(mph), slots })
+        let trailer_pos = slot_start + cur.position() as usize;
+        let indexed = parse_coverage_trailer(&payload[trailer_pos..]);
+        Ok(Self {
+            mph: Some(mph),
+            slots,
+            indexed,
+        })
+    }
+
+    /// `Some(true)` if `idx` was fed to this index at build time;
+    /// `Some(false)` if it wasn't; `None` for old-format archives
+    /// where the coverage trailer isn't present. Callers treat
+    /// `Some(false)` and `None` the same way — scan the entry
+    /// conservatively — but the distinction lets `tzip grep` warn
+    /// on legacy archives if it wants to.
+    pub fn covers(&self, idx: u32) -> Option<bool> {
+        self.indexed.as_ref().map(|set| set.contains(&idx))
     }
 
     /// Postings for a known-canonical lowercase term. `None` if the
@@ -266,6 +343,31 @@ impl TermIndex {
         }
         Some(acc)
     }
+}
+
+/// Try to parse the index-coverage trailer. Returns `None` when
+/// the trailing bytes are empty, don't start with the magic, or
+/// are truncated — all of which mean "pre-fix format, coverage
+/// unknown."
+fn parse_coverage_trailer(bytes: &[u8]) -> Option<std::collections::HashSet<u32>> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    if bytes[..4] != TRAILER_MAGIC {
+        return None;
+    }
+    let count = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let needed = 8 + count * 4;
+    if bytes.len() < needed {
+        return None;
+    }
+    let mut set = std::collections::HashSet::with_capacity(count);
+    for i in 0..count {
+        let off = 8 + i * 4;
+        let v = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+        set.insert(v);
+    }
+    Some(set)
 }
 
 #[cfg(test)]

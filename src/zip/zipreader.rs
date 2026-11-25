@@ -86,6 +86,24 @@ struct CacheCtx {
     archive_id: crate::indexcache::ArchiveId,
 }
 
+/// Was a CDR entry covered by the term index when it was built?
+/// Used by `tzip grep` to decide whether the candidate set from
+/// `term_candidates` is authoritative for that entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermCoverage {
+    /// At least one segment recorded this entry in its coverage
+    /// trailer. Grep can trust the candidate set — if `idx` isn't
+    /// in it, the entry can't match a literal query.
+    Covered,
+    /// Every segment with a trailer explicitly excluded this
+    /// entry (e.g. `.log` in a corpus built with `--index-terms
+    /// '*.json'`). Grep must scan it linearly.
+    NotCovered,
+    /// Legacy segment without a trailer (pre-fix format) OR no
+    /// term index at all. Grep must scan conservatively.
+    Unknown,
+}
+
 impl Archive {
     /// Open a local-file archive. Detects multi-disk (spanned)
     /// archives via the EOCD's `this_disk` field and transparently
@@ -634,6 +652,46 @@ impl Archive {
             }
         }
         Some(if any_usable { Some(merged) } else { None })
+    }
+
+    /// Does the term index actually cover CDR entry `idx`? Phase-2
+    /// indices only ingested bodies matching `--index-terms` at
+    /// create time, so a `.log` entry in a corpus built with
+    /// `--index-terms '*.json'` is never mentioned in any posting
+    /// list — but it still exists in the archive and must be
+    /// scanned for literal matches. `term_candidates` alone would
+    /// silently exclude it.
+    ///
+    /// Returns:
+    ///
+    /// - `Coverage::Covered` when at least one term segment
+    ///   recorded `idx` in its coverage trailer.
+    /// - `Coverage::NotCovered` when every segment that carried a
+    ///   trailer explicitly excluded `idx` (and no segment was
+    ///   legacy).
+    /// - `Coverage::Unknown` when any segment predates the
+    ///   trailer, or when the archive has no term index at all —
+    ///   the caller must scan `idx` conservatively.
+    pub fn term_coverage(&self, idx: u32) -> TermCoverage {
+        if self.term_segments.is_empty() {
+            return TermCoverage::Unknown;
+        }
+        let mut any_covered = false;
+        let mut any_legacy = false;
+        for seg in &self.term_segments {
+            match seg.covers(idx) {
+                Some(true) => any_covered = true,
+                Some(false) => {}
+                None => any_legacy = true,
+            }
+        }
+        if any_covered {
+            TermCoverage::Covered
+        } else if any_legacy {
+            TermCoverage::Unknown
+        } else {
+            TermCoverage::NotCovered
+        }
     }
 
     pub fn disk_count(&self) -> usize {

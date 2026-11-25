@@ -20,7 +20,7 @@
 //! previous run left off and refuses mismatched queries.
 
 use anyhow::{anyhow, bail, Context, Result};
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::Sender;
 use regex::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -173,7 +173,22 @@ fn process_archive(
     }
 
     // Phase 2: inner fan-out.
-    let (tx, rx) = bounded::<ReadEntry>(opts.inner_jobs * 2);
+    //
+    // `unbounded` by design: the full candidate list is already
+    // sitting in `filtered` as a `Vec<ReadEntry>` — we're not
+    // streaming from a live producer. The previous
+    // `bounded(inner_jobs * 2)` was a deadlock trap (issue #54):
+    // we pre-populated the channel *before* spawning any workers,
+    // so with more than `inner_jobs * 2` candidates the producer
+    // loop blocked on `tx.send` forever with nothing to drain it.
+    // Threshold on the reproduce was ~100 entries at the default
+    // `--inner-jobs 8`, which also made the bug invisible on every
+    // existing test (all archives under 50 entries).
+    //
+    // Backpressure isn't needed here because the Vec is the
+    // backpressure: every ReadEntry is already materialised and
+    // moving it into the channel is a pointer copy, not an alloc.
+    let (tx, rx) = crossbeam_channel::unbounded::<ReadEntry>();
     for re in filtered {
         if tx.send(re).is_err() {
             break;

@@ -100,29 +100,59 @@ impl HttpSource {
         }
         let want = min_len.max(PREFETCH_MIN);
         let end = (start + want).min(self.len);
-        let resp = self
-            .agent
-            .get(&self.url)
-            .set("Range", &format!("bytes={}-{}", start, end - 1))
-            .call()
-            .map_err(ureq_to_io)?;
-        if resp.status() != 206 && resp.status() != 200 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("unexpected status {} for Range GET", resp.status()),
-            ));
+        let range = format!("bytes={}-{}", start, end - 1);
+        // Same transient-failure retry story as S3Source. DNS
+        // flakes and 5xx bursts recover on a second attempt most
+        // of the time; ureq's default 60s per-attempt timeout
+        // means one lookup glitch would otherwise stall a whole
+        // worker. 3 attempts with 400/800 ms backoff.
+        let mut last_err: Option<io::Error> = None;
+        for attempt in 0u32..3 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    200u64 * (1 << attempt),
+                ));
+            }
+            match self
+                .agent
+                .get(&self.url)
+                .set("Range", &range)
+                .call()
+            {
+                Ok(resp) => {
+                    if resp.status() != 206 && resp.status() != 200 {
+                        if resp.status() >= 500 && attempt < 2 {
+                            last_err = Some(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("unexpected status {} for Range GET", resp.status()),
+                            ));
+                            continue;
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("unexpected status {} for Range GET", resp.status()),
+                        ));
+                    }
+                    let mut buf: Vec<u8> = Vec::with_capacity((end - start) as usize);
+                    resp.into_reader().read_to_end(&mut buf)?;
+                    if buf.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("empty response body for Range {}", range),
+                        ));
+                    }
+                    self.cache_start = start;
+                    self.cache = buf;
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(ureq_to_io(e));
+                }
+            }
         }
-        let mut buf: Vec<u8> = Vec::with_capacity((end - start) as usize);
-        resp.into_reader().read_to_end(&mut buf)?;
-        if buf.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("empty response body for Range {}-{}", start, end - 1),
-            ));
-        }
-        self.cache_start = start;
-        self.cache = buf;
-        Ok(())
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "HTTP Range GET failed after retries")
+        }))
     }
 }
 

@@ -213,6 +213,9 @@ path = "tests/index/index_segments.rs"
 name = "indexcache"
 path = "tests/index/indexcache.rs"
 [[test]]
+name = "cdr_cache"
+path = "tests/index/cdr_cache.rs"
+[[test]]
 name = "nameidx"
 path = "tests/index/nameidx.rs"
 [[test]]

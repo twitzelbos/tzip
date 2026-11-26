@@ -58,6 +58,8 @@ pub mod columnar;
 pub mod facets;
 #[path = "index/indexcache.rs"]
 pub mod indexcache;
+#[path = "index/cdr_cache.rs"]
+pub mod cdr_cache;
 #[path = "index/nameidx.rs"]
 pub mod nameidx;
 #[path = "index/parquet_prune.rs"]

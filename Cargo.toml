@@ -227,6 +227,9 @@ path = "tests/index/termidx.rs"
 [[test]]
 name = "equivalence"
 path = "tests/index/equivalence.rs"
+[[test]]
+name = "manifest"
+path = "tests/index/manifest.rs"
 
 [[test]]
 name = "extract_parallel"

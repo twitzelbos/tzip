@@ -847,10 +847,18 @@ pub fn run(opts: Options) -> Result<()> {
         }
     }
 
+    // Snapshot facet field names + columnar-presence BEFORE the
+    // drain-and-emit loops consume the builders — the manifest
+    // block below needs this metadata after the builders are
+    // gone.
+    let mut facet_field_names: Vec<String> = Vec::new();
+    let mut columnar_builder_was_present = false;
+
     // --facet: emit one `.tzip/facets.v1/<leaf>` entry per facet.
     // These are STORE-method entries (never encrypted or compressed)
     // so `Archive::try_load_facet_indices` can read them directly.
     for fb in facet_builders.drain(..) {
+        let field = fb.field_name().to_string();
         let name = crate::facets::entry_name_for(fb.field_name());
         let payload = fb.finish()?;
         if payload.is_empty() {
@@ -859,6 +867,7 @@ pub fn run(opts: Options) -> Result<()> {
         if opts.index_names {
             indexed_names.push(name.clone());
         }
+        facet_field_names.push(field);
         crate::sentinel::emit(&mut zw, &opts, &name, payload)?;
     }
 
@@ -874,6 +883,7 @@ pub fn run(opts: Options) -> Result<()> {
             if opts.index_names {
                 indexed_names.push(name.clone());
             }
+            columnar_builder_was_present = true;
             crate::sentinel::emit(&mut zw, &opts, &name, payload)?;
         }
     }
@@ -902,6 +912,41 @@ pub fn run(opts: Options) -> Result<()> {
         )?;
         let name = crate::nameidx::INDEX_ENTRY_NAME.to_string();
         crate::sentinel::emit(&mut zw, &opts, &name, payload)?;
+    }
+
+    // `.tzip/manifest.v1` — unified record of which index
+    // components this archive carries. Emitted last so every
+    // sentinel it enumerates is already written. Readers that
+    // know about it use it as a fast capability check; readers
+    // that don't fall back to CDR-walk discovery. Only written
+    // when at least one index component is on — plain archives
+    // don't carry a manifest.
+    {
+        let mut manifest = crate::manifest::Manifest::new();
+        if opts.index_names && !indexed_names.is_empty() {
+            manifest.names_segments = 1;
+        }
+        if !opts.index_terms.is_empty() {
+            manifest.terms_segments = 1;
+        }
+        if columnar_builder_was_present {
+            manifest.columnar_segments = 1;
+        }
+        for field in facet_field_names.iter() {
+            manifest.facets.insert(field.clone(), 1);
+        }
+        if manifest.names_segments > 0
+            || manifest.terms_segments > 0
+            || manifest.columnar_segments > 0
+            || !manifest.facets.is_empty()
+        {
+            crate::sentinel::emit(
+                &mut zw,
+                &opts,
+                crate::manifest::MANIFEST_ENTRY_NAME,
+                manifest.encode(),
+            )?;
+        }
     }
 
     profile(profile_on, "main_write_loop", t_mainloop);

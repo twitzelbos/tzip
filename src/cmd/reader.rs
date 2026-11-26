@@ -39,6 +39,14 @@ pub struct ReaderOptions {
     pub quiet: bool,
     pub verbose: bool,
     pub op: ReaderOp,
+    /// Phase-6 index cache spec. Threaded through from
+    /// `--cache-dir` / `--cache-size-mb` / `--cache-ram-mb`;
+    /// `None` = cache disabled. The reader runners open the
+    /// cache once per invocation and pass the handle into
+    /// `open_archive_with_cache` so repeat remote `ls`/`cat`/`x`
+    /// against the same ETag hits the cached CDR + `.tzip/*`
+    /// sentinels.
+    pub cache: Option<crate::indexcache::IndexCacheSpec>,
 }
 
 /// Dispatches on scheme: `s3://…` → `S3Source`, `http(s)://…` → `HttpSource`,
@@ -46,6 +54,22 @@ pub struct ReaderOptions {
 /// local and remote behave identically downstream of this seam.
 pub(crate) fn open_archive(spec: &str) -> Result<Archive> {
     open_archive_with_cache(spec, None)
+}
+
+/// Open the Phase-6 index cache if a spec was supplied,
+/// otherwise return `None`. Called by `run_ls`/`run_cat`/
+/// `run_extract` once per invocation; the resulting handle is
+/// threaded into the archive open so `.tzip/*` sentinel and
+/// CDR reads consult the cache. Local archives silently skip
+/// the cache (no payoff: index reads are already a local file
+/// seek, and the CDR is in the same file).
+pub(crate) fn open_cache_if_configured(
+    spec: Option<&crate::indexcache::IndexCacheSpec>,
+) -> Result<Option<std::sync::Arc<crate::indexcache::IndexCache>>> {
+    match spec {
+        Some(s) => Ok(Some(s.open()?)),
+        None => Ok(None),
+    }
 }
 
 /// Same as `open_archive` but with an optional Phase-6 index cache.
@@ -207,7 +231,8 @@ fn local_source_for(
 // ── Entry points ───────────────────────────────────────────────────────────
 
 pub fn run_ls(opts: ReaderOptions) -> Result<()> {
-    let arch = open_archive(&opts.archive)
+    let cache = open_cache_if_configured(opts.cache.as_ref())?;
+    let arch = open_archive_with_cache(&opts.archive, cache)
         .with_context(|| format!("open {}", opts.archive))?;
 
     let stdout = std::io::stdout();
@@ -265,7 +290,8 @@ pub fn run_cat(opts: ReaderOptions) -> Result<()> {
         ReaderOp::Cat { name } => name.clone(),
         _ => unreachable!("run_cat called with wrong op"),
     };
-    let mut arch = open_archive(&opts.archive)
+    let cache = open_cache_if_configured(opts.cache.as_ref())?;
+    let mut arch = open_archive_with_cache(&opts.archive, cache)
         .with_context(|| format!("open {}", opts.archive))?;
 
     let idx = find_entry_index(&arch, &name)?;
@@ -313,8 +339,9 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     }
     .max(1);
 
+    let cache = open_cache_if_configured(opts.cache.as_ref())?;
     let t = std::time::Instant::now();
-    let mut arch = open_archive(&opts.archive)
+    let mut arch = open_archive_with_cache(&opts.archive, cache)
         .with_context(|| format!("open {}", opts.archive))?;
     p("open_archive", t);
 

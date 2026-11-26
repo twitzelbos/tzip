@@ -88,6 +88,10 @@ struct ServerState {
     /// client's If-Match actually matches. Lets a test force
     /// the concurrent-writer code path without racing threads.
     force_complete_412: bool,
+    /// Per-verb request counts. `get_count` lets the probe-trim
+    /// regression test assert that `tzip u` doesn't fan out
+    /// into one LFH probe per kept entry.
+    get_count: usize,
 }
 
 impl ServerState {
@@ -124,6 +128,9 @@ impl ServerGuard {
     fn upload_count(&self) -> usize {
         self.state.lock().unwrap().uploads.len()
     }
+    fn get_count(&self) -> usize {
+        self.state.lock().unwrap().get_count
+    }
 }
 
 impl Drop for ServerGuard {
@@ -149,6 +156,7 @@ fn serve_mock_s3_mpu(bucket: &str, key: &str, fixture: Vec<u8>) -> ServerGuard {
         uploads: BTreeMap::new(),
         etag_counter: 0,
         force_complete_412: false,
+        get_count: 0,
     }));
     let state_srv = Arc::clone(&state);
     let stop = Arc::new(AtomicBool::new(false));
@@ -239,7 +247,8 @@ fn handle(
 fn handle_get(req: tiny_http::Request, state: &Arc<Mutex<ServerState>>) {
     use tiny_http::{Response, StatusCode};
     let (body, etag) = {
-        let s = state.lock().unwrap();
+        let mut s = state.lock().unwrap();
+        s.get_count += 1;
         (s.body.clone(), s.etag.clone())
     };
     let range_hdr = req
@@ -923,6 +932,60 @@ fn s3_append_rejects_delete_sort_atomic_and_name_collision() {
         stderr.contains("already exists"),
         "expected collision rejection: {}",
         stderr
+    );
+}
+
+#[test]
+fn s3_append_does_not_probe_lfh_per_kept_entry() {
+    // P1 audit: the S3 append path doesn't rewrite any kept
+    // entry — it ships `[0, cd_offset)` through a single
+    // server-side `UploadPartCopy`. `record_existing` reads
+    // only CDR-sourced fields. Before this fix, `tzip u`
+    // nonetheless fetched every kept LFH (~30 B each) at
+    // Range-GET granularity, so a 1 000-entry archive incurred
+    // 1 000+ signed round-trips just to warm up.
+    //
+    // Assert the count of GETs issued during the append is
+    // bounded by a small constant (probe + EOCD-scan +
+    // CDR-fetch + a handful of per-CDR-span reads for large
+    // CDRs), NOT by the number of kept entries.
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = tmp.path().join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    // 400 tiny entries — small enough to run quickly, large
+    // enough that a per-entry LFH probe would show up as
+    // ≥ 400 GETs.
+    for i in 0..400u32 {
+        fs::write(corpus.join(format!("e{:04}.txt", i)), b"x").unwrap();
+    }
+    run_tzip_create(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "store", "-q"],
+    );
+    let initial_body = fs::read(tmp.path().join("out.zip")).unwrap();
+    let server = serve_mock_s3_mpu("mybucket", "out.zip", initial_body);
+
+    fs::write(tmp.path().join("new.txt"), b"appended\n").unwrap();
+    let env = env_s3(&server);
+    let env_ref = env_s3_refs(&env);
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["u", "s3://mybucket/out.zip", "new.txt"],
+        &env_ref,
+    );
+    assert!(ok, "s3 u failed: {stderr}");
+
+    // Every GET here is one signed Range round-trip. For 400
+    // kept entries the pre-fix code path produced ~400+; the
+    // post-fix shape is probe + CDR-fetch(es), i.e. a small
+    // handful. Give generous slack so a future prefetch tweak
+    // or an extra EOCD64-locator read doesn't false-fail; the
+    // invariant that matters is "sub-linear in entry count."
+    let gets = server.get_count();
+    assert!(
+        gets < 50,
+        "tzip u issued {gets} Range GETs against a 400-entry \
+         archive; append path must be O(1), not O(entries)",
     );
 }
 

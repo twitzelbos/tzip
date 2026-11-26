@@ -128,6 +128,8 @@ fn process_archive(
     // literal string with no regex metacharacters), consult the
     // index to narrow the candidate set. Everything else falls
     // through to full linear scan.
+    let profile_on = std::env::var("TZIP_PROFILE").ok().as_deref() == Some("1");
+    let t_term = std::time::Instant::now();
     let term_candidates: Option<std::collections::HashSet<u32>> =
         if is_plain_literal(&opts.pattern) {
             match driver.term_candidates(&opts.pattern) {
@@ -137,6 +139,15 @@ fn process_archive(
         } else {
             None
         };
+    if profile_on {
+        eprintln!(
+            "tzip grep profile: term_candidates = {} entries in {:.1} ms (pattern={:?} plain_literal={})",
+            term_candidates.as_ref().map(|s| s.len()).unwrap_or(0),
+            t_term.elapsed().as_secs_f64() * 1000.0,
+            opts.pattern,
+            is_plain_literal(&opts.pattern),
+        );
+    }
 
     // Collect candidate indices first so we can mutably probe LFH sizes
     // without holding an immutable borrow of the driver.
@@ -165,26 +176,47 @@ fn process_archive(
         }
         maybe_candidates.push(idx);
     }
+    let t_filter = std::time::Instant::now();
+    let mut dropped_by_index = 0usize;
+    let mut kept_by_index_hit = 0usize;
+    let mut kept_by_unknown_coverage = 0usize;
     let candidates: Vec<usize> = if let Some(ref set) = term_candidates {
         let mut kept = Vec::with_capacity(maybe_candidates.len());
         for idx in maybe_candidates {
             if set.contains(&(idx as u32)) {
                 kept.push(idx);
+                kept_by_index_hit += 1;
                 continue;
             }
             // Candidate set says "not a match." Only trust that
             // when the index actually covered this entry;
             // otherwise fall through to scan.
             match driver.term_coverage(idx as u32) {
-                crate::zipreader::TermCoverage::Covered => {}
+                crate::zipreader::TermCoverage::Covered => {
+                    dropped_by_index += 1;
+                }
                 crate::zipreader::TermCoverage::NotCovered
-                | crate::zipreader::TermCoverage::Unknown => kept.push(idx),
+                | crate::zipreader::TermCoverage::Unknown => {
+                    kept.push(idx);
+                    kept_by_unknown_coverage += 1;
+                }
             }
         }
         kept
     } else {
         maybe_candidates
     };
+    if profile_on {
+        eprintln!(
+            "tzip grep profile: filter in {:.1} ms — {} candidates \
+             ({} index-hit, {} unknown-coverage, {} dropped-by-index)",
+            t_filter.elapsed().as_secs_f64() * 1000.0,
+            candidates.len(),
+            kept_by_index_hit,
+            kept_by_unknown_coverage,
+            dropped_by_index,
+        );
+    }
     let mut filtered: Vec<ReadEntry> = Vec::with_capacity(candidates.len());
     for idx in candidates {
         let name = driver.entry(idx).name.clone();
@@ -193,6 +225,15 @@ fn process_archive(
             .with_context(|| format!("probe LFH for {} in {}", name, url))?;
         filtered.push(driver.entry(idx).clone());
     }
+    // Sort by `lfh_offset` ascending so each worker's pulls
+    // from the channel land as a mostly-forward sweep through
+    // the archive. The S3Source caches the last ~1 MiB range
+    // GET, so adjacent-offset scans hit the cache instead of
+    // kicking off a fresh signed GET per entry. On a grep
+    // with 100 hits packed near each other, this collapses
+    // 100 Range GETs to ≈ 1 — the win the user flagged about
+    // "every byte that needs to be transferred costs a lot."
+    filtered.sort_by_key(|re| re.lfh_offset);
     // Build the worker-side source hint from the Archive we already
     // opened. Workers then skip the EOCD scan (local) or length-probe
     // HEAD / signed Range-0-0 round-trip (http/s3) they'd otherwise

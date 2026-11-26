@@ -14,7 +14,11 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 /// How many bytes to over-fetch past a small read. Big enough to cover the
 /// EOCD scan in one GET; small enough that one-off `cat`s don't balloon.
-const PREFETCH_MIN: u64 = 256 * 1024;
+/// 1 MiB per HTTP Range GET. See `src/sources/s3.rs` for the
+/// rationale — same shape: each round-trip has fixed cost,
+/// bytes are ~free, grep/extract workers sort candidates by
+/// offset so adjacent reads hit the cache window.
+const PREFETCH_MIN: u64 = 1024 * 1024;
 
 pub struct HttpSource {
     url: String,

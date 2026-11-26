@@ -21,7 +21,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::sigv4::{encode_key, sign_get, ExtraHeader, SigV4Credentials};
 
-const PREFETCH_MIN: u64 = 256 * 1024;
+/// Minimum bytes per S3 Range GET. S3 bills per *request*, not
+/// per byte, so one 1 MiB fetch is strictly cheaper than four
+/// 256 KiB fetches of the same region. Sized so that a grep /
+/// extract worker doing a forward sweep over adjacent entries
+/// (see the lfh-offset sort in `src/cmd/grep.rs`) typically
+/// gets ~250 × 4 KiB entries served out of one cache window
+/// instead of one Range GET per entry. Was 256 KiB — bumped
+/// after profiling showed single-entry greps spent most of
+/// their wall-clock on signed-GET round-trips.
+const PREFETCH_MIN: u64 = 1024 * 1024;
 
 pub struct S3Source {
     agent: ureq::Agent,
@@ -196,31 +205,68 @@ impl S3Source {
         let want = min_len.max(PREFETCH_MIN);
         let end = (start + want).min(self.len);
         let range = format!("bytes={}-{}", start, end - 1);
-        let signed = self
-            .sign(&[ExtraHeader { name: "Range", value: &range }])
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let mut req = self.agent.get(&signed.url);
-        for (k, v) in &signed.headers {
-            req = req.set(k, v);
+        // Transient-failure retry loop. DNS resolver glitches,
+        // connection resets, and 5xx responses are all recovered
+        // on a second attempt the vast majority of the time;
+        // ureq's default 60s timeout per attempt means one
+        // flaky lookup can otherwise stall a grep worker for a
+        // minute. 3 attempts with short backoff.
+        let mut last_err: Option<io::Error> = None;
+        for attempt in 0u32..3 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    200u64 * (1 << attempt),
+                ));
+            }
+            // Re-sign each attempt — the x-amz-date header must
+            // be within SigV4's 15-minute clock skew window,
+            // and a long retry chain could outrun it.
+            let signed = match self
+                .sign(&[ExtraHeader { name: "Range", value: &range }])
+            {
+                Ok(s) => s,
+                Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
+            };
+            let mut req = self.agent.get(&signed.url);
+            for (k, v) in &signed.headers {
+                req = req.set(k, v);
+            }
+            match req.call() {
+                Ok(resp) => {
+                    if resp.status() != 206 && resp.status() != 200 {
+                        if resp.status() >= 500 && attempt < 2 {
+                            last_err = Some(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("S3 Range GET returned status {}", resp.status()),
+                            ));
+                            continue;
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("S3 Range GET returned status {}", resp.status()),
+                        ));
+                    }
+                    let mut buf = Vec::with_capacity((end - start) as usize);
+                    resp.into_reader().read_to_end(&mut buf)?;
+                    if buf.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("empty S3 body for Range {}", range),
+                        ));
+                    }
+                    self.cache_start = start;
+                    self.cache = buf;
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(io::Error::new(io::ErrorKind::Other, e));
+                    // Fall through to retry.
+                }
+            }
         }
-        let resp = req.call().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        if resp.status() != 206 && resp.status() != 200 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("S3 Range GET returned status {}", resp.status()),
-            ));
-        }
-        let mut buf = Vec::with_capacity((end - start) as usize);
-        resp.into_reader().read_to_end(&mut buf)?;
-        if buf.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("empty S3 body for Range {}", range),
-            ));
-        }
-        self.cache_start = start;
-        self.cache = buf;
-        Ok(())
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "S3 Range GET failed after retries")
+        }))
     }
 }
 

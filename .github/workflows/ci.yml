@@ -33,7 +33,34 @@ jobs:
       - name: Install deslop-please
         run: cargo install --locked deslop-please@0.1.4
       - name: Run deslop-please
-        run: deslop-please
+        # Retry on transient `rust-analyzer scip failed (signal:
+        # 13 (SIGPIPE))` — rust-analyzer occasionally SIGPIPEs
+        # mid-index on GHA runners (seen on PR #79, #85). Retry
+        # with a short backoff before giving up. Non-flake
+        # failures (real cycles, wide-dir, field-leak) print
+        # their `error[…]` lines and exit non-zero on every
+        # attempt, so they still fail after the retries.
+        run: |
+          set +e
+          for attempt in 1 2 3; do
+              echo "::group::deslop-please attempt $attempt"
+              output=$(deslop-please 2>&1)
+              rc=$?
+              echo "$output"
+              echo "::endgroup::"
+              if [[ $rc -eq 0 ]]; then
+                  echo "deslop-please clean on attempt $attempt"
+                  exit 0
+              fi
+              if ! echo "$output" | grep -q "rust-analyzer scip failed"; then
+                  echo "deslop-please reported a real finding (not a SIGPIPE flake)"
+                  exit $rc
+              fi
+              echo "attempt $attempt hit the rust-analyzer SIGPIPE flake; retrying"
+              sleep 5
+          done
+          echo "deslop-please still SIGPIPE-ing after 3 attempts — the flake may have become persistent"
+          exit 1
 
   test:
     name: test (${{ matrix.os }})

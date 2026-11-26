@@ -393,11 +393,21 @@ run "ls-head" bash -c "'$TZIP' ls '$S3_URL' | head -8"
 # follow. `tzip find --names-only` emits `<archive>:<entry>`
 # per line; strip the archive prefix with the last-colon
 # split so S3 URLs' own colon doesn'\''t confuse it.
+#
+# `head -1` closes the pipe after reading one line, which
+# SIGPIPEs `tzip find` on its next write — exit 141, which
+# is the correct UNIX-CLI behaviour (see PR #83). Under
+# the script'\''s `set -o pipefail` that'\''d abort the whole
+# run silently, which is how the demo was dying "at 5/15".
+# Toggle pipefail off just for this single line so the
+# expected SIGPIPE isn'\''t fatal.
+set +o pipefail
 MARKER_ENTRY=$(
     "$TZIP" find --names-only --include 'corpus/entry-*.json' "$S3_URL" \
     | head -1 \
     | sed 's/^.*:\([^:]*\)$/\1/'
 )
+set -o pipefail
 if [[ -z "$MARKER_ENTRY" ]]; then
     echo "FAIL: couldn'\''t locate a corpus/entry-*.json in the archive" >&2
     exit 1

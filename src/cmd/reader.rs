@@ -88,22 +88,25 @@ pub(crate) fn open_archive_with_cache(
     // multi-disk EOCDs rather than silently misinterpreting them.
     if spec.starts_with("s3://") {
         let rest = &spec["s3://".len()..];
-        let src = crate::sources::s3::S3Source::open(rest)
+        let mut src = crate::sources::s3::S3Source::open(rest)
             .with_context(|| format!("open S3 source s3://{}", rest))?;
-        let binding = cache_binding_for_remote(spec, src.fingerprint(), src.url().len() as u64, cache);
+        // Real ContentLength (via SeekFrom::End) as the
+        // last-ditch fingerprint — much better than the
+        // URL-string-length nonsense this used to pass.
+        let len = src
+            .seek(std::io::SeekFrom::End(0))
+            .ok()
+            .unwrap_or(0);
+        let binding = cache_binding_for_remote(spec, src.fingerprint(), len, cache);
         Archive::open_source_with_cache(Box::new(src), binding)
     } else if spec.starts_with("http://") || spec.starts_with("https://") {
-        let src = crate::sources::http::HttpSource::open(spec)
+        let mut src = crate::sources::http::HttpSource::open(spec)
             .with_context(|| format!("open HTTP source {}", spec))?;
-        let binding = cache_binding_for_remote(
-            src.url(),
-            src.fingerprint(),
-            // Content-Length is available via Seek(SeekFrom::End(0))
-            // after open; it's used only as a last-ditch fingerprint
-            // when ETag/Last-Modified are absent.
-            0,
-            cache,
-        );
+        let len = src
+            .seek(std::io::SeekFrom::End(0))
+            .ok()
+            .unwrap_or(0);
+        let binding = cache_binding_for_remote(src.url(), src.fingerprint(), len, cache);
         Archive::open_source_with_cache(Box::new(src), binding)
     } else {
         Archive::open(Path::new(spec))
@@ -111,10 +114,25 @@ pub(crate) fn open_archive_with_cache(
 }
 
 /// Build the (cache, archive-id) pair the Archive needs when a
-/// cache is in scope. `ETag` is the strongest fingerprint; falls
-/// back to `Last-Modified` (already encoded into `fingerprint`
-/// by the source) or to a weak `<len>` string when both are
-/// missing. Returns `None` when the caller passed no cache.
+/// cache is in scope.
+///
+/// Fingerprint priority (strongest first):
+///
+/// 1. `fingerprint` — the ETag the source captured at open
+///    time, or `Last-Modified` if ETag was missing (the
+///    source resolves the two internally).
+/// 2. `weak_len` — the real `Content-Length` of the object,
+///    so a changed object at the same URL with a different
+///    size still misses the cache.
+///
+/// If **neither** is available (unusual: a source that
+/// returned no ETag, no Last-Modified, *and* no
+/// `Content-Length`), we **hard-disable the cache for this
+/// archive** rather than silently keying on URL alone. A
+/// URL-only key would happily serve stale bytes after a
+/// same-URL object change, which defeats the invalidation
+/// story Phase 6 + the CDR cache rely on. Security analysis
+/// in `docs/scenarios/s3-huge-archive-single-entry.md`.
 fn cache_binding_for_remote(
     url: &str,
     fingerprint: Option<&str>,
@@ -127,7 +145,12 @@ fn cache_binding_for_remote(
     let cache = cache?;
     let fp: String = match fingerprint {
         Some(s) => s.to_string(),
-        None => format!("len={}", weak_len),
+        None if weak_len > 0 => format!("len={}", weak_len),
+        None => {
+            // No fingerprint, no Content-Length — can't key
+            // the cache safely. Disable rather than share.
+            return None;
+        }
     };
     Some((cache, crate::indexcache::ArchiveId::derive(url, &fp)))
 }

@@ -74,6 +74,11 @@ pub enum Cmd {
     #[command(alias = "f")]
     Find(FindArgs),
 
+    /// Last N entries of one or more archives, by either the order
+    /// they were added (CDR position proxy) or their mtime. Body-
+    /// free, same shard fan-out as `find`.
+    Tail(TailArgs),
+
     /// Benchmark tzip against system `7z` / `zip` / `unzip` on a
     /// reproducible corpus. Measures create speed, extract speed, list
     /// speed, output size, and compression ratio. External tools are
@@ -481,6 +486,64 @@ pub struct FindArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct TailArgs {
+    /// Archives to tail. Local paths, `http(s)://` URLs, or
+    /// `s3://bucket/key.zip` URLs. S3 URLs may contain `*` / `?`
+    /// wildcards in the key portion (expanded via ListObjectsV2).
+    /// Results across all shards are merged into one global top-N.
+    #[arg(required = true)]
+    pub archives: Vec<String>,
+
+    /// Number of entries to return.
+    #[arg(short = 'n', long, default_value_t = 10)]
+    pub n: usize,
+
+    /// Which "last" the `-n N` applies to. `added` uses CDR
+    /// position (approximates archive-write order; see
+    /// `src/cmd/tail.rs` for the caveat on rebuilt archives);
+    /// `mtime` uses the DOS mtime stored on each entry (the
+    /// source file's mtime at archive time).
+    #[arg(long, value_enum, default_value_t = TailByArg::Added)]
+    pub by: TailByArg,
+
+    /// Emit entries as JSON lines instead of the default tabular
+    /// format.
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum TailByArg {
+    /// CDR position (approximates "most recently added" for
+    /// append-only archives).
+    Added,
+    /// DOS mtime stored on each entry (the source file's mtime
+    /// at archive time).
+    Mtime,
+}
+
+/// Sort key for `tzip tail`. Lives here (next to its clap
+/// counterpart) rather than in `src/cmd/tail.rs` to avoid a
+/// `cli ↔ tail` module cycle — `TailOptions` is defined in
+/// `cli`, so if `tail` owned the enum we'd have cycles in
+/// both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailBy {
+    /// CDR position within the archive. For append-only
+    /// archives this approximates "most recently added."
+    /// Rebuilds reset this ordering — see `docs/TIMESTAMPS.md`.
+    Added,
+    /// DOS mtime stored on the entry — the *source file's*
+    /// modification time at the moment the archive was written.
+    Mtime,
+}
+
+#[derive(Args, Debug)]
 pub struct DiffArgs {
     /// Baseline archive. Local path, `http(s)://` URL, or
     /// `s3://bucket/key.zip` URL.
@@ -798,6 +861,16 @@ pub struct FindOptions {
 }
 
 #[derive(Clone, Debug)]
+pub struct TailOptions {
+    pub archives: Vec<String>,
+    pub n: usize,
+    pub by: TailBy,
+    pub json: bool,
+    pub quiet: bool,
+    pub verbose: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct DiffOptions {
     pub a: String,
     pub b: String,
@@ -1059,6 +1132,25 @@ impl BenchArgs {
             quick: self.quick,
             json: self.json,
             only: self.only,
+            quiet: self.quiet,
+            verbose: self.verbose,
+        })
+    }
+}
+
+impl TailArgs {
+    pub fn into_options(self) -> Result<TailOptions> {
+        if self.n == 0 {
+            anyhow::bail!("--n must be ≥ 1");
+        }
+        Ok(TailOptions {
+            archives: self.archives,
+            n: self.n,
+            by: match self.by {
+                TailByArg::Added => TailBy::Added,
+                TailByArg::Mtime => TailBy::Mtime,
+            },
+            json: self.json,
             quiet: self.quiet,
             verbose: self.verbose,
         })

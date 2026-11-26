@@ -52,6 +52,7 @@ non-encrypted subset) `unzip`/macOS Archive Utility/Windows Explorer.
 - [TUI mode](#tui-mode)
 - [Benchmarks (`tzip bench`)](#benchmarks-tzip-bench)
 - [Scenarios: where tzip changes the cost math](docs/scenarios/README.md)
+- [Timestamps: what each entry carries + `tzip tail` semantics](docs/TIMESTAMPS.md)
 - [Performance](#performance)
 - [External-drive tuning](#external-drive-tuning)
 - [macOS-specific fast paths](#macos-specific-fast-paths)

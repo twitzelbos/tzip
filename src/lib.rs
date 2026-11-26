@@ -84,6 +84,8 @@ pub mod walker;
 pub mod bench;
 #[path = "cmd/diff.rs"]
 pub mod diff;
+#[path = "cmd/tail.rs"]
+pub mod tail;
 #[path = "cmd/find.rs"]
 pub mod find;
 #[path = "cmd/grep.rs"]

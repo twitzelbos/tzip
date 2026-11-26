@@ -21,16 +21,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::sigv4::{encode_key, sign_get, ExtraHeader, SigV4Credentials};
 
-/// Minimum bytes per S3 Range GET. S3 bills per *request*, not
-/// per byte, so one 1 MiB fetch is strictly cheaper than four
-/// 256 KiB fetches of the same region. Sized so that a grep /
-/// extract worker doing a forward sweep over adjacent entries
-/// (see the lfh-offset sort in `src/cmd/grep.rs`) typically
-/// gets ~250 × 4 KiB entries served out of one cache window
-/// instead of one Range GET per entry. Was 256 KiB — bumped
-/// after profiling showed single-entry greps spent most of
-/// their wall-clock on signed-GET round-trips.
-const PREFETCH_MIN: u64 = 1024 * 1024;
+/// Floor on how many bytes to pull per S3 Range GET. S3 bills
+/// per *request*, not per byte, so one larger fetch is strictly
+/// cheaper than several small ones of the same region. The
+/// window is adaptive (see `fetch`): sequential access doubles
+/// it up to `PREFETCH_MAX`; a non-sequential jump resets it
+/// back to `PREFETCH_MIN`. Floor is sized to keep single-entry
+/// `cat` cheap without paying for round-trips on every 8 KiB
+/// Read call.
+const PREFETCH_MIN: u64 = 256 * 1024;
+
+/// Cap on the adaptive prefetch window. 16 MiB turns a
+/// forward-sweep over a ~100 MiB central directory from roughly
+/// 100 Range GETs into roughly 6. Big enough to amortise S3's
+/// per-request overhead across a sequential run, small enough
+/// that a single mis-predicted sequential prefix on a random
+/// workload wastes bounded bytes.
+const PREFETCH_MAX: u64 = 16 * 1024 * 1024;
 
 pub struct S3Source {
     agent: ureq::Agent,
@@ -58,6 +65,16 @@ pub struct S3Source {
     /// a HTTP 412 instead of silently mixing bytes from two
     /// versions.
     fingerprint: Option<String>,
+    /// Adaptive prefetch window. Grows (×2) on sequential access
+    /// up to `PREFETCH_MAX`; resets to `PREFETCH_MIN` on a
+    /// non-sequential jump. The intent: CDR scans and sorted-
+    /// candidate greps pay a handful of large GETs; single-entry
+    /// `cat`s stay cheap at the floor.
+    prefetch_window: u64,
+    /// End offset of the previous fetch (byte just past the
+    /// cached window). `None` before the first fetch. Used only
+    /// as the "is this read sequential?" predicate.
+    last_fetch_end: Option<u64>,
 }
 
 /// Returned by `fetch` when the server rejected a Range GET with
@@ -107,6 +124,8 @@ impl S3Source {
             cache_start: 0,
             cache: Vec::new(),
             fingerprint: None,
+            prefetch_window: PREFETCH_MIN,
+            last_fetch_end: None,
         };
         src.probe_len()?;
         Ok(src)
@@ -167,6 +186,8 @@ impl S3Source {
             cache_start: 0,
             cache: Vec::new(),
             fingerprint: if_match,
+            prefetch_window: PREFETCH_MIN,
+            last_fetch_end: None,
         })
     }
 
@@ -227,8 +248,21 @@ impl S3Source {
             self.cache.clear();
             return Ok(());
         }
-        let want = min_len.max(PREFETCH_MIN);
+        // Adaptive prefetch: if this fetch continues exactly
+        // where the last one ended, we're in a sequential sweep
+        // (CDR scan, sorted-candidate grep, parallel-block
+        // decompress read-ahead). Double the window up to
+        // PREFETCH_MAX. On a non-sequential jump the window
+        // resets to PREFETCH_MIN so random single-entry access
+        // stays cheap.
+        if self.last_fetch_end == Some(start) {
+            self.prefetch_window = (self.prefetch_window * 2).min(PREFETCH_MAX);
+        } else {
+            self.prefetch_window = PREFETCH_MIN;
+        }
+        let want = min_len.max(self.prefetch_window);
         let end = (start + want).min(self.len);
+        self.last_fetch_end = Some(end);
         let range = format!("bytes={}-{}", start, end - 1);
         // Transient-failure retry loop. DNS resolver glitches,
         // connection resets, and 5xx responses are all recovered

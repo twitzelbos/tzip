@@ -922,24 +922,21 @@ pub fn run(opts: Options) -> Result<()> {
     // when at least one index component is on — plain archives
     // don't carry a manifest.
     {
-        let mut manifest = crate::manifest::Manifest::new();
+        let mut b = crate::manifest::Manifest::builder();
         if opts.index_names && !indexed_names.is_empty() {
-            manifest.names_segments = 1;
+            b = b.with_names_segments(1);
         }
         if !opts.index_terms.is_empty() {
-            manifest.terms_segments = 1;
+            b = b.with_terms_segments(1);
         }
         if columnar_builder_was_present {
-            manifest.columnar_segments = 1;
+            b = b.with_columnar_segments(1);
         }
         for field in facet_field_names.iter() {
-            manifest.facets.insert(field.clone(), 1);
+            b = b.with_facet(field.clone(), 1);
         }
-        if manifest.names_segments > 0
-            || manifest.terms_segments > 0
-            || manifest.columnar_segments > 0
-            || !manifest.facets.is_empty()
-        {
+        let manifest = b.build();
+        if !manifest.is_empty() {
             crate::sentinel::emit(
                 &mut zw,
                 &opts,

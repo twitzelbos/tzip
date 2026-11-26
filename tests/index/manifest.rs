@@ -67,7 +67,7 @@ fn create_emits_manifest_listing_every_index_component() {
     let arch_path = tmp.path().join("out.zip");
     let mut arch = tzip::zipreader::Archive::open(&arch_path).expect("open archive");
     let manifest = arch.manifest().expect("manifest should be present");
-    assert_eq!(manifest.schema, tzip::manifest::SCHEMA_VERSION);
+    assert_eq!(manifest.schema(), tzip::manifest::SCHEMA_VERSION);
     assert!(manifest.has_names(), "names index should be listed");
     assert!(manifest.has_terms(), "terms index should be listed");
     assert!(

@@ -60,22 +60,56 @@ pub const MANIFEST_ENTRY_NAME: &str = ".tzip/manifest.v1";
 /// back on anything they don't.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Private struct fields keep deslop-please's `field-leak` lint
+/// happy — only this module can set them. Writers build the
+/// manifest through `builder()` and readers consult the capability
+/// predicates below.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Manifest {
-    pub schema: u32,
+    pub(crate) schema: u32,
     /// Number of `.tzip/names.v1[.segN]` sentinels present.
     /// `0` → no name index.
-    pub names_segments: u32,
+    pub(crate) names_segments: u32,
     /// Number of `.tzip/terms.v1[.segN]` sentinels present.
-    pub terms_segments: u32,
+    pub(crate) terms_segments: u32,
     /// Number of `.tzip/columnar.v1.parquet[.segN]` sentinels present.
-    pub columnar_segments: u32,
+    pub(crate) columnar_segments: u32,
     /// Per-facet-field segment counts, keyed by the facet's leaf
     /// name (the part after `.tzip/facets.v1/`). BTreeMap for a
     /// stable serialisation order — determinism makes
     /// byte-identical builds possible when the rest of the
     /// archive is deterministic too.
-    pub facets: BTreeMap<String, u32>,
+    pub(crate) facets: BTreeMap<String, u32>,
+}
+
+/// Fluent builder. Used by `tzip create` to assemble a manifest
+/// as sentinels are emitted; the final `.build()` returns the
+/// immutable `Manifest` that gets encoded into
+/// `.tzip/manifest.v1`.
+pub struct ManifestBuilder {
+    inner: Manifest,
+}
+
+impl ManifestBuilder {
+    pub fn with_names_segments(mut self, n: u32) -> Self {
+        self.inner.names_segments = n;
+        self
+    }
+    pub fn with_terms_segments(mut self, n: u32) -> Self {
+        self.inner.terms_segments = n;
+        self
+    }
+    pub fn with_columnar_segments(mut self, n: u32) -> Self {
+        self.inner.columnar_segments = n;
+        self
+    }
+    pub fn with_facet(mut self, field: impl Into<String>, segments: u32) -> Self {
+        self.inner.facets.insert(field.into(), segments);
+        self
+    }
+    pub fn build(self) -> Manifest {
+        self.inner
+    }
 }
 
 impl Manifest {
@@ -84,6 +118,15 @@ impl Manifest {
             schema: SCHEMA_VERSION,
             ..Self::default()
         }
+    }
+
+    /// Start building a manifest. See `ManifestBuilder`.
+    pub fn builder() -> ManifestBuilder {
+        ManifestBuilder { inner: Manifest::new() }
+    }
+
+    pub fn schema(&self) -> u32 {
+        self.schema
     }
 
     pub fn has_names(&self) -> bool {
@@ -96,6 +139,15 @@ impl Manifest {
 
     pub fn has_columnar(&self) -> bool {
         self.columnar_segments > 0
+    }
+
+    /// Returns `true` iff the manifest records at least one
+    /// index component.
+    pub fn is_empty(&self) -> bool {
+        self.names_segments == 0
+            && self.terms_segments == 0
+            && self.columnar_segments == 0
+            && self.facets.is_empty()
     }
 
     pub fn facet_fields(&self) -> impl Iterator<Item = &str> {
@@ -182,12 +234,13 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip() {
-        let mut m = Manifest::new();
-        m.names_segments = 2;
-        m.terms_segments = 1;
-        m.columnar_segments = 3;
-        m.facets.insert("status_code".into(), 4);
-        m.facets.insert("user".into(), 1);
+        let m = Manifest::builder()
+            .with_names_segments(2)
+            .with_terms_segments(1)
+            .with_columnar_segments(3)
+            .with_facet("status_code", 4)
+            .with_facet("user", 1)
+            .build();
 
         let bytes = m.encode();
         let back = Manifest::decode(&bytes).expect("decode");
@@ -205,9 +258,9 @@ terms = 2
 # trailing comment
 ";
         let m = Manifest::decode(input).unwrap();
-        assert_eq!(m.schema, 1);
-        assert_eq!(m.names_segments, 0);
-        assert_eq!(m.terms_segments, 2);
+        assert_eq!(m.schema(), 1);
+        assert!(!m.has_names());
+        assert!(m.has_terms());
     }
 
     #[test]
@@ -229,18 +282,23 @@ terms = 2
 
     #[test]
     fn capability_methods() {
-        let mut m = Manifest::new();
+        let m = Manifest::new();
         assert!(!m.has_names());
         assert!(!m.has_terms());
         assert!(!m.has_columnar());
+        assert!(m.is_empty());
         assert!(m.facet_fields().next().is_none());
-        m.names_segments = 1;
-        m.terms_segments = 2;
-        m.columnar_segments = 3;
-        m.facets.insert("x".into(), 1);
-        assert!(m.has_names());
-        assert!(m.has_terms());
-        assert!(m.has_columnar());
-        assert_eq!(m.facet_fields().collect::<Vec<_>>(), vec!["x"]);
+
+        let m2 = Manifest::builder()
+            .with_names_segments(1)
+            .with_terms_segments(2)
+            .with_columnar_segments(3)
+            .with_facet("x", 1)
+            .build();
+        assert!(m2.has_names());
+        assert!(m2.has_terms());
+        assert!(m2.has_columnar());
+        assert!(!m2.is_empty());
+        assert_eq!(m2.facet_fields().collect::<Vec<_>>(), vec!["x"]);
     }
 }

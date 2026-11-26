@@ -742,6 +742,12 @@ pub struct GrepArgs {
     #[arg(long, value_name = "MB")]
     pub cache_ram_mb: Option<u64>,
 
+    /// Exit non-zero if any entry was skipped (per-entry error,
+    /// bad body, retry exhaustion, 412 snapshot change, …). Default
+    /// is tolerant: skips are logged to stderr and the run exits 0.
+    #[arg(long)]
+    pub strict: bool,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
@@ -887,6 +893,10 @@ pub struct GrepOptions {
     pub resume: bool,
     pub password: Option<String>,
     pub cache: Option<crate::indexcache::IndexCacheSpec>,
+    /// `--strict` → exit non-zero if any per-entry skip occurred.
+    /// Default is tolerant (log + exit 0, matching PR #93's
+    /// continue-on-per-entry-error behaviour).
+    pub strict: bool,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -1264,6 +1274,7 @@ impl GrepArgs {
                 self.cache_size_mb,
                 self.cache_ram_mb,
             ),
+            strict: self.strict,
             quiet: self.quiet,
             verbose: self.verbose,
         })
@@ -1708,6 +1719,12 @@ pub struct JqArgs {
     #[arg(long, value_name = "MB")]
     pub cache_ram_mb: Option<u64>,
 
+    /// Exit non-zero if any entry was skipped (JSON parse error,
+    /// body decode error, filter error, …). Default is tolerant:
+    /// per-entry failures are logged with `-v` and the run exits 0.
+    #[arg(long)]
+    pub strict: bool,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
     #[arg(short = 'v', long)]
@@ -1729,6 +1746,7 @@ impl JqArgs {
                 self.cache_size_mb,
                 self.cache_ram_mb,
             ),
+            strict: self.strict,
             quiet: self.quiet,
             verbose: self.verbose,
         })

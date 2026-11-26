@@ -683,6 +683,112 @@ fn grep_scans_entries_outside_term_index_coverage() {
     );
 }
 
+#[test]
+fn grep_strict_flag_turns_per_entry_skips_into_nonzero_exit() {
+    // Default behaviour (PR #93): per-entry decrypt failures are
+    // logged to stderr but the grep exits 0 so partial matches
+    // remain useful. `--strict` turns the same skip into a
+    // non-zero exit, so pipelines that need an authoritative
+    // answer can detect the incompleteness.
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = tmp.path().join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    write_log(&corpus.join("a.log"), "ERROR here\n");
+    write_log(&corpus.join("b.log"), "ERROR there\n");
+    run_tzip_create(
+        tmp.path(),
+        &[
+            "create",
+            "out.zip",
+            "corpus",
+            "-m",
+            "deflate",
+            "-p",
+            "right-password",
+            "-q",
+        ],
+    );
+
+    // Wrong password → every entry fails to decrypt → every
+    // entry becomes a per-entry skip. Default mode: exit 0 but
+    // the stderr summary line reports the incomplete run.
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["grep", "ERROR", "out.zip", "-p", "wrong-password"],
+        &[],
+    );
+    assert!(ok, "default grep should exit 0 on per-entry skips");
+    assert!(
+        stderr.contains("incomplete"),
+        "expected the 'incomplete' summary line, got stderr: {stderr}"
+    );
+
+    // --strict: exit non-zero with the same inputs.
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &[
+            "grep",
+            "ERROR",
+            "out.zip",
+            "-p",
+            "wrong-password",
+            "--strict",
+        ],
+        &[],
+    );
+    assert!(!ok, "--strict should exit non-zero when entries skipped");
+    assert!(
+        stderr.contains("incomplete") || stderr.contains("skipped"),
+        "expected skip-summary on stderr under --strict: {stderr}"
+    );
+}
+
+#[test]
+fn grep_json_report_trailer_on_incomplete_run() {
+    // --json emits a trailing {"report":{...}} line when the run
+    // was incomplete so downstream pipelines can detect missing
+    // results without parsing stderr.
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = tmp.path().join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    write_log(&corpus.join("a.log"), "ERROR x\n");
+    run_tzip_create(
+        tmp.path(),
+        &[
+            "create",
+            "out.zip",
+            "corpus",
+            "-m",
+            "deflate",
+            "-p",
+            "right-password",
+            "-q",
+        ],
+    );
+
+    let (_ok, stdout, _stderr) = run_tzip(
+        tmp.path(),
+        &[
+            "grep",
+            "ERROR",
+            "out.zip",
+            "-p",
+            "wrong-password",
+            "--json",
+        ],
+        &[],
+    );
+    let last = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .last()
+        .unwrap_or("");
+    assert!(
+        last.starts_with(r#"{"report":"#) && last.contains("\"complete\":false"),
+        "expected trailing report line, got: {last}"
+    );
+}
+
 // Satisfy std::io::Read import.
 #[allow(dead_code)]
 fn _touch() -> usize {

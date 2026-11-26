@@ -98,6 +98,8 @@ pub mod hash;
 pub mod jq;
 #[path = "cmd/reader.rs"]
 pub mod reader;
+#[path = "cmd/report.rs"]
+pub mod report;
 
 // ── Platform-gated modules (also live under `src/platform/`) ──────────────
 #[cfg(target_os = "macos")]

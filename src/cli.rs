@@ -1513,6 +1513,18 @@ pub struct AggregateArgs {
     #[arg(long, value_name = "MB")]
     pub cache_ram_mb: Option<u64>,
 
+    /// Password for AES-encrypted archives. Required to read
+    /// the `.tzip/facets.v1/*` sentinels on password-protected
+    /// archives — PR #69 fix #2 encrypts those sentinels so
+    /// their facet values stay confidential, which means
+    /// aggregate needs the password to decrypt them. Not
+    /// needed on plain archives.
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+
+    #[arg(long, conflicts_with = "password")]
+    pub password_file: Option<PathBuf>,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
     #[arg(short = 'v', long)]
@@ -1527,6 +1539,7 @@ pub struct AggregateOptions {
     pub top: usize,
     pub json: bool,
     pub cache: Option<crate::indexcache::IndexCacheSpec>,
+    pub password: Option<String>,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -1536,6 +1549,8 @@ impl AggregateArgs {
         if self.by.is_none() && !self.fields {
             bail!("tzip aggregate: pass --by FIELD or --fields");
         }
+        let password =
+            resolve_password(self.password.as_deref(), self.password_file.as_deref())?;
         Ok(AggregateOptions {
             archives: self.archives,
             by: self.by,
@@ -1547,6 +1562,7 @@ impl AggregateArgs {
                 self.cache_size_mb,
                 self.cache_ram_mb,
             ),
+            password,
             quiet: self.quiet,
             verbose: self.verbose,
         })

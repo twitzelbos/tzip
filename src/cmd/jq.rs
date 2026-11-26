@@ -79,6 +79,9 @@ pub fn run(opts: JqOpts) -> Result<()> {
     for spec in &archives {
         let mut arch = crate::reader::open_archive_with_cache(spec, cache_arc.clone())
             .with_context(|| format!("open archive {}", spec))?;
+        if let Some(pw) = opts.password.as_deref() {
+            arch.attach_password(pw.to_string());
+        }
         for idx in 0..arch.len() {
             let name = arch.entry(idx).name.clone();
             if arch.entry(idx).uncomp_size == 0 && name.ends_with('/') {

@@ -114,6 +114,13 @@ fn process_archive(
     // Phase 1: parse CDR, filter entries, populate lfh_total_size.
     let mut driver = open_archive_with_cache(url, cache)
         .with_context(|| format!("open archive {}", url))?;
+    // Attach password so the term-index sentinel (`.tzip/terms.v1`)
+    // can be decrypted on AES-encrypted archives. Without this,
+    // `term_candidates` returns None and grep degenerates to a
+    // full linear scan of every entry.
+    if let Some(pw) = opts.password.as_deref() {
+        driver.attach_password(pw.to_string());
+    }
     // Narrow the global `(url, name)` skip set to the entries we'd
     // actually probe on THIS archive, as a `HashSet<&str>` keyed by
     // name alone. Lets the hot `.contains(...)` check be zero-alloc —

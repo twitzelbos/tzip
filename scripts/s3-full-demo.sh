@@ -449,9 +449,9 @@ run "hash-crc32" bash -c "'$TZIP' hash --algo crc32 '$S3_URL' | head -3"
 run "hash-md5"   bash -c "'$TZIP' hash --algo md5 -p '$PASSWORD' '$S3_URL' | head -3"
 
 banner "12/15  tzip aggregate — facet index count-by-region"
-run "agg-by-region" "$TZIP" aggregate --by region "$S3_URL"
+run "agg-by-region" "$TZIP" aggregate --by region -p "$PASSWORD" "$S3_URL"
 echo "---"
-run "agg-by-status" "$TZIP" aggregate --by status "$S3_URL"
+run "agg-by-status" "$TZIP" aggregate --by status -p "$PASSWORD" "$S3_URL"
 
 banner "13/15  tzip query — DuckDB SQL (row-group prune should fire)"
 if ! command -v duckdb >/dev/null 2>&1; then

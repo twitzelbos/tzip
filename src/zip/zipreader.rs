@@ -86,6 +86,16 @@ pub struct Archive {
     /// a local file-seek) and on remote archives opened without an
     /// `--cache-dir`.
     cache_ctx: Option<CacheCtx>,
+    /// Password for AE-2 encrypted `.tzip/*` sentinels. Set via
+    /// `attach_password` by the reader runners that have a
+    /// password in hand. Without this, `read_index_body`
+    /// returns `None` for encrypted sentinels and
+    /// `tzip aggregate`/`query`/`jq`/`grep`'s term index all
+    /// silently degrade (facet_fields empty, term_candidates
+    /// None → full linear scan). PR #69's fix #2 made
+    /// sentinels encrypted for security; this field lets
+    /// readers un-encrypt them when they have the password.
+    archive_password: Option<String>,
 }
 
 /// Per-archive cache binding: shared cache handle + this archive's
@@ -263,6 +273,7 @@ impl Archive {
                             cache: std::sync::Arc::clone(cache),
                             archive_id: id.clone(),
                         }),
+                        archive_password: None,
                     };
                     arch.try_load_name_segments();
                     return Ok(arch);
@@ -369,6 +380,7 @@ impl Archive {
             facet_segments: std::collections::HashMap::new(),
             facet_segments_loaded: false,
             cache_ctx: cache_binding.map(|(cache, archive_id)| CacheCtx { cache, archive_id }),
+            archive_password: None,
         };
         arch.try_load_name_segments();
         // term + facet segments load lazily on first access —
@@ -478,6 +490,7 @@ impl Archive {
             facet_segments: std::collections::HashMap::new(),
             facet_segments_loaded: false,
             cache_ctx: None,
+            archive_password: None,
         };
         arch.try_load_name_segments();
         // See primary `open_source_with_cache` for why term + facet
@@ -640,21 +653,61 @@ impl Archive {
         let idx = self.entries.iter().position(|e| e.name == name)?;
         self.lfh_total_size_of(idx).ok()?;
         let re = &self.entries[idx];
-        if re.method_on_wire != 0 || re.encrypted {
-            return None;
-        }
         let body_off = re.lfh_offset + re.lfh_total_size as u64;
-        let mut body = vec![0u8; re.comp_size as usize];
-        self.source
-            .seek(SeekFrom::Start(body_off))
-            .and_then(|_| self.source.read_exact(&mut body))
-            .ok()?;
-        if let Some(ctx) = &self.cache_ctx {
-            // Best-effort cache populate. A write failure (disk
-            // full, permissions) doesn't fail the read.
-            let _ = ctx.cache.put(&ctx.archive_id, name, &body);
+        let method = re.method_on_wire;
+        let encrypted = re.encrypted;
+        let comp_size = re.comp_size;
+        // Case 1: plain Store sentinel (original Phase-6 shape).
+        if method == 0 && !encrypted {
+            let mut body = vec![0u8; comp_size as usize];
+            self.source
+                .seek(SeekFrom::Start(body_off))
+                .and_then(|_| self.source.read_exact(&mut body))
+                .ok()?;
+            if let Some(ctx) = &self.cache_ctx {
+                let _ = ctx.cache.put(&ctx.archive_id, name, &body);
+            }
+            return Some(body);
         }
-        Some(body)
+        // Case 2: AE-2 encrypted sentinel (PR #69's fix #2). The
+        // encrypted on-wire form is Store-wrapped-in-AES, i.e.
+        // method_on_wire = 99 (METHOD_AES), inner_method = 0.
+        // Decrypt back to plaintext using the attached password;
+        // caller is `aggregate` / `query` / `jq` / `grep` with a
+        // `--password` in hand.
+        if encrypted && method == crate::zipformat::METHOD_AES {
+            let pw = self.archive_password.clone()?;
+            let mut ct = vec![0u8; comp_size as usize];
+            self.source
+                .seek(SeekFrom::Start(body_off))
+                .and_then(|_| self.source.read_exact(&mut ct))
+                .ok()?;
+            // `comp_size` on an AE-2 entry is the full envelope:
+            // salt (16) + verify (2) + ciphertext + mac10. The
+            // plaintext length = comp_size - AE2_OVERHEAD.
+            let overhead = crate::crypto::AE2_OVERHEAD;
+            if ct.len() < overhead {
+                return None;
+            }
+            // decrypt_ae2's `ciphertext_len` parameter is the
+            // *ciphertext* byte count, not the full envelope.
+            // Envelope layout: salt(16) + verify(2) + ciphertext
+            // + mac10 → ciphertext_len = comp_size - overhead.
+            let plain_len = ct.len() - overhead;
+            let mut plain = Vec::with_capacity(plain_len);
+            let mut cursor = std::io::Cursor::new(&ct[..]);
+            crate::crypto::decrypt_ae2(&pw, &mut cursor, plain_len as u64, &mut plain).ok()?;
+            if let Some(ctx) = &self.cache_ctx {
+                // Cache the *decrypted* body — the cache is
+                // local and already 0600-protected (PR #91).
+                let _ = ctx.cache.put(&ctx.archive_id, name, &plain);
+            }
+            return Some(plain);
+        }
+        // Everything else (compressed sentinel without encryption,
+        // ZipCrypto-style encryption, etc.) isn't a sentinel we
+        // currently write — leave the None return intact.
+        None
     }
 
     /// Attach a Phase-6 index cache to this archive. All subsequent
@@ -663,6 +716,32 @@ impl Archive {
     /// `ArchiveId` from the source's URL + content fingerprint
     /// (ETag / Last-Modified / Content-Length) so stale buckets
     /// age out instead of serving wrong bytes.
+    /// Attach a password so `read_index_body` can decrypt
+    /// AE-2-encrypted `.tzip/*` sentinels on password-
+    /// protected archives (PR #69 fix #2 made sentinels
+    /// encrypted). Callers that already have a `--password`
+    /// in hand (grep, aggregate, query, jq, cat, x) should
+    /// call this immediately after opening the archive so
+    /// lazy-loaded sentinels (term / facet / columnar) and
+    /// the name index all see the password on first access.
+    ///
+    /// Re-loads name segments after attach, because those
+    /// are populated eagerly at open time — if the open
+    /// predated the password attach, the name-index entry
+    /// will have returned None and left `name_segments`
+    /// empty.
+    pub fn attach_password(&mut self, password: String) {
+        self.archive_password = Some(password);
+        if self.name_segments.is_empty() {
+            self.try_load_name_segments();
+        }
+        // term / facet / columnar sentinels load lazily
+        // through their `ensure_*_segments` paths — they'll
+        // pick up the password on first access.
+        self.term_segments_loaded = false;
+        self.facet_segments_loaded = false;
+    }
+
     pub fn attach_cache(
         &mut self,
         cache: std::sync::Arc<crate::indexcache::IndexCache>,

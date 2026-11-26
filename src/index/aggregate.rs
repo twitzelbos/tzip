@@ -34,6 +34,9 @@ pub fn run(opts: AggregateOptions) -> Result<()> {
     if opts.fields {
         let mut arch = open_archive_with_cache(&archives[0], cache.clone())
             .with_context(|| format!("open archive {}", archives[0]))?;
+        if let Some(pw) = opts.password.clone() {
+            arch.attach_password(pw);
+        }
         let mut out = std::io::stdout().lock();
         for name in arch.facet_fields() {
             writeln!(out, "{}", name)?;
@@ -42,7 +45,13 @@ pub fn run(opts: AggregateOptions) -> Result<()> {
     }
 
     let field = opts.by.as_deref().expect("by required");
-    let merged = merge_facet_across_shards(&archives, field, cache, opts.verbose)?;
+    let merged = merge_facet_across_shards(
+        &archives,
+        field,
+        cache,
+        opts.password.as_deref(),
+        opts.verbose,
+    )?;
 
     let limit = if opts.top == 0 { merged.counts.len() } else { opts.top };
     let top = merged.top_n(limit);
@@ -96,6 +105,7 @@ fn merge_facet_across_shards(
     archives: &[String],
     field: &str,
     cache: Option<Arc<crate::indexcache::IndexCache>>,
+    password: Option<&str>,
     verbose: bool,
 ) -> Result<Facet> {
     let mut merged_counts: HashMap<Vec<u8>, u64> = HashMap::new();
@@ -111,6 +121,9 @@ fn merge_facet_across_shards(
         }
         let mut arch = open_archive_with_cache(spec, cache.clone())
             .with_context(|| format!("open archive {}", spec))?;
+        if let Some(pw) = password {
+            arch.attach_password(pw.to_string());
+        }
         if available_hint.is_empty() {
             available_hint = arch.facet_fields();
         }

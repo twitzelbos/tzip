@@ -316,6 +316,9 @@ pub fn run_cat(opts: ReaderOptions) -> Result<()> {
     let cache = open_cache_if_configured(opts.cache.as_ref())?;
     let mut arch = open_archive_with_cache(&opts.archive, cache)
         .with_context(|| format!("open {}", opts.archive))?;
+    if let Some(pw) = opts.password.as_deref() {
+        arch.attach_password(pw.to_string());
+    }
 
     let idx = find_entry_index(&arch, &name)?;
     let stdout = std::io::stdout();
@@ -366,6 +369,9 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
     let t = std::time::Instant::now();
     let mut arch = open_archive_with_cache(&opts.archive, cache)
         .with_context(|| format!("open {}", opts.archive))?;
+    if let Some(pw) = opts.password.as_deref() {
+        arch.attach_password(pw.to_string());
+    }
     p("open_archive", t);
 
     let selected_set: Option<std::collections::HashSet<String>> = if names_filter.is_empty() {

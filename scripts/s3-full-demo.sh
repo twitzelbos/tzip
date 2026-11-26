@@ -430,7 +430,7 @@ echo "PASS: wrong password rejected (exit code $rc)"
 
 banner "8/15  tzip x — extract one entry to disk, diff against original"
 mkdir -p extract
-run "x" "$TZIP" x "$S3_URL" "$MARKER_ENTRY" -C extract -p "$PASSWORD"
+run "x" "$TZIP" x "$S3_URL" "$MARKER_ENTRY" --to extract -p "$PASSWORD"
 # The original lives in the cache dir, NOT the per-run scratch;
 # `$MARKER_ENTRY` is `corpus/entry-NNNNNN.json`, so the
 # original is `$CACHED_CORPUS/<basename>` (CACHED_CORPUS is

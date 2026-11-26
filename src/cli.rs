@@ -414,6 +414,22 @@ pub struct LsArgs {
     #[arg(long, conflicts_with = "password")]
     pub password_file: Option<PathBuf>,
 
+    /// Phase-6 index cache directory. On remote archives
+    /// (`http(s)://`, `s3://`) the central directory itself is
+    /// cached here keyed on `(url, ETag)` — a 1 M-entry
+    /// archive's cold ~70 MB CDR fetch drops to a ~2 KB local
+    /// read on repeat `tzip ls`. Local archives ignore this.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    #[arg(long, value_name = "MB", default_value_t = 256u64)]
+    pub cache_size_mb: u64,
+
+    /// Phase-6b RAM-tier cap. `0` disables the in-process LRU
+    /// (disk-only). Omitted → 64 MB default.
+    #[arg(long, value_name = "MB")]
+    pub cache_ram_mb: Option<u64>,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
@@ -434,6 +450,21 @@ pub struct CatArgs {
 
     #[arg(long, conflicts_with = "password")]
     pub password_file: Option<PathBuf>,
+
+    /// Phase-6 index cache directory. Caches the central
+    /// directory keyed on `(url, ETag)` so repeat `tzip cat`
+    /// on a huge remote archive skips the ~70 B × entries
+    /// CDR refetch. Local archives ignore this.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    #[arg(long, value_name = "MB", default_value_t = 256u64)]
+    pub cache_size_mb: u64,
+
+    /// Phase-6b RAM-tier cap. `0` disables the in-process LRU
+    /// (disk-only). Omitted → 64 MB default.
+    #[arg(long, value_name = "MB")]
+    pub cache_ram_mb: Option<u64>,
 
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -804,6 +835,22 @@ pub struct ExtractArgs {
     #[arg(long, conflicts_with = "password")]
     pub password_file: Option<PathBuf>,
 
+    /// Phase-6 index cache directory. Caches the central
+    /// directory keyed on `(url, ETag)`. Repeat `tzip x` of a
+    /// few entries from a huge remote archive drop the ~70 B
+    /// × entries CDR refetch to a local read. Local archives
+    /// ignore this.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    #[arg(long, value_name = "MB", default_value_t = 256u64)]
+    pub cache_size_mb: u64,
+
+    /// Phase-6b RAM-tier cap. `0` disables the in-process LRU
+    /// (disk-only). Omitted → 64 MB default.
+    #[arg(long, value_name = "MB")]
+    pub cache_ram_mb: Option<u64>,
+
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
@@ -1090,6 +1137,11 @@ impl LsArgs {
             quiet: self.quiet,
             verbose: self.verbose,
             op: ReaderOp::Ls,
+            cache: cache_spec_from_flags_with_ram(
+                self.cache_dir,
+                self.cache_size_mb,
+                self.cache_ram_mb,
+            ),
         })
     }
 }
@@ -1103,6 +1155,11 @@ impl CatArgs {
             quiet: self.quiet,
             verbose: self.verbose,
             op: ReaderOp::Cat { name: self.name },
+            cache: cache_spec_from_flags_with_ram(
+                self.cache_dir,
+                self.cache_size_mb,
+                self.cache_ram_mb,
+            ),
         })
     }
 }
@@ -1287,6 +1344,11 @@ impl ExtractArgs {
                 parallel,
                 connections: self.connections,
             },
+            cache: cache_spec_from_flags_with_ram(
+                self.cache_dir,
+                self.cache_size_mb,
+                self.cache_ram_mb,
+            ),
         })
     }
 }

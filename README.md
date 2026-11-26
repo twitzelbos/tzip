@@ -198,6 +198,7 @@ tzip query --cache-dir ~/.cache/tzip -s "SELECT ..." s3://logs/shards/*.zip
 | Group, join, percentile, date-histogram | `tzip query --sql` | `--write-columnar` + `duckdb` on PATH |
 | List / stream / extract files | `tzip ls` / `cat` / `x` | nothing |
 | Find entries by name / size / mtime | `tzip find` | nothing |
+| See the last N entries by add-order or mtime | `tzip tail` | nothing |
 
 The [elastic-replacement scenarios doc](docs/scenarios/elastic-replacement.md)
 walks through six real-world cases where this story replaces Elasticsearch,
@@ -219,6 +220,7 @@ tzip ls        <ARCHIVE>              # list entries
 tzip cat       <ARCHIVE> <NAME>       # stream one entry to stdout
 tzip x         <ARCHIVE> [NAMES]...   # extract (whole archive or selected names)
 tzip find      <ARCHIVE>...           # list entries matching name / size / mtime
+tzip tail      <ARCHIVE>...           # last N entries by CDR position or mtime
 tzip diff      <A> <B>                # CDR-level diff between two archives
 tzip hash      <ARCHIVE>              # crc32 / md5 / sha256 of entries
 
@@ -239,9 +241,11 @@ The flags below are for `create` unless the row says otherwise. `u`
 takes the same subset relevant to its work (jobs, read-jobs, walk-jobs,
 method/level for new entries, password, sort, exclude, quiet, verbose,
 keep-cache, basename-only) plus `--delete GLOB` and `--atomic`.
-The reader subcommands (`ls`, `cat`, `x`) take only password-related
-flags (`-p`, `--password-file`), `-q`, `-v`, plus `cat`'s `<NAME>`
-positional and `x`'s optional `[NAMES]...` + `--to DIR`.
+The reader subcommands (`ls`, `cat`, `x`) take password flags (`-p`,
+`--password-file`), the Phase-6 cache flags (`--cache-dir DIR`,
+`--cache-size-mb MB`, `--cache-ram-mb MB`) that are useful against
+remote archives, `-q`, `-v`, plus `cat`'s `<NAME>` positional and
+`x`'s optional `[NAMES]...` + `--to DIR`.
 
 **Positional (create / u)**
 
@@ -454,26 +458,26 @@ Workarounds if speed matters more than ratio on `.7z`:
 
 ## Update mode
 
-`-u` / `--update` modifies an existing `.zip` in place without re-reading or
+`tzip u` modifies an existing `.zip` in place without re-reading or
 re-compressing the entries that are being kept. It's the analog of
 `7z u archive.zip files...`. ZIP only — `.7z` solid archives can't be
-edited in place and tzip rejects `-u` on them up front.
+edited in place and tzip rejects `u` on them up front.
 
 ```
 # Add c.txt to an existing archive
-tzip -u out.zip c.txt
+tzip u out.zip c.txt
 
 # Replace an entry by providing a matching input
-tzip -u out.zip a.txt             # if a.txt is already in the archive, it is replaced
+tzip u out.zip a.txt             # if a.txt is already in the archive, it is replaced
 
 # Remove entries by glob
-tzip -u --delete '*.log' out.zip
+tzip u --delete '*.log' out.zip
 
 # Mixed: delete some, add some
-tzip -u --delete b.txt out.zip d.txt
+tzip u --delete b.txt out.zip d.txt
 
 # Force the safer path (see below) even for pure adds
-tzip -u --atomic out.zip c.txt
+tzip u --atomic out.zip c.txt
 ```
 
 ### Two paths, chosen automatically
@@ -519,11 +523,36 @@ Rebuild mode is inherently atomic — the temp file either lands via
   verbatim. (Unknown central-directory extras are not preserved; the CDR
   is reconstructed from parsed fields.)
 
+### Updating an `s3://` archive
+
+`tzip u s3://bucket/key.zip ...` adds entries to a ZIP living in S3
+without staging the whole object locally. The append mode's
+truncate-at-cd_offset trick doesn't translate to S3 directly (objects
+are immutable), so tzip does the morally-equivalent dance via
+multipart upload with server-side part-copy:
+
+1. `CreateMultipartUpload` opens a staging slot; the live object is
+   untouched.
+2. `UploadPartCopy` ranges copy the archive's prefix (bytes
+   `0 .. cd_offset`) into the staging upload server-side — no bytes
+   transit your machine.
+3. `UploadPart` streams the new LFH+body records plus the rebuilt
+   central directory into the final parts.
+4. `CompleteMultipartUpload` with `If-Match: <original-etag>` atomically
+   swaps staging → live. A lost-update race turns into a clean
+   HTTP 412 rather than a corrupted object; any error before step 4
+   triggers `AbortMultipartUpload`, and a bucket lifecycle rule
+   (`AbortIncompleteMultipartUpload`, standard setup) GCs any orphan.
+
+Scope matches the local append path: pure add only. `--delete`,
+`--sort`, `--atomic`, and name collisions with existing entries all
+error out — rebuild locally and re-upload if you need any of those.
+
 ### Known limits
 
 - `.7z` is rejected; rebuild it from source if you need to change its
   contents.
-- Concurrent writers are not supported — two `tzip -u` runs on the same
+- Concurrent writers are not supported — two `tzip u` runs on the same
   archive will race. The undo file's exclusive-create catches the simple
   overlap case (the second run fails with a clear "undo already exists"
   error).
@@ -532,9 +561,12 @@ Rebuild mode is inherently atomic — the temp file either lands via
 
 ## Reading archives
 
-Three read subcommands land in 0.2, with the long-range plan of
-extending them to remote sources (HTTP Range, S3) and to a mount point
-in later releases. Today they work on local `.zip` files.
+Three read subcommands — `ls`, `cat`, `x` — work against a local file,
+an `http(s)://` URL, or an `s3://bucket/key.zip` URL. Remote archives
+use Range GETs through the HTTP/S3 reader stack described in
+[Reading remote archives](#reading-remote-archives-http--s3) below; the
+same archives also serve as the backing store for
+[`tzip mount`](#mounting-archives-as-a-filesystem-tzip-mount).
 
 ```
 # List entries. `*` marks AES-encrypted entries.
@@ -601,8 +633,12 @@ Why this matters: `tzip cat s3://bucket/huge.zip one-file.txt` pulls
 ~200 KiB over the wire regardless of whether `huge.zip` is 100 MB or
 100 GB. No staging, no full download.
 
-Write operations (`create`, `u`) are **local-only** by design — passing
-a URL target fails fast with a clear error.
+`tzip create` is **local-only** by design — passing a URL target
+fails fast with a clear error. `tzip u` accepts `s3://` targets (pure
+append only, atomic via multipart-upload-with-server-side-part-copy —
+see [Updating an `s3://` archive](#updating-an-s3-archive)); plain
+HTTP(S) targets stay read-only because the protocol has no atomic
+append primitive.
 
 ### HTTP(S) requirements
 
@@ -693,6 +729,15 @@ command acts as an rg pre-filter.
 
 Defaults are tuned for S3's documented per-prefix soft limits
 (~5,500 GET/s per prefix historically). Override per workload.
+
+### Password + index cache
+
+| flag | meaning |
+|---|---|
+| `-p, --password <PW>` / `--password-file <FILE>` | Needed to grep AES-encrypted entries. The encrypted sentinel entries (`.tzip/terms.v1`, `.tzip/facets.v1/<f>`, `.tzip/columnar.v1.parquet`) are decrypted locally too — tzip attaches the password to the reader so the index path still narrows candidates on encrypted archives. |
+| `--cache-dir <DIR>` | Phase-6 disk cache for the CDR + term posting lists keyed on `(url, ETag)`. Repeat greps across the same remote archives skip the CDR + term-index Range GETs. Mirrors `tzip query`'s flag. |
+| `--cache-size-mb <MB>` | Disk-cache byte cap (default 256). |
+| `--cache-ram-mb <MB>` | Phase-6b RAM-tier cap (`0` = disk-only; omitted = 64 MB default). |
 
 ### CDR-side filters
 
@@ -796,8 +841,9 @@ event.kind
 ```
 
 Flags: `--top N` for top-N by count, `--json` for one JSON object
-per line, `--cache-dir DIR` for client-side index caching
-(mirrors `tzip query`).
+per line, `--cache-dir DIR` / `--cache-size-mb` / `--cache-ram-mb` for
+client-side index caching (mirrors `tzip query`), `-p / --password` so
+encrypted facet sentinels still decrypt against AES archives.
 
 ---
 
@@ -1075,8 +1121,6 @@ Semantics (same on both platforms):
 - **Concurrent reads of different entries serialise** through a single
   archive-source mutex. A follow-up can pool sources per-mount for
   parallel Range GETs (mirroring `tzip grep --inner-jobs`).
-- **mtime from the DOS-epoch default** if the archive was created by
-  tzip's macOS bulk walker — same limitation documented elsewhere.
 - **Symlinks** aren't surfaced as symlinks (ZIP writer doesn't emit
   them yet). Follow-up.
 
@@ -1341,8 +1385,8 @@ Finder use internally.
 - Reduces syscall count 10-30× on wide directories
 - Preserves the dirfd for the openat path
 - Disabled with `--classic-walk` (falls back to jwalk)
-- Currently sets mtime = DOS epoch (1980-01-01) — proper timestamp
-  parsing is a TODO; use `--classic-walk` if real mtimes matter
+- Parses `ATTR_CMN_MODTIME` from the bulk-attribute buffer, so entries
+  carry real source-file mtimes end-to-end
 
 ### `openat(dirfd, basename)` reader
 
@@ -1549,10 +1593,6 @@ Map. Then rsync your data back.
 
 - **`.7z` solid is single-threaded** — sevenz-rust 0.6 does not expose
   multi-threaded LZMA2. Use `-m xz` inside a `.zip` for parallelism.
-- **Bulk walker sets mtime = DOS epoch** — the `getattrlistbulk`
-  attribute-alignment parser doesn't currently decode `ATTR_CMN_MODTIME`
-  correctly; the field is skipped and mtime is set to 1980-01-01. Use
-  `--classic-walk` if real mtimes matter. TODO.
 - **Symlinks are not preserved as links** — the ZIP writer has no
   symlink-entry support, so a symbolic link is archived as a *regular
   file whose contents are the link target path* rather than a symlink.
@@ -1608,21 +1648,30 @@ Map. Then rsync your data back.
 
 ```
 src/
-├── main.rs             CLI entrypoint
-├── cli.rs              clap args + Options struct
-├── walker.rs           jwalk-based streaming walker (portable)
-├── bulk_walker.rs      macOS getattrlistbulk walker (fast path)
-├── platform.rs         OwnedDirFd, F_NOCACHE/F_RDADVISE/F_RDAHEAD,
-│                       mmap-or-read, POSIX_FADV_DONTNEED (Linux)
+├── main.rs             CLI entrypoint (binary shim)
+├── lib.rs              re-exports every module so the FSKit cdylib
+│                       and integration tests share one tree
+├── cli.rs              clap args + per-subcommand Options structs
+├── options.rs          CreateOptions & shared flag bag
+├── method.rs           compression-method enum + level clamping
 ├── pipeline.rs         reader/CPU/writer orchestration + Source trait
-├── dispatch_io.rs      GCD dispatch_io_read Source (macOS opt-in)
-├── dispatch_shim.c     C shim with Objective-C blocks (built by build.rs)
-├── compress.rs         methods + Scratch (buffer pool) + parallel-block DEFLATE
-├── crypto.rs           WinZIP AES-256 AE-2 in-place encrypt
-├── zipwriter.rs        hand-rolled LFH/CDR/EOCD/ZIP64/AES-extra-field
 ├── sevenz.rs           .7z solid via sevenz-rust
-├── progress.rs         indicatif progress bar (determinate + spinner)
-└── tui.rs              ratatui dashboard
+├── io/                 walker, bulk_walker (macOS), source, progress, tui
+├── platform/           F_NOCACHE/F_RDADVISE, dispatch_io, raw_apfs,
+│                       linux_raw + fiemap, io_uring_src, dirfd_cache
+├── zip/                hand-rolled writer + reader + dos_time + crypto
+│                       (AE-2 AES-256 + ZipCrypto) + sentinel + decompress
+├── cmd/                read subcommands: ls/cat/x (reader), find, tail,
+│                       diff, hash, grep, jq, bench
+├── index/              archive-as-database stack: nameidx, termidx,
+│                       facets + aggregate, columnar + parquet_prune,
+│                       shards, indexcache (Phase 6 disk+RAM LRU),
+│                       cdr_cache, query (DuckDB dispatch)
+├── update/             local append/rebuild + s3 (multipart append)
+├── sources/            remote readers: http, s3, sigv4, s3_list,
+│                       s3_write (multipart), multidisk
+└── mount/              FUSE3 (Linux) + FSKit (macOS 15.4+) runtime,
+                        shared VFS, Keychain integration
 ```
 
 ### `Source` trait
@@ -1635,10 +1684,11 @@ pub trait Source: Send + Sync {
 }
 ```
 
-Current implementations: `LocalFsSource`, `DispatchIoSource`. This is the
-seam where future cloud backends (S3, Google Drive, Box) plug in —
-they'll stream from an HTTP body into a `Bytes`-like buffer without
-touching the local filesystem.
+Write-pipeline implementations today: `LocalFsSource`,
+`DispatchIoSource`, `RawApfsSource`, `LinuxRawSource`, `IoUringSource`.
+Archive readers (HTTP / S3 Range GETs) live under `src/sources/` and
+expose the `Read + Seek` surface the ZIP reader consumes — same seam,
+different direction.
 
 ---
 
@@ -1677,22 +1727,23 @@ cargo test                    # debug build tests
 cargo test --release          # release build tests (recommended pre-commit)
 ```
 
-Three integration suites:
+Integration tests live under `tests/`, grouped by subsystem:
 
-- `tests/roundtrip.rs` — create-and-extract round-trips for STORE,
-  DEFLATE (levels 0 and 12), BZIP2, LZMA, XZ, Zstd (via system `7z`),
-  AES-256 structural check, `.7z` solid (plain + AES), `--sort`
-  byte-identical determinism.
-- `tests/update.rs` — `tzip u` in both append and rebuild modes: add,
-  replace, delete, mixed, AES preservation across kept entries,
-  `--sort`, create-if-missing, `.7z` rejection, stale-undo cleanup,
-  crash recovery from a fabricated truncated archive.
-- `tests/reader.rs` — `tzip ls`, `tzip cat` per compression method
-  (store / deflate / bzip2 / lzma / xz / zstd), AES cat with correct /
-  missing / wrong password, whole-archive and selective `tzip x`,
-  zip-slip rejection, create-then-extract identity.
+- `tests/zip/` — `roundtrip`, `update` (append + rebuild, AES
+  preservation, crash recovery), `extract_parallel`, `mount`,
+  `multidisk`, `zipcrypto`, `hash`.
+- `tests/cmd/` — one file per read subcommand: `reader` (ls / cat / x
+  across every compression method, zip-slip rejection, AES), `find`,
+  `grep` (CDR-side filters, checkpoint/resume, `--exec`, JSON output),
+  `jq`, `diff`, `tail`, `bench`.
+- `tests/index/` — the archive-as-database index path: `nameidx`,
+  `termidx`, `facets` via `aggregate`, `columnar` + autoinfer +
+  per-segment, `shards`, `indexcache`, `index_segments`, `cdr_cache`.
+- `tests/remote/` — HTTP + S3 Range-GET readers against an in-process
+  `tiny_http` mock, plus the `writer_s3` suite that exercises
+  multipart-append end-to-end (`tzip u s3://...`).
 
-43 integration tests total. CI runs them on ubuntu-latest and
+Roughly 223 tests across 28 files. CI runs them on ubuntu-latest and
 macos-latest (see `.github/workflows/ci.yml`).
 
 ---

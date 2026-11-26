@@ -466,91 +466,104 @@ fn run_update_append(
     file.seek(SeekFrom::Start(cd_offset))
         .context("seek to cd_offset")?;
 
-    // 3. BufWriter + ZipWriter positioned at cd_offset. Rebuild the central
-    //    directory from the entries we parsed. fstatfs on the rw fd we
-    //    already hold — no second path walk.
-    #[cfg(unix)]
-    let out_info = {
-        use std::os::unix::io::AsRawFd;
-        platform::fs_info_fd(file.as_raw_fd()).ok()
-    };
-    #[cfg(not(unix))]
-    let out_info = platform::fs_info(
-        opts.archive
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new(".")),
-    )
-    .ok();
-    let cap = pipeline::writer_capacity_for(out_info.as_ref());
-    let writer = BufWriter::with_capacity(cap, file);
-    let mut zw = ZipWriter::new_at(writer, cd_offset);
-
-    // Re-open a read-only handle solely to parse the old CDR we snapshotted.
-    // We already have the parsed entries in `tail`; parse them back out so
-    // the writer's central directory lists them with their *original*
-    // lfh_offsets (unchanged on disk).
-    let existing = reparse_entries_from_tail(&tail, cd_offset)?;
-    for re in &existing {
-        zw.record_existing(re, re.lfh_offset);
-    }
-
-    // 4. Run the reader/CPU pool on the new items; writes land at the end
-    //    of the appended region. Also construct a Phase-4 index segment
-    //    so new entries' names / terms / facets flow into fresh
-    //    `.segN` sentinels at the base of CDR position
-    //    = existing count (which records_existing has already placed).
-    let total_new_bytes: u64 = new_items.iter().map(|i| i.size).sum();
-    let total_new_files = new_items.len() as u64;
+    // Everything from here on runs after the archive has been
+    // truncated past its original CDR. ANY error must restore
+    // from the undo file we just wrote — not just a failure
+    // inside `encode_items_into_writer`. Issue #80 surfaced
+    // this: `reparse_entries_from_tail` on a ZIP64 archive used
+    // to bail here and the archive was left truncated with no
+    // recovery triggered.
+    //
+    // Wrap the critical section in a closure so there's exactly
+    // one error path, and call `restore_from_undo` on every
+    // failure. On success we fall through to the undo-removal
+    // step below.
     let progress = Arc::new(Progress::new(
-        total_new_bytes,
-        total_new_files,
+        new_items.iter().map(|i| i.size).sum(),
+        new_items.len() as u64,
         opts.quiet || opts.tui,
     ));
-    let base_idx = existing.len() as u32;
-    let want_any_segment = opts.index_names
-        || !opts.index_terms.is_empty()
-        || !opts.facet.is_empty()
-        || columnar_schema.is_some();
-    let mut seg = if want_any_segment {
-        Some(IndexSegment::new(opts, base_idx, columnar_schema)?)
-    } else {
-        None
-    };
-    let result =
-        encode_items_into_writer(opts, new_items, &mut zw, &progress, seg.as_mut());
+    let result = (|| -> Result<()> {
+        // 3. BufWriter + ZipWriter positioned at cd_offset. Rebuild the
+        //    central directory from the entries we parsed. fstatfs on
+        //    the rw fd we already hold — no second path walk.
+        #[cfg(unix)]
+        let out_info = {
+            use std::os::unix::io::AsRawFd;
+            platform::fs_info_fd(file.as_raw_fd()).ok()
+        };
+        #[cfg(not(unix))]
+        let out_info = platform::fs_info(
+            opts.archive
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new(".")),
+        )
+        .ok();
+        let cap = pipeline::writer_capacity_for(out_info.as_ref());
+        let writer = BufWriter::with_capacity(cap, file);
+        let mut zw = ZipWriter::new_at(writer, cd_offset);
+
+        // Re-open a read-only handle solely to parse the old CDR we
+        // snapshotted. We already have the parsed entries in `tail`;
+        // parse them back out so the writer's central directory lists
+        // them with their *original* lfh_offsets (unchanged on disk).
+        let existing = reparse_entries_from_tail(&tail, cd_offset)?;
+        for re in &existing {
+            zw.record_existing(re, re.lfh_offset);
+        }
+
+        // 4. Run the reader/CPU pool on the new items; writes land at
+        //    the end of the appended region. Also construct a Phase-4
+        //    index segment so new entries' names / terms / facets flow
+        //    into fresh `.segN` sentinels at the base of CDR position
+        //    = existing count (which records_existing has already placed).
+        let base_idx = existing.len() as u32;
+        let want_any_segment = opts.index_names
+            || !opts.index_terms.is_empty()
+            || !opts.facet.is_empty()
+            || columnar_schema.is_some();
+        let mut seg = if want_any_segment {
+            Some(IndexSegment::new(opts, base_idx, columnar_schema)?)
+        } else {
+            None
+        };
+        encode_items_into_writer(opts, new_items, &mut zw, &progress, seg.as_mut())?;
+
+        // 4b. Emit Phase-4 index segments for the newly added entries.
+        //     Segment number = (max existing segment of this kind) + 1;
+        //     1 if no existing segment, so segments never collide with
+        //     the Phase-1/2/3 unsuffixed base entries.
+        if let Some(mut s) = seg.take() {
+            let (name_seg_n, term_seg_n, facet_seg_ns, columnar_seg_n) =
+                next_segment_numbers(&existing, &opts.facet);
+            write_index_segment_entries(
+                &mut zw,
+                &mut s,
+                opts,
+                name_seg_n,
+                term_seg_n,
+                &facet_seg_ns,
+                columnar_seg_n,
+            )?;
+        }
+
+        // 5. Finish + fsync. Order matters — we must know the archive
+        //    is durable on disk *before* the caller removes the undo
+        //    file.
+        let mut inner = zw.finish()?;
+        inner.flush()?;
+        inner.get_mut().sync_all().context("sync_all on archive")?;
+        drop(inner);
+        Ok(())
+    })();
 
     if let Err(e) = result {
-        // Try to restore via undo. If restore fails, leave the undo file in
-        // place so the next tzip -u can retry.
+        // Try to restore via undo. If restore fails, leave the undo
+        // file in place so the next `tzip u` can retry.
         let _ = restore_from_undo(&opts.archive, &undo_path);
-        return Err(e.context("append-mode update failed"));
+        return Err(e.context("append-mode update failed (archive restored from undo)"));
     }
-
-    // 4b. Emit Phase-4 index segments for the newly added entries.
-    //     Segment number = (max existing segment of this kind) + 1;
-    //     1 if no existing segment, so segments never collide with
-    //     the Phase-1/2/3 unsuffixed base entries.
-    if let Some(mut s) = seg.take() {
-        let (name_seg_n, term_seg_n, facet_seg_ns, columnar_seg_n) =
-            next_segment_numbers(&existing, &opts.facet);
-        write_index_segment_entries(
-            &mut zw,
-            &mut s,
-            opts,
-            name_seg_n,
-            term_seg_n,
-            &facet_seg_ns,
-            columnar_seg_n,
-        )?;
-    }
-
-    // 5. Finish + fsync + delete undo. Order matters — we must know the
-    //    archive is durable on disk *before* we remove the undo file.
-    let mut inner = zw.finish()?;
-    inner.flush()?;
-    inner.get_mut().sync_all().context("sync_all on archive")?;
-    drop(inner);
 
     std::fs::remove_file(&undo_path).with_context(|| {
         format!(
@@ -1222,7 +1235,7 @@ fn restore_from_undo_with_hdr(archive: &Path, undo: &Path, hdr: &UndoHeader) -> 
 /// so we can reconstruct the existing-entries list without reopening
 /// the archive. Shares the CDR parser with `zipreader`, directly from
 /// the in-memory tail — no scratch file, no fsync, no second open.
-fn reparse_entries_from_tail(tail: &[u8], _cd_offset: u64) -> Result<Vec<ReadEntry>> {
-    crate::zipreader::parse_entries_from_tail(tail)
+fn reparse_entries_from_tail(tail: &[u8], cd_offset: u64) -> Result<Vec<ReadEntry>> {
+    crate::zipreader::parse_entries_from_tail(tail, cd_offset)
 }
 

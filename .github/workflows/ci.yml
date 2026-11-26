@@ -24,43 +24,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          # `rust-analyzer` is the backend deslop-please uses to
-          # index the crate's module graph + fields. It ships as an
-          # optional rustup component, not a separate binary.
-          components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
+      # deslop-please drives `rust-analyzer scip` to index the
+      # workspace. The rust-analyzer that ships as a rustup
+      # component is a lagging "proxy" build; its `scip`
+      # subcommand has repeatedly SIGPIPE'd mid-index on GHA
+      # Linux runners (PRs #79, #85), while the standalone
+      # rust-analyzer release (what `brew install
+      # rust-analyzer` gives you locally) does not. Install the
+      # standalone build so CI matches local behaviour.
+      #
+      # `nightly-latest` tag always redirects to the most
+      # recent rust-analyzer build; we pin the archive name's
+      # architecture so a runner-arch change is a loud failure
+      # instead of a confusing SIGPIPE.
+      - name: Install rust-analyzer (standalone)
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/ra.gz \
+              https://github.com/rust-lang/rust-analyzer/releases/download/nightly/rust-analyzer-x86_64-unknown-linux-gnu.gz
+          gunzip /tmp/ra.gz
+          chmod +x /tmp/ra
+          sudo mv /tmp/ra /usr/local/bin/rust-analyzer
+          rust-analyzer --version
       - name: Install deslop-please
         run: cargo install --locked deslop-please@0.1.4
       - name: Run deslop-please
-        # Retry on transient `rust-analyzer scip failed (signal:
-        # 13 (SIGPIPE))` — rust-analyzer occasionally SIGPIPEs
-        # mid-index on GHA runners (seen on PR #79, #85). Retry
-        # with a short backoff before giving up. Non-flake
-        # failures (real cycles, wide-dir, field-leak) print
-        # their `error[…]` lines and exit non-zero on every
-        # attempt, so they still fail after the retries.
-        run: |
-          set +e
-          for attempt in 1 2 3; do
-              echo "::group::deslop-please attempt $attempt"
-              output=$(deslop-please 2>&1)
-              rc=$?
-              echo "$output"
-              echo "::endgroup::"
-              if [[ $rc -eq 0 ]]; then
-                  echo "deslop-please clean on attempt $attempt"
-                  exit 0
-              fi
-              if ! echo "$output" | grep -q "rust-analyzer scip failed"; then
-                  echo "deslop-please reported a real finding (not a SIGPIPE flake)"
-                  exit $rc
-              fi
-              echo "attempt $attempt hit the rust-analyzer SIGPIPE flake; retrying"
-              sleep 5
-          done
-          echo "deslop-please still SIGPIPE-ing after 3 attempts — the flake may have become persistent"
-          exit 1
+        run: deslop-please
 
   test:
     name: test (${{ matrix.os }})

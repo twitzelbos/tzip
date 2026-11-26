@@ -240,7 +240,22 @@ fn process_archive(
                 let mut source = crate::reader::open_source_for_with_hint(&url, worker_hint)
                     .with_context(|| format!("open inner source for {}", url))?;
                 while let Ok(re) = rx.recv() {
-                    scan_entry(&url, &mut *source, &re, &regex, &opts, cp_writer.as_ref(), &out)?;
+                    // Per-entry errors (transient DNS, a
+                    // single corrupt entry, a bad password on
+                    // one entry out of thousands, …) should
+                    // not kill the whole grep — matches
+                    // already emitted are useful, and a
+                    // lone network flake shouldn't erase them.
+                    // Log to stderr, keep scanning the rest.
+                    // The worker itself still returns Ok;
+                    // only `open_source_for_with_hint` above
+                    // (which is a one-shot at worker start)
+                    // can bail the whole thread.
+                    if let Err(e) =
+                        scan_entry(&url, &mut *source, &re, &regex, &opts, cp_writer.as_ref(), &out)
+                    {
+                        eprintln!("tzip grep: {} — {:#}", re.name, e);
+                    }
                 }
                 Ok(())
             });

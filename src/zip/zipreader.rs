@@ -220,6 +220,59 @@ impl Archive {
             bail!("archive is too small to be a ZIP ({} bytes)", file_size);
         }
 
+        // ChatGPT-review #74 / issue #74: before issuing the
+        // EOCD scan + CDR range GET (which dominates the wire
+        // cost on million-entry archives — ~70 bytes × entries),
+        // check the Phase 6 cache for a cached CDR blob keyed
+        // on (url, fingerprint). On hit we skip every remote
+        // read past this point.
+        if let Some((cache, id)) = &cache_binding {
+            if let Some(blob) = crate::cdr_cache::load(cache, id) {
+                // Defence-in-depth: an attacker who can write to
+                // the local cache dir shouldn't be able to point
+                // us at arbitrary byte ranges past end-of-file.
+                // Reject mismatches rather than trust the cache
+                // blindly.
+                if blob.file_size == file_size
+                    && blob
+                        .cd_offset
+                        .checked_add(blob.cd_size)
+                        .is_some_and(|end| end <= blob.file_size)
+                    && blob.cdr.len() as u64 == blob.cd_size
+                {
+                    let entries =
+                        parse_central_directory(&blob.cdr, blob.entry_count)
+                            .context("parse CDR from cache blob")?;
+                    let tail_size = blob.file_size - blob.cd_offset;
+                    let archive_comment = decode_name(&blob.comment, 0);
+                    let mut arch = Self {
+                        source,
+                        entries,
+                        file_size: blob.file_size,
+                        cd_offset: blob.cd_offset,
+                        cd_size: blob.cd_size,
+                        tail_size,
+                        archive_comment,
+                        disk_count: 1,
+                        name_segments: Vec::new(),
+                        term_segments: Vec::new(),
+                        term_segments_loaded: false,
+                        facet_segments: std::collections::HashMap::new(),
+                        facet_segments_loaded: false,
+                        cache_ctx: Some(CacheCtx {
+                            cache: std::sync::Arc::clone(cache),
+                            archive_id: id.clone(),
+                        }),
+                    };
+                    arch.try_load_name_segments();
+                    return Ok(arch);
+                }
+                // Blob rejected (mismatched size / bad fields).
+                // Fall through to a real fetch; the stale blob
+                // gets overwritten by the writeback below.
+            }
+        }
+
         let (eocd_pos, eocd) = find_eocd(&mut *source, file_size).context("find EOCD")?;
 
         if eocd.this_disk != 0 || eocd.cd_disk != 0 {
@@ -282,6 +335,22 @@ impl Archive {
         }
 
         let entries = parse_central_directory(&cdr_bytes, entry_count)?;
+
+        // Write the CDR blob back into the Phase 6 cache (issue
+        // #74), keyed on the same (url, fingerprint) as sentinel
+        // entries. Soft-fails — a failed cache write never
+        // aborts the open; the next open just re-fetches.
+        if let Some((cache, id)) = &cache_binding {
+            let blob = crate::cdr_cache::Blob {
+                file_size,
+                cd_offset,
+                cd_size,
+                entry_count,
+                comment: eocd.comment_bytes.clone(),
+                cdr: cdr_bytes.clone(),
+            };
+            crate::cdr_cache::store(cache, id, &blob);
+        }
 
         let tail_size = file_size - cd_offset;
         let archive_comment = decode_name(&eocd.comment_bytes, 0);
@@ -1474,4 +1543,5 @@ mod tests {
             msg
         );
     }
+
 }

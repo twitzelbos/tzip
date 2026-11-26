@@ -1,4 +1,4 @@
-//! Row-group pruning for `tzip query --sql` — ChatGPT review #4.
+//! Row-group pruning for `tzip query --sql`.
 //!
 //! Before shelling out to DuckDB, we parse a *minimal* subset of
 //! the user's SQL to extract conjunctive `col OP constant`
@@ -8,6 +8,29 @@
 //! row groups whose stats prove the predicate can never match.
 //! A composed Parquet containing only the surviving row groups
 //! is staged to the temp file DuckDB reads.
+//!
+//! ## Why this isn't "reimplementing DuckDB's optimiser"
+//!
+//! The P1 audit flagged "delegate SQL optimisation to the query
+//! engine" as a cleanup candidate. The answer, after
+//! investigation, is that this module isn't a query optimiser —
+//! it's a **client-side Parquet Range-fetch planner**:
+//!
+//! - DuckDB's own row-group pruning lives *inside* its Parquet
+//!   reader. By the time we've handed DuckDB a local temp file,
+//!   the bytes have already crossed the network; DuckDB's prune
+//!   only saves CPU, not S3 GET bytes.
+//! - DuckDB's `httpfs` extension does push WHERE predicates into
+//!   a Parquet *at a URL*, but our Parquet sidecar is a byte
+//!   range inside a ZIP, not a file at a URL — the architecture
+//!   DuckDB's extension targets doesn't exist here.
+//!
+//! So the client-side pruner sits in the gap DuckDB can't reach:
+//! it saves network I/O on remote archives that no downstream
+//! engine can recover. DuckDB retains ownership of everything
+//! above the byte layer — schema binding, joins across shards,
+//! aggregates, percentiles, sort/limit, final WHERE filtering.
+//! See `src/index/query.rs` for the end-to-end dispatch.
 //!
 //! ## Safety / soundness
 //!

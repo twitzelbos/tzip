@@ -161,13 +161,19 @@ pub fn run_update_s3(opts: Options) -> Result<()> {
         return Ok(());
     }
 
-    // Populate LFH sizes on the Archive's own entries up front so
-    // `record_existing` has the correct carry-forward info.
-    for idx in 0..arch.len() {
-        let name = arch.entry(idx).name.clone();
-        arch.lfh_total_size_of(idx)
-            .with_context(|| format!("probe LFH for carried entry {}", name))?;
-    }
+    // NB: unlike the local *rebuild* path (which needs
+    // `lfh_total_size` to byte-copy LFH + body of each kept
+    // entry), the S3 append path does NOT rewrite any kept
+    // entry. It ships `[0, cd_offset)` through server-side
+    // `UploadPartCopy` as a single opaque region, so the kept
+    // LFHs never need to be enumerated client-side. We
+    // deliberately skip the per-entry LFH probe loop that the
+    // local rebuild uses — on a 100 K-entry archive that was
+    // 100 K signed Range GETs of 30 bytes each (P1 audit).
+    // `record_existing` below reads only CDR-sourced fields
+    // (name, method, crc32, sizes, lfh_offset, mtime,
+    // external_attr, stored digests) — none of which require
+    // the LFH probe.
 
     // Snapshot existing entries so we can drop `arch` (freeing the
     // S3Source) before we start the upload. The tail bytes stay

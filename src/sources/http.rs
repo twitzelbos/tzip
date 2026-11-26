@@ -12,13 +12,16 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{self, Read, Seek, SeekFrom};
 
-/// How many bytes to over-fetch past a small read. Big enough to cover the
-/// EOCD scan in one GET; small enough that one-off `cat`s don't balloon.
-/// 1 MiB per HTTP Range GET. See `src/sources/s3.rs` for the
-/// rationale — same shape: each round-trip has fixed cost,
-/// bytes are ~free, grep/extract workers sort candidates by
-/// offset so adjacent reads hit the cache window.
-const PREFETCH_MIN: u64 = 1024 * 1024;
+/// Floor on per-fetch window size. The actual window is
+/// adaptive: sequential access doubles it up to `PREFETCH_MAX`
+/// (see `fetch`), and a non-sequential jump resets it. Mirrors
+/// the shape in `src/sources/s3.rs` so both backends have the
+/// same cost profile.
+const PREFETCH_MIN: u64 = 256 * 1024;
+
+/// Ceiling on the adaptive prefetch window. See the matching
+/// constant in `src/sources/s3.rs` for the sizing rationale.
+const PREFETCH_MAX: u64 = 16 * 1024 * 1024;
 
 pub struct HttpSource {
     url: String,
@@ -39,6 +42,10 @@ pub struct HttpSource {
     /// compliant server; `If-Match` wins when an ETag is
     /// available because it's byte-content, not a timestamp).
     precondition: Option<Precondition>,
+    /// Adaptive prefetch state. See the matching fields in
+    /// `src/sources/s3.rs`.
+    prefetch_window: u64,
+    last_fetch_end: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +102,8 @@ impl HttpSource {
             cache: Vec::new(),
             fingerprint,
             precondition,
+            prefetch_window: PREFETCH_MIN,
+            last_fetch_end: None,
         })
     }
 
@@ -131,6 +140,8 @@ impl HttpSource {
             cache: Vec::new(),
             fingerprint,
             precondition,
+            prefetch_window: PREFETCH_MIN,
+            last_fetch_end: None,
         })
     }
 
@@ -153,8 +164,17 @@ impl HttpSource {
             self.cache.clear();
             return Ok(());
         }
-        let want = min_len.max(PREFETCH_MIN);
+        // Adaptive prefetch — see `src/sources/s3.rs::fetch` for
+        // the rationale. Sequential access doubles the window;
+        // non-sequential resets it to the floor.
+        if self.last_fetch_end == Some(start) {
+            self.prefetch_window = (self.prefetch_window * 2).min(PREFETCH_MAX);
+        } else {
+            self.prefetch_window = PREFETCH_MIN;
+        }
+        let want = min_len.max(self.prefetch_window);
         let end = (start + want).min(self.len);
+        self.last_fetch_end = Some(end);
         let range = format!("bytes={}-{}", start, end - 1);
         // Same transient-failure retry story as S3Source. DNS
         // flakes and 5xx bursts recover on a second attempt most

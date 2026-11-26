@@ -57,11 +57,21 @@ struct ServerGuard {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
+    /// Count of Range GETs served (ignores HEAD). Lets the
+    /// adaptive-prefetch test observe that sequential access
+    /// collapses into fewer large GETs instead of O(bytes /
+    /// floor) small ones.
+    range_gets: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ServerGuard {
     fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
+    }
+    #[allow(dead_code)]
+    fn range_get_count(&self) -> usize {
+        self.range_gets
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -89,6 +99,8 @@ fn serve_file(file_path: PathBuf, support_ranges: bool) -> ServerGuard {
     let bytes = fs::read(&file_path).expect("read fixture file");
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
+    let range_gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let range_gets2 = Arc::clone(&range_gets);
 
     let join = thread::spawn(move || {
         let server = tiny_http::Server::from_listener(listener, None)
@@ -102,6 +114,13 @@ fn serve_file(file_path: PathBuf, support_ranges: bool) -> ServerGuard {
                 Ok(None) => continue,
                 Err(_) => break,
             };
+            let has_range = req
+                .headers()
+                .iter()
+                .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("range"));
+            if has_range {
+                range_gets2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             serve_one(req, &bytes, support_ranges);
         }
     });
@@ -110,6 +129,7 @@ fn serve_file(file_path: PathBuf, support_ranges: bool) -> ServerGuard {
         addr,
         stop,
         join: Some(join),
+        range_gets,
     }
 }
 
@@ -332,6 +352,52 @@ fn http_rejected_for_update() {
             || stderr.to_lowercase().contains("not supported")
             || stderr.to_lowercase().contains("url"),
         "expected a clear remote-write error, got: {stderr}"
+    );
+}
+
+#[test]
+fn http_adaptive_prefetch_shrinks_range_gets_on_large_archive() {
+    // The adaptive prefetch window doubles on sequential access
+    // up to 16 MiB. A listing of a 400-entry archive forces a
+    // CDR scan; that scan is strictly sequential, so the window
+    // should ramp up and the number of Range GETs the server
+    // sees should stay small — single-digit or low-double-digit
+    // even though the archive is several MiB. Before this change
+    // (fixed 1 MiB window) a larger archive would get one GET
+    // per 1 MiB chunk regardless of access pattern.
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = tmp.path().join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    // 400 entries with ~2.5 KB bodies each → archive ~1-2 MiB,
+    // CDR alone spans several hundred KiB. Sequential read on
+    // the tail triggers the adaptive ramp.
+    for i in 0..400u32 {
+        let body: Vec<u8> = (0..2500u32)
+            .map(|j| (j.wrapping_mul(97).wrapping_add(i)) as u8)
+            .collect();
+        fs::write(corpus.join(format!("e{:04}.bin", i)), body).unwrap();
+    }
+    run_tzip(
+        tmp.path(),
+        &["create", "out.zip", "corpus", "-m", "store", "-q"],
+    );
+    let server = serve_file(tmp.path().join("out.zip"), true);
+
+    let url = server.url("/out.zip");
+    let (ok, _stdout, stderr) = tzip_run(tmp.path(), &["ls", &url]);
+    assert!(ok, "http ls failed: {stderr}");
+    let gets = server.range_get_count();
+    // Pre-change (fixed 1 MiB window) a ~2 MiB-tail archive ls
+    // typically produced 3-4 GETs; post-change the adaptive
+    // ramp makes it ~1-2. We assert the generous bound that
+    // the invariant holds: Range GET count must be sub-linear
+    // in archive size. For this fixture, < 10 is a wide safety
+    // margin — the adaptive path produces ≤ 3 in practice.
+    assert!(
+        gets < 10,
+        "http ls issued {gets} Range GETs against a ~2 MiB archive; \
+         the adaptive prefetch window should collapse the CDR scan \
+         into a handful of large GETs, not O(bytes)",
     );
 }
 

@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
 
-use tzip::{aggregate, bench, cli, diff, find, grep, hash, jq, mount, pipeline, query, reader, update, update_s3};
+use tzip::{aggregate, bench, cli, diff, find, grep, hash, jq, mount, pipeline, query, reader, tail, update, update_s3};
 
 fn main() -> Result<()> {
     // Parse via ArgMatches so UserSetFlags::from_matches can distinguish
@@ -46,6 +46,7 @@ fn main() -> Result<()> {
         cli::Cmd::Grep(args) => grep::run(args.into_options()?),
         cli::Cmd::Mount(args) => mount::dispatch(args.into_action()?),
         cli::Cmd::Find(args) => find::run(args.into_options()?),
+        cli::Cmd::Tail(args) => tail::run(args.into_options()?),
         cli::Cmd::Bench(args) => bench::run(args.into_options()?),
         cli::Cmd::Diff(args) => {
             // `tzip diff` carries a shell exit status (0 = identical,

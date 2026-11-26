@@ -254,6 +254,9 @@ path = "tests/cmd/diff.rs"
 name = "find"
 path = "tests/cmd/find.rs"
 [[test]]
+name = "tail"
+path = "tests/cmd/tail.rs"
+[[test]]
 name = "grep"
 path = "tests/cmd/grep.rs"
 [[test]]

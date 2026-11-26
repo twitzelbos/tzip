@@ -80,6 +80,8 @@ pub fn run(opts: GrepOptions) -> Result<()> {
     let opts = Arc::new(opts);
     let skip = Arc::new(skip);
 
+    let report = crate::report::RunReport::new();
+
     outer.install(|| -> Result<()> {
         use rayon::prelude::*;
         archives
@@ -93,10 +95,17 @@ pub fn run(opts: GrepOptions) -> Result<()> {
                     cp_writer.clone(),
                     Arc::clone(&shared_out),
                     cache.clone(),
+                    report.clone(),
                 )
             })
     })?;
 
+    if crate::report::finalize(&report, "grep", opts.strict, opts.json) {
+        bail!(
+            "tzip grep: --strict mode and {} entries were skipped",
+            report.skipped_count()
+        );
+    }
     Ok(())
 }
 
@@ -110,6 +119,7 @@ fn process_archive(
     cp_writer: Option<Arc<Mutex<File>>>,
     out: Arc<Mutex<Box<dyn Write + Send>>>,
     cache: Option<Arc<crate::indexcache::IndexCache>>,
+    report: crate::report::RunReport,
 ) -> Result<()> {
     // Phase 1: parse CDR, filter entries, populate lfh_total_size.
     let mut driver = open_archive_with_cache(url, cache)
@@ -284,6 +294,7 @@ fn process_archive(
             let cp_writer = cp_writer.clone();
             let out = Arc::clone(&out);
             let url = url.to_string();
+            let report = report.clone();
             let worker_hint = worker_hint.clone();
             let handle = scope.spawn(move || -> Result<()> {
                 let mut source = crate::reader::open_source_for_with_hint(&url, worker_hint)
@@ -295,15 +306,20 @@ fn process_archive(
                     // not kill the whole grep — matches
                     // already emitted are useful, and a
                     // lone network flake shouldn't erase them.
-                    // Log to stderr, keep scanning the rest.
-                    // The worker itself still returns Ok;
-                    // only `open_source_for_with_hint` above
-                    // (which is a one-shot at worker start)
-                    // can bail the whole thread.
+                    // Log to stderr AND record in the shared
+                    // RunReport so `--strict` / `--json` can
+                    // surface the incomplete result. The
+                    // worker itself still returns Ok; only
+                    // `open_source_for_with_hint` above (which
+                    // is a one-shot at worker start) can bail
+                    // the whole thread.
                     if let Err(e) =
                         scan_entry(&url, &mut *source, &re, &regex, &opts, cp_writer.as_ref(), &out)
                     {
                         eprintln!("tzip grep: {} — {:#}", re.name, e);
+                        report.record_skip(format!("{}:{}", url, re.name), format!("{:#}", e));
+                    } else {
+                        report.incr_ok();
                     }
                 }
                 Ok(())

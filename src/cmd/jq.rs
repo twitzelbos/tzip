@@ -53,6 +53,7 @@ pub struct JqOpts {
     pub password: Option<String>,
     pub inner_jobs: usize,
     pub cache: Option<crate::indexcache::IndexCacheSpec>,
+    pub strict: bool,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -80,6 +81,7 @@ pub fn run(opts: JqOpts) -> Result<()> {
     };
 
     let total_scanned = AtomicUsize::new(0);
+    let report = crate::report::RunReport::new();
 
     for spec in &archives {
         let mut arch = open_archive_with_cache(spec, cache_arc.clone())
@@ -122,6 +124,7 @@ pub fn run(opts: JqOpts) -> Result<()> {
             compiled.clone(),
             &opts,
             &total_scanned,
+            &report,
         )?;
     }
 
@@ -130,6 +133,12 @@ pub fn run(opts: JqOpts) -> Result<()> {
             "tzip jq: scanned {} archive(s), {} matching entries",
             archives.len(),
             total_scanned.load(Ordering::Relaxed),
+        );
+    }
+    if crate::report::finalize(&report, "jq", opts.strict, false) {
+        bail!(
+            "tzip jq: --strict mode and {} entries were skipped",
+            report.skipped_count()
         );
     }
     Ok(())
@@ -147,6 +156,7 @@ fn run_archive_parallel(
     compiled: Arc<CompiledFilter>,
     opts: &JqOpts,
     total_scanned: &AtomicUsize,
+    report: &crate::report::RunReport,
 ) -> Result<()> {
     let parallel = opts.inner_jobs.max(1).min(entries.len());
 
@@ -173,6 +183,7 @@ fn run_archive_parallel(
             let verbose = opts.verbose;
             let out = &out;
             let total_scanned = total_scanned;
+            let report = report.clone();
             let worker_hint = worker_hint.clone();
             let handle = scope.spawn(move || -> Result<()> {
                 let mut source = open_source_for_with_hint(&spec_str, worker_hint)
@@ -188,6 +199,10 @@ fn run_archive_parallel(
                         if verbose {
                             eprintln!("tzip jq: skip {} ({}): {:#}", spec_str, re.name, e);
                         }
+                        report.record_skip(
+                            format!("{}:{}", spec_str, re.name),
+                            format!("{:#}", e),
+                        );
                         continue;
                     }
                     let input_val = match read::parse_single(&body) {
@@ -199,6 +214,10 @@ fn run_archive_parallel(
                                     spec_str, re.name, e
                                 );
                             }
+                            report.record_skip(
+                                format!("{}:{}", spec_str, re.name),
+                                format!("JSON parse failed: {:?}", e),
+                            );
                             continue;
                         }
                     };
@@ -236,6 +255,7 @@ fn run_archive_parallel(
                         drop(guard);
                     }
                     total_scanned.fetch_add(1, Ordering::Relaxed);
+                    report.incr_ok();
                 }
                 Ok(())
             });

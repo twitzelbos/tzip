@@ -828,6 +828,18 @@ impl Archive {
         names
     }
 
+    /// Parse the `.tzip/manifest.v1` sentinel if present. Returns
+    /// `None` on archives that don't carry one (older tzip output,
+    /// archives produced without any index flag, or stale
+    /// manifests whose payload fails to decode — a stale manifest
+    /// never masks a real sentinel because readers keep falling
+    /// back on CDR-walk discovery). Cheap to call: decodes on
+    /// demand, no caching inside `Archive`.
+    pub fn manifest(&mut self) -> Option<crate::manifest::Manifest> {
+        let body = self.read_index_body(crate::manifest::MANIFEST_ENTRY_NAME)?;
+        crate::manifest::Manifest::decode(&body).ok()
+    }
+
     /// Return a merged `Facet` for `field`, summing counts across
     /// every segment this archive carries. `None` if no segment has
     /// the field. Appendable-safe: `tzip u` can write additional

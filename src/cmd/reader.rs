@@ -52,7 +52,7 @@ pub struct ReaderOptions {
 /// Dispatches on scheme: `s3://…` → `S3Source`, `http(s)://…` → `HttpSource`,
 /// anything else → local file path. Called by every reader subcommand so
 /// local and remote behave identically downstream of this seam.
-pub(crate) fn open_archive(spec: &str) -> Result<Archive> {
+pub(crate) fn open_archive(spec: &str) -> Result<OpenedArchive> {
     open_archive_with_cache(spec, None)
 }
 
@@ -80,7 +80,7 @@ pub(crate) fn open_cache_if_configured(
 pub(crate) fn open_archive_with_cache(
     spec: &str,
     cache: Option<std::sync::Arc<crate::indexcache::IndexCache>>,
-) -> Result<Archive> {
+) -> Result<OpenedArchive> {
     // Local paths go through `Archive::open` so multi-disk spanned
     // archives get stitched across their sibling `.z01`..`.zip` files.
     // Remote schemes (http/https/s3) don't have sibling disks — they
@@ -99,11 +99,8 @@ pub(crate) fn open_archive_with_cache(
             .unwrap_or(0);
         let fingerprint = src.fingerprint().map(|s| s.to_string());
         let binding = cache_binding_for_remote(spec, fingerprint.as_deref(), len, cache);
-        let mut arch = Archive::open_source_with_cache(Box::new(src), binding)?;
-        if let Some(fp) = fingerprint {
-            arch.attach_remote_fingerprint(fp);
-        }
-        Ok(arch)
+        let arch = Archive::open_source_with_cache(Box::new(src), binding)?;
+        Ok(OpenedArchive { arch, remote_fingerprint: fingerprint })
     } else if spec.starts_with("http://") || spec.starts_with("https://") {
         let mut src = crate::sources::http::HttpSource::open(spec)
             .with_context(|| format!("open HTTP source {}", spec))?;
@@ -114,13 +111,35 @@ pub(crate) fn open_archive_with_cache(
         let url = src.url().to_string();
         let fingerprint = src.fingerprint().map(|s| s.to_string());
         let binding = cache_binding_for_remote(&url, fingerprint.as_deref(), len, cache);
-        let mut arch = Archive::open_source_with_cache(Box::new(src), binding)?;
-        if let Some(fp) = fingerprint {
-            arch.attach_remote_fingerprint(fp);
-        }
-        Ok(arch)
+        let arch = Archive::open_source_with_cache(Box::new(src), binding)?;
+        Ok(OpenedArchive { arch, remote_fingerprint: fingerprint })
     } else {
-        Archive::open(Path::new(spec))
+        let arch = Archive::open(Path::new(spec))?;
+        Ok(OpenedArchive { arch, remote_fingerprint: None })
+    }
+}
+
+/// `Archive` plus the ETag / Last-Modified the source captured
+/// at open time. Kept together here (rather than on `Archive`)
+/// because the fingerprint is purely a reader-module concern:
+/// `hint_from_archive` reads it; nothing in `src/zip/zipreader.rs`
+/// cares. Deref<Target = Archive> so every existing call site
+/// that took an `Archive` keeps working through auto-deref.
+pub(crate) struct OpenedArchive {
+    arch: Archive,
+    pub(crate) remote_fingerprint: Option<String>,
+}
+
+impl std::ops::Deref for OpenedArchive {
+    type Target = Archive;
+    fn deref(&self) -> &Archive {
+        &self.arch
+    }
+}
+
+impl std::ops::DerefMut for OpenedArchive {
+    fn deref_mut(&mut self) -> &mut Archive {
+        &mut self.arch
     }
 }
 
@@ -189,13 +208,16 @@ pub(crate) enum SourceHint {
     },
 }
 
-/// Build a hint from an already-opened `Archive`. Workers spawned
-/// after this point reuse the probe the main thread already did.
-pub(crate) fn hint_from_archive(spec: &str, arch: &Archive) -> Option<SourceHint> {
+/// Build a hint from an already-opened `OpenedArchive`. Workers
+/// spawned after this point reuse the probe the main thread
+/// already did (both the length and, for remote sources, the
+/// snapshot ETag that pins per-worker Range GETs via
+/// `If-Match` / `If-Unmodified-Since`).
+pub(crate) fn hint_from_archive(spec: &str, arch: &OpenedArchive) -> Option<SourceHint> {
     if spec.starts_with("http://") || spec.starts_with("https://") || spec.starts_with("s3://") {
         Some(SourceHint::RemoteKnownLen {
             len: arch.file_size(),
-            fingerprint: arch.remote_fingerprint().map(|s| s.to_string()),
+            fingerprint: arch.remote_fingerprint.clone(),
         })
     } else if arch.disk_count() >= 2 {
         Some(SourceHint::LocalMultiDisk(arch.disk_count()))

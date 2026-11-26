@@ -494,5 +494,58 @@ if ! grep -q "via tzip u" <<< "$APPENDED_BODY"; then
     exit 1
 fi
 
+# ── Appendix: CDR-cache cold vs warm (PR #85 + #87) ──────────
+banner "Appendix  CDR cache cold vs warm — the whole point of --cache-dir"
+
+# A fresh cache dir inside the per-run scratch so repeated
+# invocations of the script don't leak timing from each other.
+DEMO_CACHE="$SCRATCH/demo-cache"
+rm -rf "$DEMO_CACHE"
+
+# Small helper — `date` on macOS doesn't do nanos, `python3 -c
+# 'time.time()'` is portable and fast enough for the three
+# measurements we take here.
+measure() {
+    local start end
+    start=$(python3 -c 'import time; print(time.time())')
+    "$@" > /dev/null 2>&1
+    end=$(python3 -c 'import time; print(time.time())')
+    python3 -c "print(f'{($end) - ($start):.3f}')"
+}
+
+echo
+echo "1) cold tzip ls (no cache — full CDR refetch each time)"
+COLD_LS=$(measure "$TZIP" ls "$S3_URL")
+echo "   elapsed: ${COLD_LS}s"
+
+echo
+echo "2) tzip ls --cache-dir (first call populates the CDR cache)"
+WARM_LS_1=$(measure "$TZIP" ls --cache-dir "$DEMO_CACHE" "$S3_URL")
+echo "   elapsed: ${WARM_LS_1}s"
+
+echo
+echo "3) tzip ls --cache-dir (second call — CDR served from local disk)"
+WARM_LS_2=$(measure "$TZIP" ls --cache-dir "$DEMO_CACHE" "$S3_URL")
+echo "   elapsed: ${WARM_LS_2}s"
+
+# Hero scenario: single-entry cat. On a 100 K-entry archive
+# the CDR fetch dominates the 1 KB payload cost; cached run
+# should cost ~just the LFH + body.
+echo
+echo "4) cold tzip cat one entry (no cache)"
+COLD_CAT=$(measure "$TZIP" cat "$S3_URL" "$MARKER_ENTRY" -p "$PASSWORD")
+echo "   elapsed: ${COLD_CAT}s"
+
+echo
+echo "5) tzip cat --cache-dir, same entry (cache hit from the ls above)"
+WARM_CAT=$(measure "$TZIP" cat --cache-dir "$DEMO_CACHE" "$S3_URL" "$MARKER_ENTRY" -p "$PASSWORD")
+echo "   elapsed: ${WARM_CAT}s"
+
+echo
+RATIO_LS=$(python3 -c "print(f'{$COLD_LS / $WARM_LS_2:.1f}×')")
+RATIO_CAT=$(python3 -c "print(f'{$COLD_CAT / $WARM_CAT:.1f}×')")
+printf '\033[1m  tzip ls   speedup: %s (%ss → %ss)\033[0m\n'  "$RATIO_LS"  "$COLD_LS"  "$WARM_LS_2"
+printf '\033[1m  tzip cat  speedup: %s (%ss → %ss)\033[0m\n'  "$RATIO_CAT" "$COLD_CAT" "$WARM_CAT"
+
 echo
 printf '\033[1;32m═══ PASS — every operation round-tripped against %s ═══\033[0m\n' "$S3_URL"

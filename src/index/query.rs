@@ -25,21 +25,47 @@
 //! row, suitable for piping into jq. Pass `--csv` for CSV with a
 //! header row.
 //!
-//! ## Known limit (ChatGPT review #4): whole-sidecar download
+//! ## Row-group pruning (PR #72 + follow-ups)
 //!
-//! Each shard's full `.tzip/columnar.v1.parquet` body is extracted
-//! to a temp file before DuckDB starts, even when the query's
-//! predicate would only touch a few row groups. For a 500 MB
-//! sidecar behind `SELECT * ... WHERE day = '2026-11-24'`, that's
-//! ~495 MB of avoidable network I/O on the first run (the Phase 6
-//! index cache makes subsequent runs free). A proper fix is
-//! sketched in `docs/ROADMAP.md`:
-//!   1. Range-read the Parquet footer (last ~1 MB) only.
-//!   2. Parse row-group statistics.
-//!   3. Fetch only the row groups whose min/max intersects the
-//!      predicate.
-//! This needs a Parquet-aware range reader on top of the
-//! `sources::` backends — nontrivial — and is tracked separately.
+//! Before invoking DuckDB on a remote archive, we try to range-
+//! read only the Parquet row groups whose min/max stats could
+//! match the SQL's WHERE predicates. The pipeline is:
+//!
+//!   1. Parse the SQL into a flat `col OP constant` predicate
+//!      list via `parquet_prune::extract_conjunctive_predicates`.
+//!      Anything the mini-parser can't handle (joins, `OR`,
+//!      subqueries, functions on columns) → `None` → full-body
+//!      fallback.
+//!   2. Range-read the Parquet footer (tens of KB) off each shard
+//!      sidecar via the regular `sources::` Range-GET stack.
+//!   3. Compare each row group's column statistics against the
+//!      predicates. Prove-exclusion drops the row group;
+//!      ambiguous or stats-missing keeps it. Pruning is a pure
+//!      speed optimisation — DuckDB still runs the full WHERE on
+//!      whatever we hand it, so a mistakenly kept row group only
+//!      wastes CPU, never corrupts results.
+//!   4. Compose a Parquet with only the surviving row groups to
+//!      the temp file DuckDB reads.
+//!
+//! ### Why not just delegate everything to DuckDB?
+//!
+//! The predicate extractor and row-group pruner are *not*
+//! reimplementing a query optimiser — they're a **client-side
+//! Parquet Range-fetch planner**. We have to decide which bytes
+//! to pull BEFORE DuckDB runs, because:
+//!
+//! - DuckDB's `httpfs` extension can pushdown predicates into a
+//!   Parquet file *at a URL*, but our Parquet sidecar is a byte
+//!   range inside a ZIP, not a file at a URL.
+//! - By the time we've handed DuckDB a local temp file, the
+//!   network cost is sunk — DuckDB's own pruning can only save
+//!   CPU, not bytes.
+//!
+//! So the client-side pruner saves network I/O that no downstream
+//! engine can recover, and DuckDB retains ownership of everything
+//! above that: schema binding, joins across shards (via
+//! `read_parquet([...])`), aggregates, percentiles, sort/limit.
+//! The division of labour is deliberate.
 
 use anyhow::{bail, Context, Result};
 use std::io::Write;

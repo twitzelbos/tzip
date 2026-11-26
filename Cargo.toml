@@ -224,6 +224,9 @@ path = "tests/index/shards.rs"
 [[test]]
 name = "termidx"
 path = "tests/index/termidx.rs"
+[[test]]
+name = "equivalence"
+path = "tests/index/equivalence.rs"
 
 [[test]]
 name = "extract_parallel"

@@ -75,9 +75,18 @@ ENTRIES="${ENTRIES:-100000}"
 KEY="${KEY:-demo-ppmd-aes-${ENTRIES}.zip}"
 # A FIXED marker string so a cached corpus (see CACHE_DIR
 # below) carries it reproducibly across runs. Grep asserts
-# this exact string, so changing it requires invalidating the
-# cache or setting FORCE_REBUILD=1.
-MARKER="${MARKER:-UNIQUE-MARKER-FOR-TZIP-GREP-TEST}"
+# this exact string, so changing it requires invalidating
+# the cache or setting FORCE_REBUILD=1.
+#
+# Every token here is chosen NOT to appear in the 4 KiB
+# corpus vocab (`the of and to a in that is was for on with
+# as by this it be …` — see the Python generator below). The
+# term index tokenises on non-alphanumerics, so each of
+# `xyzzy`, `qorg`, `flarg`, `plugh` lands as its own posting
+# list with exactly one entry. `tzip grep <marker>` can
+# then narrow candidates to 1 instead of ~100 000, cutting
+# step 9's wall-clock from minutes to seconds.
+MARKER="${MARKER:-TZIP-MARKER-XYZZY-QORG-FLARG-PLUGH}"
 # Per-entry raw size target. The original ~130-byte entries
 # left PPMd level 9 almost no context to model, so the
 # archive crushed only ~3× (~40 MB from 13 MB raw). Bumping
@@ -93,7 +102,7 @@ ENTRY_BYTES="${ENTRY_BYTES:-4096}"
 # the count or the entry shape naturally invalidates. Bumped
 # to `v2` with the 4 KiB-per-entry change; everyone's old
 # `tzip-s3-demo-cache-100000` dir can be deleted.
-CACHE_VERSION="${CACHE_VERSION:-v2-4k}"
+CACHE_VERSION="${CACHE_VERSION:-v3-rare-marker}"
 CACHE_DIR="${CACHE_DIR:-${TMPDIR:-/tmp}/tzip-s3-demo-cache-${CACHE_VERSION}-${ENTRIES}}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 

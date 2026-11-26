@@ -169,6 +169,30 @@ impl IndexCache {
         fs::create_dir_all(&root).with_context(|| {
             format!("create tzip index cache at {}", root.display())
         })?;
+        // ZIP entry names are plaintext in the CDR (even on
+        // password-protected archives), so the CDR + name-index
+        // blobs we store here can contain filenames the user
+        // considers private. Lock out other local OS users on
+        // multi-tenant hosts by narrowing the dir perms to
+        // `0700`. Files beneath it are already written via
+        // `tempfile::NamedTempFile`, which uses `O_EXCL` +
+        // 0600 by default on Unix. Explicit security analysis
+        // in `docs/scenarios/s3-huge-archive-single-entry.md`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Walk up from `root` through every segment we may
+            // have created (dir, dir/LAYOUT_VERSION). Explicit
+            // chmod — don't rely on umask, which is often `022`.
+            for anc in [&root, root.parent().unwrap_or(&root)] {
+                if anc.exists() {
+                    let _ = fs::set_permissions(
+                        anc,
+                        fs::Permissions::from_mode(0o700),
+                    );
+                }
+            }
+        }
         let ram = ram_max_bytes.map(|cap| Mutex::new(RamTier::new(cap)));
         Ok(Self {
             root,
@@ -227,6 +251,16 @@ impl IndexCache {
         fs::create_dir_all(&archive_dir).with_context(|| {
             format!("create cache archive dir {}", archive_dir.display())
         })?;
+        // Same 0700 narrowing as the cache root — per-archive
+        // dirs hold filenames that may be private.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(
+                &archive_dir,
+                fs::Permissions::from_mode(0o700),
+            );
+        }
 
         // Write the body and _meta atomically.
         atomic_write(&self.entry_path(id, entry_name), bytes)

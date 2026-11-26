@@ -55,6 +55,28 @@ few KB of structural overhead, regardless of how large the archive is**.
 At 100 entries the transfer is tens of KB. At 10 million entries it's
 most of a gigabyte.
 
+### Reproduce the numbers on your own bucket
+
+`scripts/s3-full-demo.sh` ends with a measured cold-vs-cached
+comparison against a 100 K-entry PPMd-max + AES-256 archive the
+same script builds and uploads:
+
+```
+Appendix  CDR cache cold vs warm — the whole point of --cache-dir
+1) cold tzip ls (no cache — full CDR refetch each time)
+2) tzip ls --cache-dir (first call populates the CDR cache)
+3) tzip ls --cache-dir (second call — CDR served from local disk)
+4) cold tzip cat one entry (no cache)
+5) tzip cat --cache-dir, same entry (cache hit from the ls above)
+   tzip ls   speedup: X× (Y s → Z s)
+   tzip cat  speedup: X× (Y s → Z s)
+```
+
+The speedups track the entry-count scale in the table above —
+bigger archive → bigger CDR → bigger win. Run the script
+against your own workload to see the exact numbers for your
+network + bucket region.
+
 ---
 
 ## Where the structure tzip already ships *does* help

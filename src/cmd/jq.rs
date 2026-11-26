@@ -173,6 +173,7 @@ fn run_archive_parallel(
             let verbose = opts.verbose;
             let out = &out;
             let total_scanned = total_scanned;
+            let worker_hint = worker_hint.clone();
             let handle = scope.spawn(move || -> Result<()> {
                 let mut source = open_source_for_with_hint(&spec_str, worker_hint)
                     .with_context(|| format!("open worker source for {}", spec_str))?;

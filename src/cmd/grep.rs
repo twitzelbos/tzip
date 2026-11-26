@@ -284,6 +284,7 @@ fn process_archive(
             let cp_writer = cp_writer.clone();
             let out = Arc::clone(&out);
             let url = url.to_string();
+            let worker_hint = worker_hint.clone();
             let handle = scope.spawn(move || -> Result<()> {
                 let mut source = crate::reader::open_source_for_with_hint(&url, worker_hint)
                     .with_context(|| format!("open inner source for {}", url))?;

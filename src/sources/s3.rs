@@ -53,9 +53,20 @@ pub struct S3Source {
     /// ETag of the S3 object captured at open time. S3 always emits
     /// one; absent only if the upstream (MinIO / LocalStack) stripped
     /// it. Used as the index cache's content-change fingerprint
-    /// (Phase 6).
+    /// (Phase 6) **and** as the `If-Match` header on every subsequent
+    /// Range GET so a mid-run replacement of the object surfaces as
+    /// a HTTP 412 instead of silently mixing bytes from two
+    /// versions.
     fingerprint: Option<String>,
 }
+
+/// Returned by `fetch` when the server rejected a Range GET with
+/// HTTP 412 Precondition Failed — the archive we opened has been
+/// replaced since open time. Surfaced to callers so grep /
+/// aggregate / query / jq can bail with a clear message instead
+/// of retrying or silently serving bytes from two versions of the
+/// object.
+pub const SNAPSHOT_CHANGED_MARKER: &str = "tzip: remote snapshot changed mid-run";
 
 pub(crate) struct Credentials {
     pub(crate) access_key: String,
@@ -120,6 +131,20 @@ impl S3Source {
     /// wasted signed-GET round-trip. Credential + endpoint resolution
     /// still runs per worker (cheap, and credentials can rotate).
     pub fn open_with_len(spec: &str, len: u64) -> Result<Self> {
+        Self::open_with_len_and_if_match(spec, len, None)
+    }
+
+    /// Same as `open_with_len`, but also pins the worker to the
+    /// ETag the main-thread open captured. Every Range GET sends
+    /// `If-Match: <etag>`; a mid-run replace of the object
+    /// surfaces as HTTP 412 on the first fetch, so a grep /
+    /// extract run reading from multiple workers can't silently
+    /// mix bytes from two versions.
+    pub fn open_with_len_and_if_match(
+        spec: &str,
+        len: u64,
+        if_match: Option<String>,
+    ) -> Result<Self> {
         let (bucket, key) = split_bucket_key(spec)?;
         let creds = resolve_credentials().context("resolve AWS credentials")?;
         let region = resolve_region();
@@ -141,7 +166,7 @@ impl S3Source {
             pos: 0,
             cache_start: 0,
             cache: Vec::new(),
-            fingerprint: None,
+            fingerprint: if_match,
         })
     }
 
@@ -221,9 +246,18 @@ impl S3Source {
             // Re-sign each attempt — the x-amz-date header must
             // be within SigV4's 15-minute clock skew window,
             // and a long retry chain could outrun it.
-            let signed = match self
-                .sign(&[ExtraHeader { name: "Range", value: &range }])
-            {
+            //
+            // If we captured an ETag at open time, send it as
+            // `If-Match` on every GET. A mid-run object
+            // replacement returns 412 and we bail with a
+            // snapshot-changed error — far better than silently
+            // stitching two versions together.
+            let mut extras: Vec<ExtraHeader> =
+                vec![ExtraHeader { name: "Range", value: &range }];
+            if let Some(ref etag) = self.fingerprint {
+                extras.push(ExtraHeader { name: "If-Match", value: etag });
+            }
+            let signed = match self.sign(&extras) {
                 Ok(s) => s,
                 Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
             };
@@ -257,6 +291,20 @@ impl S3Source {
                     self.cache_start = start;
                     self.cache = buf;
                     return Ok(());
+                }
+                Err(ureq::Error::Status(412, _)) => {
+                    // Precondition failed → the object we
+                    // opened has been replaced. Not retryable;
+                    // surface a clear error up through Read.
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "{} (ETag {} no longer matches on {})",
+                            SNAPSHOT_CHANGED_MARKER,
+                            self.fingerprint.as_deref().unwrap_or("?"),
+                            self.object_url(),
+                        ),
+                    ));
                 }
                 Err(e) => {
                     last_err = Some(io::Error::new(io::ErrorKind::Other, e));

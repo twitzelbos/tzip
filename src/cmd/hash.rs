@@ -160,6 +160,7 @@ pub fn run(args: HashArgs) -> Result<()> {
             let rx = rx.clone();
             let spec = spec.clone();
             let password = password.clone();
+            let worker_hint = worker_hint.clone();
             let out = &out;
             let hashed = &hashed;
             let handle = scope.spawn(move || -> Result<()> {

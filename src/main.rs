@@ -9,6 +9,20 @@ use clap::{CommandFactory, FromArgMatches};
 use tzip::{aggregate, bench, cli, diff, find, grep, hash, jq, mount, pipeline, query, reader, tail, update, update_s3};
 
 fn main() -> Result<()> {
+    // Restore Unix's default SIGPIPE behaviour: when stdout
+    // closes mid-stream (e.g. `tzip ls … | head -5`), be
+    // killed quietly by SIGPIPE rather than let the Rust
+    // runtime's default SIG_IGN turn the write into an
+    // `ErrorKind::BrokenPipe` that bubbles up as
+    // `Error: Broken pipe (os error 32)` on stderr + exit 1.
+    // The shell convention is "silent clean exit"; every well-
+    // behaved CLI (grep, ls, cat) honours it. Must run before
+    // any stdout write.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     // Parse via ArgMatches so UserSetFlags::from_matches can distinguish
     // CLI-supplied flags from clap defaults — needed by the auto-tune step.
     let matches = cli::Cli::command().get_matches();

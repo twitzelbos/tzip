@@ -110,6 +110,9 @@ pub fn run(opts: QueryOpts) -> Result<()> {
         let mut archive =
             crate::reader::open_archive_with_cache(spec, cache_arc.clone())
                 .with_context(|| format!("open archive {}", spec))?;
+        if let Some(pw) = opts.password.as_deref() {
+            archive.attach_password(pw.to_string());
+        }
         let ranges = archive.columnar_segment_ranges();
         if ranges.is_empty() {
             bail!(

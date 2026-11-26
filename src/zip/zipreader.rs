@@ -1024,35 +1024,78 @@ pub fn probe_total_disks<S: Read + Seek + ?Sized>(file: &mut S, file_size: u64) 
 }
 
 /// Parse CDR entries directly from an in-memory archive tail
-/// (bytes starting at `cd_offset` — the CDR, then the EOCD, plus any
-/// optional ZIP64 trailer). Used by append-mode update's undo
-/// snapshot, which has the tail in hand already and shouldn't have
-/// to materialise a scratch file on disk, open it, re-scan the EOCD,
-/// and re-parse the CDR just to reconstruct the entry list.
+/// (bytes starting at `cd_offset` — the CDR, then the optional
+/// ZIP64 EOCD + ZIP64 locator, then the EOCD). Used by append-
+/// mode update's undo snapshot: the caller already has the tail
+/// in hand, and shouldn't have to re-materialise a scratch file
+/// on disk to reconstruct the entry list.
 ///
-/// Fails on multi-disk or ZIP64 tails — those paths flow through
-/// the rebuild branch of update, not append.
-pub fn parse_entries_from_tail(tail: &[u8]) -> Result<Vec<ReadEntry>> {
+/// Handles both classic and ZIP64 tails. `cd_offset` is the
+/// archive-absolute offset the tail starts at — needed to map
+/// the ZIP64 locator's absolute `z64_off` back into the tail.
+///
+/// Multi-disk tails still fall through to the rebuild branch of
+/// update (those are vanishingly rare in practice and the
+/// append path would also have to teach `ZipWriter` about
+/// multi-disk start offsets).
+pub fn parse_entries_from_tail(tail: &[u8], cd_offset: u64) -> Result<Vec<ReadEntry>> {
     use std::io::Cursor;
     let tail_len = tail.len() as u64;
     if tail_len < EOCD_MIN_SIZE {
         bail!("archive tail too small to be a ZIP ({} bytes)", tail_len);
     }
     let mut cur = Cursor::new(tail);
-    let (_eocd_pos, eocd) = find_eocd(&mut cur, tail_len).context("find EOCD in tail")?;
-    if eocd.needs_zip64() {
-        bail!("ZIP64 tail parse not supported via parse_entries_from_tail");
-    }
+    let (eocd_pos, eocd) = find_eocd(&mut cur, tail_len).context("find EOCD in tail")?;
     if eocd.this_disk != 0 || eocd.cd_disk != 0 {
         bail!("multi-disk tail parse not supported via parse_entries_from_tail");
     }
-    // Tail starts at cd_offset in the real archive, so the CDR lives
-    // at [0 .. cd_size] within `tail`.
-    let cd_size = eocd.cd_size as usize;
+    let (entry_count, cd_size): (u64, usize) = if eocd.needs_zip64() {
+        // The EOCD64 locator is the 20 bytes immediately before
+        // the EOCD. Use its absolute `z64_off` to find the
+        // EOCD64 record within the tail — deterministic, no
+        // backward signature scan.
+        if eocd_pos < 20 {
+            bail!("no room for EOCD64 locator before EOCD in tail");
+        }
+        let loc_start = (eocd_pos - 20) as usize;
+        let loc: &[u8] = &tail[loc_start..loc_start + 20];
+        let sig = u32::from_le_bytes([loc[0], loc[1], loc[2], loc[3]]);
+        if sig != SIG_EOCD64_LOC {
+            bail!("bad EOCD64 locator signature in tail: {:#x}", sig);
+        }
+        let z64_abs = u64::from_le_bytes(loc[8..16].try_into().unwrap());
+        if z64_abs < cd_offset {
+            bail!(
+                "EOCD64 at {:#x} precedes cd_offset {:#x}",
+                z64_abs,
+                cd_offset
+            );
+        }
+        let z64_tail_pos = (z64_abs - cd_offset) as usize;
+        if z64_tail_pos + 56 > tail.len() {
+            bail!("EOCD64 header extends past end of tail");
+        }
+        let hdr: &[u8] = &tail[z64_tail_pos..z64_tail_pos + 56];
+        let z64_sig = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        if z64_sig != SIG_EOCD64 {
+            bail!("bad EOCD64 signature in tail: {:#x}", z64_sig);
+        }
+        let entry_count = u64::from_le_bytes(hdr[32..40].try_into().unwrap());
+        let cd_size = u64::from_le_bytes(hdr[40..48].try_into().unwrap());
+        (entry_count, cd_size as usize)
+    } else {
+        (eocd.entry_count as u64, eocd.cd_size as usize)
+    };
+    // Tail starts at cd_offset in the real archive, so the CDR
+    // lives at [0 .. cd_size] within `tail`.
     if cd_size > tail.len() {
-        bail!("tail shorter than declared CDR ({} < {})", tail.len(), cd_size);
+        bail!(
+            "tail shorter than declared CDR ({} < {})",
+            tail.len(),
+            cd_size
+        );
     }
-    parse_central_directory(&tail[..cd_size], eocd.entry_count as u64)
+    parse_central_directory(&tail[..cd_size], entry_count)
 }
 
 // ── EOCD ────────────────────────────────────────────────────────────────────
@@ -1328,4 +1371,107 @@ fn cp437_to_string(bytes: &[u8]) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal ZIP64 archive tail (no CDR entries) and
+    /// verify `parse_entries_from_tail` recognises it instead of
+    /// bailing with "ZIP64 tail parse not supported" (issue #80).
+    ///
+    /// Layout (98 bytes total):
+    ///   [0..56]   EOCD64 (empty CDR)
+    ///   [56..76]  EOCD64 locator — absolute z64_off points at
+    ///             (cd_offset + 0) i.e. the start of the tail
+    ///   [76..98]  EOCD with ZIP64 sentinels
+    #[test]
+    fn parse_entries_from_tail_handles_zip64_empty_cdr() {
+        let cd_offset: u64 = 5_000_000_000; // > 4 GiB, forces ZIP64 in a real archive
+        let z64_abs: u64 = cd_offset; // EOCD64 is right after a 0-byte CDR
+
+        let mut tail: Vec<u8> = Vec::with_capacity(98);
+
+        // EOCD64 record (56 bytes).
+        tail.extend_from_slice(&SIG_EOCD64.to_le_bytes()); //  0..4
+        tail.extend_from_slice(&44u64.to_le_bytes()); //       4..12  size of rec minus leading 12
+        tail.extend_from_slice(&45u16.to_le_bytes()); //      12..14  version made by
+        tail.extend_from_slice(&45u16.to_le_bytes()); //      14..16  version needed
+        tail.extend_from_slice(&0u32.to_le_bytes()); //       16..20  disk number
+        tail.extend_from_slice(&0u32.to_le_bytes()); //       20..24  disk w/ CD
+        tail.extend_from_slice(&0u64.to_le_bytes()); //       24..32  entries on this disk
+        tail.extend_from_slice(&0u64.to_le_bytes()); //       32..40  total entries
+        tail.extend_from_slice(&0u64.to_le_bytes()); //       40..48  cd_size
+        tail.extend_from_slice(&cd_offset.to_le_bytes()); //  48..56  cd_offset
+
+        // EOCD64 locator (20 bytes).
+        tail.extend_from_slice(&SIG_EOCD64_LOC.to_le_bytes()); // 0..4
+        tail.extend_from_slice(&0u32.to_le_bytes()); //           4..8  disk w/ z64
+        tail.extend_from_slice(&z64_abs.to_le_bytes()); //        8..16 absolute z64_off
+        tail.extend_from_slice(&1u32.to_le_bytes()); //          16..20 total disks
+
+        // EOCD (22 bytes, ZIP64 sentinels so needs_zip64() fires).
+        tail.extend_from_slice(&SIG_EOCD.to_le_bytes()); //        0..4
+        tail.extend_from_slice(&0u16.to_le_bytes()); //            4..6  this disk
+        tail.extend_from_slice(&0u16.to_le_bytes()); //            6..8  disk w/ CD
+        tail.extend_from_slice(&0xFFFF_u16.to_le_bytes()); //      8..10 ← ZIP64 sentinel
+        tail.extend_from_slice(&0xFFFF_u16.to_le_bytes()); //     10..12 ← ZIP64 sentinel
+        tail.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes()); // 12..16 ← ZIP64 sentinel
+        tail.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes()); // 16..20 ← ZIP64 sentinel
+        tail.extend_from_slice(&0u16.to_le_bytes()); //           20..22 comment length
+
+        assert_eq!(tail.len(), 98);
+        let got = parse_entries_from_tail(&tail, cd_offset).expect("zip64 tail parsed");
+        assert!(
+            got.is_empty(),
+            "expected 0 entries (empty CDR), got {}",
+            got.len()
+        );
+    }
+
+    /// The post-#80 parser still needs cd_offset to be plausible;
+    /// a locator claiming z64 at an offset below cd_offset must
+    /// error instead of underflowing.
+    #[test]
+    fn parse_entries_from_tail_rejects_zip64_locator_below_cd_offset() {
+        let cd_offset: u64 = 5_000_000_000;
+        let bogus_z64_abs: u64 = cd_offset - 1_000;
+
+        let mut tail = Vec::with_capacity(98);
+        // 56-byte EOCD64 with signature + plausible fields.
+        tail.extend_from_slice(&SIG_EOCD64.to_le_bytes());
+        tail.extend_from_slice(&44u64.to_le_bytes());
+        tail.extend_from_slice(&45u16.to_le_bytes());
+        tail.extend_from_slice(&45u16.to_le_bytes());
+        tail.extend_from_slice(&0u32.to_le_bytes());
+        tail.extend_from_slice(&0u32.to_le_bytes());
+        tail.extend_from_slice(&0u64.to_le_bytes());
+        tail.extend_from_slice(&0u64.to_le_bytes());
+        tail.extend_from_slice(&0u64.to_le_bytes());
+        tail.extend_from_slice(&cd_offset.to_le_bytes());
+        // Locator with a z64_off *before* cd_offset — nonsensical.
+        tail.extend_from_slice(&SIG_EOCD64_LOC.to_le_bytes());
+        tail.extend_from_slice(&0u32.to_le_bytes());
+        tail.extend_from_slice(&bogus_z64_abs.to_le_bytes());
+        tail.extend_from_slice(&1u32.to_le_bytes());
+        // EOCD with ZIP64 sentinels.
+        tail.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        tail.extend_from_slice(&0u16.to_le_bytes());
+        tail.extend_from_slice(&0u16.to_le_bytes());
+        tail.extend_from_slice(&0xFFFF_u16.to_le_bytes());
+        tail.extend_from_slice(&0xFFFF_u16.to_le_bytes());
+        tail.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
+        tail.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
+        tail.extend_from_slice(&0u16.to_le_bytes());
+
+        let err = parse_entries_from_tail(&tail, cd_offset)
+            .expect_err("locator below cd_offset should error");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("precedes cd_offset") || msg.contains("locator"),
+            "unexpected error: {}",
+            msg
+        );
+    }
 }

@@ -59,6 +59,17 @@ pub fn mount(opts: MountOptions) -> Result<()> {
         PathBuf::new()
     };
 
+    // Shed the reader-side `OpenedArchive` wrapper (which carries
+    // the remote fingerprint for per-worker If-Match) and pass the
+    // plain `Archive` into VirtualFs — the mount keeps the single
+    // backing source for its life, so the per-worker pinning path
+    // doesn't apply here.
+    let archive = {
+        // The wrapper is a transparent `Deref`; we have to move the
+        // inner `Archive` out by destructuring, which `OpenedArchive`
+        // exposes via `into_archive()`.
+        archive.into_archive()
+    };
     let vfs = Arc::new(VirtualFs::new_full(
         archive,
         opts.password.clone(),

@@ -130,6 +130,16 @@ pub(crate) struct OpenedArchive {
     pub(crate) remote_fingerprint: Option<String>,
 }
 
+impl OpenedArchive {
+    /// Consume the wrapper, returning the underlying `Archive`.
+    /// Used by sites (mount) that don't need the remote fingerprint
+    /// — the mount keeps one source for its lifetime, so the
+    /// per-worker If-Match pinning doesn't apply.
+    pub(crate) fn into_archive(self) -> Archive {
+        self.arch
+    }
+}
+
 impl std::ops::Deref for OpenedArchive {
     type Target = Archive;
     fn deref(&self) -> &Archive {

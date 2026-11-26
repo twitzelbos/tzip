@@ -31,7 +31,44 @@ pub struct HttpSource {
     /// used by the index cache (Phase 6) as a content-change
     /// fingerprint. `None` when the server emits neither.
     fingerprint: Option<String>,
+    /// Precondition header to send on every Range GET so a mid-run
+    /// replacement of the object surfaces as HTTP 412 instead of
+    /// silently mixing bytes from two versions. Derived from
+    /// `fingerprint` at open time: ETag → `If-Match`, Last-Modified
+    /// → `If-Unmodified-Since` (both honoured by every spec-
+    /// compliant server; `If-Match` wins when an ETag is
+    /// available because it's byte-content, not a timestamp).
+    precondition: Option<Precondition>,
 }
+
+#[derive(Clone, Debug)]
+pub(crate) enum Precondition {
+    IfMatch(String),
+    IfUnmodifiedSince(String),
+}
+
+impl Precondition {
+    fn from_fingerprint(fp: &str) -> Self {
+        if fp.starts_with('"') || fp.starts_with("W/") {
+            Precondition::IfMatch(fp.to_string())
+        } else {
+            // Non-quoted, non-weak-prefixed → Last-Modified style.
+            Precondition::IfUnmodifiedSince(fp.to_string())
+        }
+    }
+    fn header(&self) -> (&'static str, &str) {
+        match self {
+            Precondition::IfMatch(v) => ("If-Match", v.as_str()),
+            Precondition::IfUnmodifiedSince(v) => ("If-Unmodified-Since", v.as_str()),
+        }
+    }
+}
+
+/// Mirrors `S3Source::SNAPSHOT_CHANGED_MARKER`; see there for the
+/// contract. Callers (grep, aggregate, query, jq) scan the error
+/// chain for this substring to decide whether to bail with a
+/// snapshot-changed message instead of a generic read error.
+pub const SNAPSHOT_CHANGED_MARKER: &str = "tzip: remote snapshot changed mid-run";
 
 impl HttpSource {
     /// Open an HTTP(S) archive. Probes the server for `Content-Length` and
@@ -48,6 +85,7 @@ impl HttpSource {
                 url
             );
         }
+        let precondition = fingerprint.as_deref().map(Precondition::from_fingerprint);
         Ok(Self {
             url: url.to_string(),
             agent,
@@ -56,6 +94,7 @@ impl HttpSource {
             cache_start: 0,
             cache: Vec::new(),
             fingerprint,
+            precondition,
         })
     }
 
@@ -67,7 +106,22 @@ impl HttpSource {
     /// fetch comes back 200-not-206 we'll fail there with the same
     /// error the probe path would have.
     pub fn open_with_len(url: &str, len: u64) -> Result<Self> {
+        Self::open_with_len_and_fingerprint(url, len, None)
+    }
+
+    /// Same as `open_with_len`, but also pins the worker to the
+    /// ETag / Last-Modified captured by the main-thread open —
+    /// every Range GET sends `If-Match` (preferred) or
+    /// `If-Unmodified-Since`, so a mid-run replacement surfaces as
+    /// HTTP 412 on the first fetch instead of silently serving
+    /// bytes from two versions of the resource.
+    pub fn open_with_len_and_fingerprint(
+        url: &str,
+        len: u64,
+        fingerprint: Option<String>,
+    ) -> Result<Self> {
         let agent = super::shared_agent();
+        let precondition = fingerprint.as_deref().map(Precondition::from_fingerprint);
         Ok(Self {
             url: url.to_string(),
             agent,
@@ -75,7 +129,8 @@ impl HttpSource {
             pos: 0,
             cache_start: 0,
             cache: Vec::new(),
-            fingerprint: None,
+            fingerprint,
+            precondition,
         })
     }
 
@@ -113,12 +168,12 @@ impl HttpSource {
                     200u64 * (1 << attempt),
                 ));
             }
-            match self
-                .agent
-                .get(&self.url)
-                .set("Range", &range)
-                .call()
-            {
+            let mut req = self.agent.get(&self.url).set("Range", &range);
+            if let Some(ref p) = self.precondition {
+                let (name, value) = p.header();
+                req = req.set(name, value);
+            }
+            match req.call() {
                 Ok(resp) => {
                     if resp.status() != 206 && resp.status() != 200 {
                         if resp.status() >= 500 && attempt < 2 {
@@ -144,6 +199,18 @@ impl HttpSource {
                     self.cache_start = start;
                     self.cache = buf;
                     return Ok(());
+                }
+                Err(ureq::Error::Status(412, _)) => {
+                    // Snapshot replaced mid-run; not retryable.
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "{} (fingerprint {} no longer matches on {})",
+                            SNAPSHOT_CHANGED_MARKER,
+                            self.fingerprint.as_deref().unwrap_or("?"),
+                            self.url,
+                        ),
+                    ));
                 }
                 Err(e) => {
                     last_err = Some(ureq_to_io(e));

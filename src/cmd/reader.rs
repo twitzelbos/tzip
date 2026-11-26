@@ -97,8 +97,13 @@ pub(crate) fn open_archive_with_cache(
             .seek(std::io::SeekFrom::End(0))
             .ok()
             .unwrap_or(0);
-        let binding = cache_binding_for_remote(spec, src.fingerprint(), len, cache);
-        Archive::open_source_with_cache(Box::new(src), binding)
+        let fingerprint = src.fingerprint().map(|s| s.to_string());
+        let binding = cache_binding_for_remote(spec, fingerprint.as_deref(), len, cache);
+        let mut arch = Archive::open_source_with_cache(Box::new(src), binding)?;
+        if let Some(fp) = fingerprint {
+            arch.attach_remote_fingerprint(fp);
+        }
+        Ok(arch)
     } else if spec.starts_with("http://") || spec.starts_with("https://") {
         let mut src = crate::sources::http::HttpSource::open(spec)
             .with_context(|| format!("open HTTP source {}", spec))?;
@@ -106,8 +111,14 @@ pub(crate) fn open_archive_with_cache(
             .seek(std::io::SeekFrom::End(0))
             .ok()
             .unwrap_or(0);
-        let binding = cache_binding_for_remote(src.url(), src.fingerprint(), len, cache);
-        Archive::open_source_with_cache(Box::new(src), binding)
+        let url = src.url().to_string();
+        let fingerprint = src.fingerprint().map(|s| s.to_string());
+        let binding = cache_binding_for_remote(&url, fingerprint.as_deref(), len, cache);
+        let mut arch = Archive::open_source_with_cache(Box::new(src), binding)?;
+        if let Some(fp) = fingerprint {
+            arch.attach_remote_fingerprint(fp);
+        }
+        Ok(arch)
     } else {
         Archive::open(Path::new(spec))
     }
@@ -161,18 +172,31 @@ fn cache_binding_for_remote(
 /// per-worker `open_source_for_with_hint` lets each worker skip its own
 /// EOCD scan (local) or length-probe HEAD/Range-0-0 round-trip
 /// (HTTP/S3). `None` = unknown, probe.
-#[derive(Clone, Copy)]
+///
+/// `RemoteKnownLen` additionally carries the main thread's ETag /
+/// Last-Modified fingerprint so per-worker sources can pin every
+/// Range GET to the same snapshot via `If-Match` /
+/// `If-Unmodified-Since` — a mid-run object replacement then
+/// surfaces as HTTP 412 instead of silently stitching bytes from
+/// two versions.
+#[derive(Clone)]
 pub(crate) enum SourceHint {
     LocalSingleDisk,
     LocalMultiDisk(usize),
-    RemoteKnownLen(u64),
+    RemoteKnownLen {
+        len: u64,
+        fingerprint: Option<String>,
+    },
 }
 
 /// Build a hint from an already-opened `Archive`. Workers spawned
 /// after this point reuse the probe the main thread already did.
 pub(crate) fn hint_from_archive(spec: &str, arch: &Archive) -> Option<SourceHint> {
     if spec.starts_with("http://") || spec.starts_with("https://") || spec.starts_with("s3://") {
-        Some(SourceHint::RemoteKnownLen(arch.file_size()))
+        Some(SourceHint::RemoteKnownLen {
+            len: arch.file_size(),
+            fingerprint: arch.remote_fingerprint().map(|s| s.to_string()),
+        })
     } else if arch.disk_count() >= 2 {
         Some(SourceHint::LocalMultiDisk(arch.disk_count()))
     } else {
@@ -190,14 +214,18 @@ pub(crate) fn open_source_for_with_hint(
 ) -> Result<Box<dyn crate::sources::ReadSeek>> {
     if let Some(rest) = spec.strip_prefix("s3://") {
         let src = match hint {
-            Some(SourceHint::RemoteKnownLen(len)) => S3Source::open_with_len(rest, len),
+            Some(SourceHint::RemoteKnownLen { len, fingerprint }) => {
+                S3Source::open_with_len_and_if_match(rest, len, fingerprint)
+            }
             _ => S3Source::open(rest),
         }
         .with_context(|| format!("open S3 source s3://{}", rest))?;
         Ok(Box::new(src))
     } else if spec.starts_with("http://") || spec.starts_with("https://") {
         let src = match hint {
-            Some(SourceHint::RemoteKnownLen(len)) => HttpSource::open_with_len(spec, len),
+            Some(SourceHint::RemoteKnownLen { len, fingerprint }) => {
+                HttpSource::open_with_len_and_fingerprint(spec, len, fingerprint)
+            }
             _ => HttpSource::open(spec),
         }
         .with_context(|| format!("open HTTP source {}", spec))?;
@@ -227,7 +255,7 @@ fn local_source_for(
         }
         // RemoteKnownLen reached here only if a bad call site passed
         // a remote hint to a local path; fall through and probe.
-        Some(SourceHint::RemoteKnownLen(_)) | None => {}
+        Some(SourceHint::RemoteKnownLen { .. }) | None => {}
     }
 
     // No hint — scan EOCD once to decide. Keep the probe fd in-hand
@@ -487,6 +515,7 @@ pub fn run_extract(opts: ReaderOptions) -> Result<()> {
             let password = password.clone();
             let spec = spec.clone();
             let extracted = &extracted;
+            let worker_hint = worker_hint.clone();
             let handle = scope.spawn(move || -> Result<()> {
                 let mut source = open_source_for_with_hint(&spec, worker_hint)
                     .with_context(|| format!("open worker source for {}", spec))?;

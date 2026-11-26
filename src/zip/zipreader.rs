@@ -96,6 +96,14 @@ pub struct Archive {
     /// sentinels encrypted for security; this field lets
     /// readers un-encrypt them when they have the password.
     archive_password: Option<String>,
+    /// ETag / Last-Modified the remote source captured at open
+    /// time. Set via `attach_remote_fingerprint` by the reader
+    /// runners that pull the probe response off the source
+    /// before handing it over. Downstream worker-source
+    /// constructors use this as `If-Match` so a mid-run object
+    /// replacement surfaces as a 412 instead of silently mixing
+    /// bytes from two versions of the archive.
+    remote_fingerprint: Option<String>,
 }
 
 /// Per-archive cache binding: shared cache handle + this archive's
@@ -274,6 +282,7 @@ impl Archive {
                             archive_id: id.clone(),
                         }),
                         archive_password: None,
+                        remote_fingerprint: None,
                     };
                     arch.try_load_name_segments();
                     return Ok(arch);
@@ -381,6 +390,7 @@ impl Archive {
             facet_segments_loaded: false,
             cache_ctx: cache_binding.map(|(cache, archive_id)| CacheCtx { cache, archive_id }),
             archive_password: None,
+            remote_fingerprint: None,
         };
         arch.try_load_name_segments();
         // term + facet segments load lazily on first access —
@@ -491,6 +501,7 @@ impl Archive {
             facet_segments_loaded: false,
             cache_ctx: None,
             archive_password: None,
+            remote_fingerprint: None,
         };
         arch.try_load_name_segments();
         // See primary `open_source_with_cache` for why term + facet
@@ -748,6 +759,24 @@ impl Archive {
         archive_id: crate::indexcache::ArchiveId,
     ) {
         self.cache_ctx = Some(CacheCtx { cache, archive_id });
+    }
+
+    /// Store the remote source's ETag / Last-Modified for later
+    /// use as a Range-GET precondition (`If-Match`/
+    /// `If-Unmodified-Since`). Called by the reader runners that
+    /// opened the remote source; the fingerprint is read back via
+    /// `remote_fingerprint()` when spawning per-worker sources so
+    /// every worker pins to the snapshot the main thread saw.
+    pub fn attach_remote_fingerprint(&mut self, fp: String) {
+        self.remote_fingerprint = Some(fp);
+    }
+
+    /// The remote ETag / Last-Modified captured at open time, or
+    /// `None` on local archives and on remote sources that
+    /// didn't emit either. Used by workers to pin their own
+    /// Range GETs to the same snapshot the main thread opened.
+    pub fn remote_fingerprint(&self) -> Option<&str> {
+        self.remote_fingerprint.as_deref()
     }
 
     /// Try to load every `.tzip/facets.v1/<leaf>[.segN]` entry as a

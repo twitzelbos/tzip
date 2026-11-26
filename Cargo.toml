@@ -247,6 +247,9 @@ path = "tests/zip/roundtrip.rs"
 name = "update"
 path = "tests/zip/update.rs"
 [[test]]
+name = "crash_matrix"
+path = "tests/zip/crash_matrix.rs"
+[[test]]
 name = "zipcrypto"
 path = "tests/zip/zipcrypto.rs"
 

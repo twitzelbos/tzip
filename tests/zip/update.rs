@@ -504,3 +504,88 @@ fn find_eocd_cd_offset(bytes: &[u8]) -> (u64, u16) {
     }
     panic!("EOCD not found in test archive");
 }
+
+/// Issue #94: `tzip u` used to call `lfh_total_size_of` on
+/// every kept entry *before* deciding append vs rebuild,
+/// reading 30 bytes per kept entry regardless of which path
+/// it ended up on. For a 48 K-entry archive on a remote
+/// backend, that's 48 K latency-bound reads for no reason.
+///
+/// Regression: build an archive, zero out the first 30 bytes
+/// at every kept entry's lfh_offset (corrupting the LFH
+/// signature so any probe would fail), then run `tzip u` in
+/// pure-append mode. If the append path still touches those
+/// bytes, `probe LFH for carried entry …` would blow up.
+#[test]
+fn append_mode_does_not_probe_kept_entry_lfhs() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 20 small kept entries so there are many LFHs to
+    // potentially probe. Store method so zeroing the LFH
+    // sig is unambiguous (no decompressor reads these
+    // bytes during append).
+    for i in 0..20 {
+        fs::write(tmp.path().join(format!("k{:02}.txt", i)), b"body\n").unwrap();
+    }
+    let paths: Vec<String> = (0..20).map(|i| format!("k{:02}.txt", i)).collect();
+    let mut args: Vec<&str> = vec!["create", "out.zip", "-m", "store", "-q"];
+    for p in &paths {
+        args.push(p.as_str());
+    }
+    run_tzip(tmp.path(), &args);
+
+    // Recover each kept entry's lfh_offset by parsing the
+    // archive once via tzip's own reader.
+    let archive_path = tmp.path().join("out.zip");
+    let offsets: Vec<u64> = {
+        use tzip::zipreader::Archive;
+        let arch = Archive::open(&archive_path).unwrap();
+        arch.iter_entries().map(|e| e.lfh_offset).collect()
+    };
+    assert_eq!(offsets.len(), 20);
+
+    // Zero out the first 30 bytes at each offset (the LFH
+    // fixed header). The archive is now corrupt from the
+    // POV of anything that probes LFHs — but a pure-append
+    // `tzip u` shouldn't care, because kept bytes are
+    // only copied in bulk, not parsed, in append mode.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .open(&archive_path)
+            .unwrap();
+        for off in &offsets {
+            f.seek(SeekFrom::Start(*off)).unwrap();
+            f.write_all(&[0u8; 30]).unwrap();
+        }
+    }
+
+    // Add one new entry via append mode. If the pre-#94 code
+    // path ran, it would hit `probe LFH for carried entry
+    // k00.txt` and bail with "bad LFH signature at offset
+    // …: 0x0". The fix makes it skip that loop entirely.
+    fs::write(tmp.path().join("new.txt"), b"appended\n").unwrap();
+    let out = Command::new(tzip_bin())
+        .current_dir(tmp.path())
+        .args(["u", "out.zip", "new.txt"])
+        .output()
+        .expect("run tzip u");
+    assert!(
+        out.status.success(),
+        "tzip u aborted — the pre-#94 code is still probing LFHs:\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Confirm the new entry landed. Can't use the `zip` crate
+    // (its `by_index_raw` validates LFH signatures on open —
+    // those are deliberately zeroed), so go through tzip's own
+    // reader which parses CDR only.
+    use tzip::zipreader::Archive;
+    let arch = Archive::open(&archive_path).unwrap();
+    let names: Vec<String> = arch.iter_entries().map(|e| e.name.clone()).collect();
+    assert!(
+        names.iter().any(|n| n == "new.txt"),
+        "new.txt not found after append: {:?}",
+        names
+    );
+}

@@ -383,23 +383,6 @@ pub fn run_update(mut opts: Options) -> Result<()> {
         new_items.retain(|it| seen.insert(it.name_in_archive.clone()));
     }
 
-    // Populate LFH sizes on the Archive's own entries up front — one
-    // linear pass. The previous flow cloned first and then did a
-    // name-based `.position()` per kept entry at carry time, which
-    // was O(N²) over the archive on large sets. Now the cloned
-    // entries in `kept` already carry `lfh_total_size`, so
-    // `populate_lfh_size` collapses to a no-op.
-    let mut kept: Vec<ReadEntry> = Vec::new();
-    for idx in 0..arch.len() {
-        let name = arch.entry(idx).name.clone();
-        if delete_matches.contains(name.as_str()) || new_names.contains(name.as_str()) {
-            continue;
-        }
-        arch.lfh_total_size_of(idx)
-            .with_context(|| format!("probe LFH for carried entry {}", name))?;
-        kept.push(arch.entry(idx).clone());
-    }
-
     if new_items.is_empty() && delete_matches.is_empty() {
         if !opts.quiet {
             eprintln!("tzip: nothing to do (no new files, nothing matched --delete)");
@@ -413,23 +396,71 @@ pub fn run_update(mut opts: Options) -> Result<()> {
         && !opts.sort
         && rw_handle.is_some();
 
+    // Kept-entry count for the log line. Computed analytically
+    // instead of by iterating + skipping, so the append branch
+    // never pays the N × 30-byte LFH probe loop just to print a
+    // number (issue #94 — reported against a 48 K-entry ZIP64
+    // on a sparse-local copy where every probe was an SSH
+    // round-trip and a remote backend would be the same shape).
+    //
+    // An entry is "kept" iff it's NOT in delete_matches AND NOT
+    // a replace target (same name as an incoming new_item).
+    // Delete and replace don't overlap in practice, but if they
+    // did we'd want to count that entry once; the union handles
+    // both.
+    let n_del = delete_matches.len();
+    let n_removed: usize = {
+        let mut union: HashSet<&str> = HashSet::with_capacity(n_del + n_rep);
+        for n in &delete_matches {
+            union.insert(n.as_str());
+        }
+        for it in &new_items {
+            if arch
+                .iter_entries()
+                .any(|e| e.name == it.name_in_archive)
+            {
+                union.insert(it.name_in_archive.as_str());
+            }
+        }
+        union.len()
+    };
+    let kept_count = arch.len().saturating_sub(n_removed);
+
     if !opts.quiet {
         let mode = if can_append { "append" } else { "rebuild" };
         let n_add = new_items.len();
-        let n_del = delete_matches.len();
         eprintln!(
             "tzip: update mode = {} (add {}, replace {}, delete {}, keep {})",
             mode,
             n_add.saturating_sub(n_rep),
             n_rep,
             n_del,
-            kept.len(),
+            kept_count,
         );
     }
 
     if can_append {
+        // Append path never looks at kept entries' LFH — it
+        // byte-copies the carried bytes in bulk via a writer
+        // positioned at cd_offset. Skip the LFH probe loop
+        // entirely.
         run_update_append(&opts, arch, new_items, rw_handle.unwrap())
     } else {
+        // Rebuild path DOES need lfh_total_size per kept entry
+        // (so `carry_entry_to` knows how many bytes to copy
+        // from LFH+body). Probe here, not earlier.
+        let mut kept: Vec<ReadEntry> = Vec::with_capacity(kept_count);
+        for idx in 0..arch.len() {
+            let name = arch.entry(idx).name.clone();
+            if delete_matches.contains(name.as_str())
+                || new_names.contains(name.as_str())
+            {
+                continue;
+            }
+            arch.lfh_total_size_of(idx)
+                .with_context(|| format!("probe LFH for carried entry {}", name))?;
+            kept.push(arch.entry(idx).clone());
+        }
         run_update_rebuild(&opts, arch, kept, new_items)
     }
 }

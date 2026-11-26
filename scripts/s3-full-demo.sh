@@ -78,12 +78,23 @@ KEY="${KEY:-demo-ppmd-aes-${ENTRIES}.zip}"
 # this exact string, so changing it requires invalidating the
 # cache or setting FORCE_REBUILD=1.
 MARKER="${MARKER:-UNIQUE-MARKER-FOR-TZIP-GREP-TEST}"
+# Per-entry raw size target. The original ~130-byte entries
+# left PPMd level 9 almost no context to model, so the
+# archive crushed only ~3× (~40 MB from 13 MB raw). Bumping
+# the body to ~4 KiB of semi-redundant English+id text per
+# entry gives PPMd real work and makes the demo's compression
+# claim actually interesting (archive shrinks ~5-10× instead
+# of ~3×).
+ENTRY_BYTES="${ENTRY_BYTES:-4096}"
 # Cached corpus + prebuilt archive live outside the per-run
 # scratch dir so re-runs skip the 100 K-file + PPMd-max
 # regeneration (which is the slow part by far). Keyed on
-# ENTRIES so bumping the size naturally invalidates the
-# cache. FORCE_REBUILD=1 forces a rebuild.
-CACHE_DIR="${CACHE_DIR:-${TMPDIR:-/tmp}/tzip-s3-demo-cache-${ENTRIES}}"
+# ENTRIES *and* on a schema-version slug so bumping either
+# the count or the entry shape naturally invalidates. Bumped
+# to `v2` with the 4 KiB-per-entry change; everyone's old
+# `tzip-s3-demo-cache-100000` dir can be deleted.
+CACHE_VERSION="${CACHE_VERSION:-v2-4k}"
+CACHE_DIR="${CACHE_DIR:-${TMPDIR:-/tmp}/tzip-s3-demo-cache-${CACHE_VERSION}-${ENTRIES}}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 
 # ── Preflight ─────────────────────────────────────────────────
@@ -168,31 +179,81 @@ if [[ ! -f "$CACHED_SENTINEL" ]]; then
     # given ENTRIES, which keeps the archive content-addressed
     # across runs. The MARKER lands in a fixed slot so grep
     # asserts the same value every time.
-    python3 - "$CACHED_CORPUS" "$ENTRIES" "$MARKER" <<'PY'
+    python3 - "$CACHED_CORPUS" "$ENTRIES" "$MARKER" "$ENTRY_BYTES" <<'PY'
 import json, pathlib, random, sys
-out, entries, marker = pathlib.Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+out, entries, marker, target_bytes = (
+    pathlib.Path(sys.argv[1]),
+    int(sys.argv[2]),
+    sys.argv[3],
+    int(sys.argv[4]),
+)
 random.seed(42)
 regions  = ["us-east-1", "us-west-2", "eu-west-1", "ap-south-1", "sa-east-1"]
 statuses = [200, 201, 301, 400, 404, 500, 503]
 users    = [f"user-{i:04d}" for i in range(500)]
+# Small vocabulary so PPMd's context model finds repeated
+# n-grams across many files. 48 words, Zipfian-weighted —
+# good approximation of English redundancy, drops bulk size
+# by 5-10× under PPMd level 9 while keeping enough entropy
+# that AES has visible work (every entry still rolls its own
+# salt, which forces distinct ciphertext).
+WORDS = (
+    "the of and to a in that is was for on with as by this it be "
+    "which an but from has or had at are not his they their been "
+    "which when were all one also can so if we more about would "
+    "service request response cached user region status payload"
+).split()
+WEIGHTS = [1.0 / (i + 1) for i in range(len(WORDS))]
+def paragraph(rng, target_len):
+    """Emit words until the running string reaches `target_len`
+    bytes, so the final record lands close to the requested
+    per-entry size regardless of the vocabulary's average
+    word length (which otherwise makes a word-count-driven
+    loop overshoot or undershoot unpredictably).
+    """
+    buf, since_sentence, cur_len = [], 0, 0
+    while cur_len < target_len:
+        w = rng.choices(WORDS, weights=WEIGHTS, k=1)[0]
+        buf.append(w.capitalize() if since_sentence == 0 else w)
+        cur_len += len(w) + 1
+        since_sentence += 1
+        if since_sentence > rng.randint(10, 20):
+            buf.append(".")
+            cur_len += 1
+            since_sentence = 0
+    return " ".join(buf).replace(" .", ".") + "."
+
+# Subtract ~200 bytes for the surrounding JSON envelope
+# (`{"id":…,"ts":…,"region":…,"status":…,"user":…,"msg":""}`)
+# so the final file lands close to `target_bytes`, not
+# `target_bytes + 200`.
+BODY_TARGET = max(100, target_bytes - 200)
 for i in range(entries):
-    (out / f"entry-{i:06d}.json").write_text(json.dumps({
+    # Per-entry PRNG seeded by i so content is deterministic
+    # independent of iteration order (enables parallel regen
+    # later if we want it).
+    rng = random.Random(42 ^ i)
+    body = paragraph(rng, BODY_TARGET)
+    rec = {
         "id":     i,
-        "ts":     f"2026-11-{random.randint(1,28):02d}T{random.randint(0,23):02d}:{random.randint(0,59):02d}:{random.randint(0,59):02d}Z",
-        "region": random.choice(regions),
-        "status": random.choice(statuses),
-        "user":   random.choice(users),
-        "msg":    f"request body {random.randint(0, 1<<30):x}",
-    }))
+        "ts":     f"2026-11-{rng.randint(1,28):02d}T{rng.randint(0,23):02d}:{rng.randint(0,59):02d}:{rng.randint(0,59):02d}Z",
+        "region": rng.choice(regions),
+        "status": rng.choice(statuses),
+        "user":   rng.choice(users),
+        "msg":    body,
+    }
+    (out / f"entry-{i:06d}.json").write_text(json.dumps(rec))
 # Fixed marker slot so grep's assertion is cache-stable.
 marker_idx = entries // 3
+rng = random.Random(42 ^ marker_idx)
+marker_body = marker + " " + paragraph(rng, BODY_TARGET)
 (out / f"entry-{marker_idx:06d}.json").write_text(json.dumps({
     "id": marker_idx, "ts": "2026-11-25T00:00:00Z",
     "region": "us-east-1", "status": 500,
     "user": "marker-user",
-    "msg": marker,
+    "msg": marker_body,
 }))
-print(f"seeded {entries} entries; marker in entry-{marker_idx:06d}.json")
+print(f"seeded {entries} entries (~{target_bytes} B each); marker in entry-{marker_idx:06d}.json")
 PY
     touch "$CACHED_SENTINEL"
 fi

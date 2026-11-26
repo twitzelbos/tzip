@@ -252,6 +252,44 @@ fn rich_filter_compiles_and_runs() {
 }
 
 #[test]
+fn inner_jobs_parallel_matches_single_worker() {
+    // Build a 60-entry archive and run the same filter under
+    // --inner-jobs 1 and --inner-jobs 8. Set membership must be
+    // identical — any serialisation seam or per-worker filter-state
+    // bug would drop or duplicate lines.
+    let tmp = tempfile::tempdir().unwrap();
+    let items: Vec<(i64, &str)> = (0..60)
+        .map(|i| (200 + (i % 3) as i64, if i % 2 == 0 { "alice" } else { "bob" }))
+        .collect();
+    make_corpus(tmp.path(), "a", &items);
+    run(
+        tmp.path(),
+        &["create", "out.zip", "a/logs", "-m", "deflate", "-q"],
+    );
+
+    let serial = run(
+        tmp.path(),
+        &["jq", "-r", ".user", "out.zip", "--inner-jobs", "1"],
+    );
+    let parallel = run(
+        tmp.path(),
+        &["jq", "-r", ".user", "out.zip", "--inner-jobs", "8"],
+    );
+    let mut s: Vec<String> = String::from_utf8_lossy(&serial.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+    let mut p: Vec<String> = String::from_utf8_lossy(&parallel.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+    s.sort();
+    p.sort();
+    assert_eq!(p, s, "parallel and serial jq must produce the same set");
+    assert_eq!(p.len(), 60, "every entry must be filtered");
+}
+
+#[test]
 fn bad_filter_errors_out_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     make_corpus(tmp.path(), "a", &[(200, "alice")]);

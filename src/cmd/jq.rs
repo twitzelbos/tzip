@@ -8,11 +8,11 @@
 //! semantics: raw strings print without quotes, non-strings
 //! serialise as JSON.
 //!
-//! One archive shard at a time; no rayon fan-out inside — `tzip
-//! grep` already demonstrates the concurrency shape for remote
-//! fan-out and the next iteration can borrow its outer pool when a
-//! user actually bottlenecks on jq latency. Filter is compiled
-//! once up front, then re-used across every entry.
+//! Archives are processed one at a time, but entries **inside** an
+//! archive fan out across `--inner-jobs` workers (default 8), each
+//! with its own backing source so remote Range GETs overlap and
+//! local body-decode uses N cores. The compiled filter is shared
+//! across workers via `Arc` so compilation happens exactly once.
 //!
 //! ## Compared to `tzip query`
 //!
@@ -27,14 +27,19 @@
 //! columns; use `jq` when you want to pick at raw JSON with the
 //! same flexibility you'd get piping `tzip cat ... | jq`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use jaq_core::load::{Arena, File as JaqFile, Loader};
 use jaq_core::{data, unwrap_valr, Compiler, Ctx, Vars};
 use jaq_json::{read, Val};
 use std::io::{BufWriter, Write};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use crate::reader::{
+    hint_from_archive, open_archive_with_cache, open_source_for_with_hint, SourceHint,
+};
 use crate::walker;
+use crate::zipreader::{stream_entry_source_to, ReadEntry};
 
 /// Options for a single `tzip jq` invocation. Mirrors the shape of
 /// `QueryOpts` / `AggregateOptions` so flag handling at the CLI
@@ -46,6 +51,7 @@ pub struct JqOpts {
     pub raw_output: bool,
     pub entry_prefix: bool,
     pub password: Option<String>,
+    pub inner_jobs: usize,
     pub cache: Option<crate::indexcache::IndexCacheSpec>,
     pub quiet: bool,
     pub verbose: bool,
@@ -62,96 +68,199 @@ pub fn run(opts: JqOpts) -> Result<()> {
         opts.include.clone()
     });
 
-    // Compile the filter once. jaq separates the Loader/Arena
-    // (which borrow each other during compilation) from the final
-    // compiled Filter struct, so we can own the latter and drop
-    // the former.
-    let compiled = compile_filter(&opts.filter).context("compile jq filter")?;
+    // Compile the filter once, share across all workers in all
+    // archives. The jaq Loader+Arena transiently borrow the filter
+    // source during compilation; the final CompiledFilter owns
+    // everything it needs.
+    let compiled = Arc::new(compile_filter(&opts.filter).context("compile jq filter")?);
 
     let cache_arc = match &opts.cache {
         Some(spec) => Some(spec.open()?),
         None => None,
     };
 
-    let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
+    let total_scanned = AtomicUsize::new(0);
 
     for spec in &archives {
-        let mut arch = crate::reader::open_archive_with_cache(spec, cache_arc.clone())
+        let mut arch = open_archive_with_cache(spec, cache_arc.clone())
             .with_context(|| format!("open archive {}", spec))?;
         if let Some(pw) = opts.password.as_deref() {
             arch.attach_password(pw.to_string());
         }
+
+        // Collect the entry indices this archive should hand to
+        // workers. Skip directory entries and `.tzip/*` sentinels
+        // up front so workers don't contend on stdout for noise.
+        let mut entries: Vec<ReadEntry> = Vec::new();
         for idx in 0..arch.len() {
-            let name = arch.entry(idx).name.clone();
-            if arch.entry(idx).uncomp_size == 0 && name.ends_with('/') {
-                continue; // directory entry, skip silently
-            }
-            if !matches_include(&name, &include) {
-                continue;
-            }
-            // Decompress the entry body into a Vec. Index entries
-            // (`.tzip/*.v1[*.segN]`) end up matching `*.json` on
-            // account of the `columnar.v1.parquet` sidecar having
-            // `.parquet` — so they're naturally excluded. Any other
-            // `.tzip/*` entries we pre-filter explicitly.
-            if name.starts_with(".tzip/") {
-                continue;
-            }
-            let mut body: Vec<u8> = Vec::new();
-            if let Err(e) =
-                arch.stream_entry_to(idx, opts.password.as_deref(), &mut body)
-            {
-                if opts.verbose {
-                    eprintln!("tzip jq: skip {} ({}): {:#}", spec, name, e);
-                }
-                continue;
-            }
-            // Parse the body as a single JSON value. `tzip jq` on
-            // non-JSON entries is a user error, but a skip-with-
-            // verbose-warning is less hostile than aborting the
-            // whole stream.
-            let input_val = match read::parse_single(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    if opts.verbose {
-                        eprintln!(
-                            "tzip jq: skip {} ({}): JSON parse failed: {:?}",
-                            spec, name, e
-                        );
-                    }
-                    continue;
+            let keep = {
+                let e = arch.entry(idx);
+                if e.name.starts_with(".tzip/") {
+                    false
+                } else if e.name.ends_with('/') && e.uncomp_size == 0 {
+                    false
+                } else {
+                    matches_include(&e.name, &include)
                 }
             };
-            let prefix: Option<String> = if opts.entry_prefix {
-                Some(format!("{}:{}\t", spec, name))
-            } else {
-                None
-            };
-            let ctx = Ctx::<data::JustLut<Val>>::new(&compiled.lut, Vars::new([]));
-            for value in compiled.id.run((ctx, input_val)).map(unwrap_valr) {
-                let v = match value {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if opts.verbose {
-                            eprintln!(
-                                "tzip jq: filter error on {}:{}: {:?}",
-                                spec, name, e
-                            );
+            if !keep {
+                continue;
+            }
+            arch.lfh_total_size_of(idx)?;
+            entries.push(arch.entry(idx).clone());
+        }
+        if entries.is_empty() {
+            continue;
+        }
+        let worker_hint = hint_from_archive(spec, &arch);
+        drop(arch);
+
+        run_archive_parallel(
+            spec,
+            entries,
+            worker_hint,
+            compiled.clone(),
+            &opts,
+            &total_scanned,
+        )?;
+    }
+
+    if !opts.quiet && opts.verbose {
+        eprintln!(
+            "tzip jq: scanned {} archive(s), {} matching entries",
+            archives.len(),
+            total_scanned.load(Ordering::Relaxed),
+        );
+    }
+    Ok(())
+}
+
+/// Spread the entry list across `opts.inner_jobs` workers. Each
+/// worker owns a stdout mutex guard only during its own emit, so
+/// per-entry output stays line-atomic even though order is
+/// non-deterministic across parallel workers (same contract as
+/// `tzip grep` / `tzip hash`).
+fn run_archive_parallel(
+    spec: &str,
+    entries: Vec<ReadEntry>,
+    worker_hint: Option<SourceHint>,
+    compiled: Arc<CompiledFilter>,
+    opts: &JqOpts,
+    total_scanned: &AtomicUsize,
+) -> Result<()> {
+    let parallel = opts.inner_jobs.max(1).min(entries.len());
+
+    let (tx, rx) = crossbeam_channel::unbounded::<ReadEntry>();
+    for re in entries {
+        let _ = tx.send(re);
+    }
+    drop(tx);
+
+    // `Mutex<io::Stdout>` because `StdoutLock` isn't `Send`. Each
+    // worker takes the lock only around its own `write_all` so
+    // lines stay atomic without serialising the body-decode.
+    let out: Mutex<std::io::Stdout> = Mutex::new(std::io::stdout());
+
+    std::thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::with_capacity(parallel);
+        for _ in 0..parallel {
+            let rx = rx.clone();
+            let compiled = compiled.clone();
+            let spec_str = spec.to_string();
+            let password = opts.password.clone();
+            let entry_prefix = opts.entry_prefix;
+            let raw_output = opts.raw_output;
+            let verbose = opts.verbose;
+            let out = &out;
+            let total_scanned = total_scanned;
+            let handle = scope.spawn(move || -> Result<()> {
+                let mut source = open_source_for_with_hint(&spec_str, worker_hint)
+                    .with_context(|| format!("open worker source for {}", spec_str))?;
+                while let Ok(re) = rx.recv() {
+                    let mut body: Vec<u8> = Vec::new();
+                    if let Err(e) = stream_entry_source_to(
+                        &mut *source,
+                        &re,
+                        password.as_deref(),
+                        &mut body,
+                    ) {
+                        if verbose {
+                            eprintln!("tzip jq: skip {} ({}): {:#}", spec_str, re.name, e);
                         }
                         continue;
                     }
-                };
-                emit(&mut out, prefix.as_deref(), &v, opts.raw_output)?;
+                    let input_val = match read::parse_single(&body) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if verbose {
+                                eprintln!(
+                                    "tzip jq: skip {} ({}): JSON parse failed: {:?}",
+                                    spec_str, re.name, e
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    // Each output value serialises into a small
+                    // per-entry buffer; the stdout lock is held
+                    // only while flushing that buffer so workers
+                    // don't contend during the actual filter run.
+                    let mut buf: Vec<u8> = Vec::with_capacity(256);
+                    let prefix_bytes: Option<Vec<u8>> = if entry_prefix {
+                        Some(format!("{}:{}\t", spec_str, re.name).into_bytes())
+                    } else {
+                        None
+                    };
+                    let ctx = Ctx::<data::JustLut<Val>>::new(&compiled.lut, Vars::new([]));
+                    for value in compiled.id.run((ctx, input_val)).map(unwrap_valr) {
+                        let v = match value {
+                            Ok(v) => v,
+                            Err(e) => {
+                                if verbose {
+                                    eprintln!(
+                                        "tzip jq: filter error on {}:{}: {:?}",
+                                        spec_str, re.name, e
+                                    );
+                                }
+                                continue;
+                            }
+                        };
+                        emit(&mut buf, prefix_bytes.as_deref(), &v, raw_output)?;
+                    }
+                    if !buf.is_empty() {
+                        let guard = out.lock().expect("stdout mutex");
+                        let mut handle = guard.lock();
+                        handle.write_all(&buf)?;
+                        drop(handle);
+                        drop(guard);
+                    }
+                    total_scanned.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            });
+            handles.push(handle);
+        }
+        let mut first_err: Option<anyhow::Error> = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(anyhow!("jq worker thread panicked"));
+                    }
+                }
             }
         }
-    }
-
-    out.flush().ok();
-    if !opts.quiet && opts.verbose {
-        eprintln!("tzip jq: scanned {} archive(s)", archives.len());
-    }
-    Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })
 }
 
 /// Compile a jq filter source into the executable `jaq` form.
@@ -206,9 +315,9 @@ fn matches_include(name: &str, globs: &[String]) -> bool {
     walker::is_excluded(name, globs)
 }
 
-fn emit<W: Write>(out: &mut W, prefix: Option<&str>, v: &Val, raw: bool) -> Result<()> {
+fn emit<W: Write>(out: &mut W, prefix: Option<&[u8]>, v: &Val, raw: bool) -> Result<()> {
     if let Some(p) = prefix {
-        out.write_all(p.as_bytes())?;
+        out.write_all(p)?;
     }
     if raw {
         // jq's -r: strings print raw (no quotes, no escaping);

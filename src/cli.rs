@@ -1688,6 +1688,13 @@ pub struct JqArgs {
     #[arg(short = 'p', long)]
     pub password: Option<String>,
 
+    /// Concurrent entries decoded + filtered within one archive.
+    /// Each worker opens its own backing source so remote Range
+    /// GETs overlap and local body-decode uses N cores. Mirrors
+    /// `tzip grep`'s flag.
+    #[arg(long, default_value_t = 8)]
+    pub inner_jobs: usize,
+
     /// Keep index entries in the client-side on-disk LRU cache
     /// under this directory. Same semantic as `tzip query`.
     #[arg(long, value_name = "DIR")]
@@ -1716,6 +1723,7 @@ impl JqArgs {
             raw_output: self.raw_output,
             entry_prefix: self.entry_prefix,
             password: self.password,
+            inner_jobs: self.inner_jobs,
             cache: cache_spec_from_flags_with_ram(
                 self.cache_dir,
                 self.cache_size_mb,

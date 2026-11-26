@@ -4,6 +4,11 @@
 //!
 //! - `--algo crc32` reads the entry's CRC-32 straight from the
 //!   central directory. Zero body I/O; free for HTTP / S3 archives.
+//!   **AE-2 AES-encrypted entries carry CRC-32 = 0 in the CDR per
+//!   spec** (the stored field is zeroed so the ciphertext doesn't
+//!   leak a plaintext fingerprint). For those we fall through to the
+//!   body-streaming path when a password is attached, and emit a
+//!   clearly-marked `n/a` row when no password is available.
 //!
 //! - `--algo md5` / `--algo sha256` streams each entry's body through
 //!   a decompressor + hasher in parallel workers, mirroring the model
@@ -11,6 +16,7 @@
 //!   decrypted first, same as `tzip cat`.
 
 use anyhow::{anyhow, Context, Result};
+use crc32fast::Hasher as Crc32;
 use md5::Md5;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
@@ -73,38 +79,52 @@ pub fn run(args: HashArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Fast path: CRC32 lives in the CDR, no body work needed.
-    if matches!(args.algo, HashAlgo::Crc32) {
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        for idx in &candidates {
-            let e = arch.entry(*idx);
-            emit_line(&mut out, args.algo, &e.name, &format!("{:08x}", e.crc32), args.json)?;
-        }
-        return Ok(());
-    }
-
-    // Body-streaming path. For entries that carry a pre-computed
-    // digest in the tzip-native extra field (written via
-    // `tzip create --write-md5` / `--write-sha256`) we can skip the
-    // decompress + hash round-trip entirely and emit straight from
-    // the CDR — same cost as the crc32 fast path. Entries without
-    // a stored digest fall through to the worker pool.
+    // Partial fast path: CRC32 lives in the CDR for plaintext
+    // entries. AE-2 AES-encrypted entries store CRC-32 = 0 in the
+    // CDR per spec (see `src/zip/crypto.rs` — AE-2 zeros the CDR
+    // CRC field so ciphertext doesn't leak a plaintext hash), so
+    // those must flow through the body-decode worker pool. Here we
+    // emit CRC32s straight from the CDR for the plaintext subset
+    // and defer the encrypted ones to the shared streaming path
+    // below.
     let stdout = io::stdout();
     let mut direct_out = stdout.lock();
     let mut entries: Vec<ReadEntry> = Vec::with_capacity(candidates.len());
     for idx in candidates {
-        let (name, stored) = {
+        let (name, encrypted, stored) = {
             let e = arch.entry(idx);
             let stored = match args.algo {
+                HashAlgo::Crc32 => {
+                    if e.encrypted {
+                        None
+                    } else {
+                        Some(format!("{:08x}", e.crc32))
+                    }
+                }
                 HashAlgo::Md5 => e.md5_digest.map(|d| hex_of(&d)),
                 HashAlgo::Sha256 => e.sha256_digest.map(|d| hex_of(&d)),
-                HashAlgo::Crc32 => unreachable!("crc32 handled above"),
             };
-            (e.name.clone(), stored)
+            (e.name.clone(), e.encrypted, stored)
         };
         if let Some(hex) = stored {
             emit_line(&mut direct_out, args.algo, &name, &hex, args.json)?;
+            continue;
+        }
+        if encrypted && password.is_none() {
+            // AE-2 crc32 for an encrypted entry with no password:
+            // we can't compute the real CRC32 (it'd require
+            // decrypt+decompress) and we must not pretend the
+            // zero'd CDR value is a real hash. Emit a visible n/a
+            // so the caller sees something's off; `--verbose` adds
+            // a stderr line.
+            emit_na_line(&mut direct_out, args.algo, &name, args.json)?;
+            if args.verbose {
+                eprintln!(
+                    "tzip hash: {} is AES-encrypted and no password is \
+                     attached — CDR CRC-32 is 0 per AE-2; skipped",
+                    name
+                );
+            }
             continue;
         }
         arch.lfh_total_size_of(idx)?;
@@ -271,6 +291,7 @@ fn resolve_password(args: &HashArgs) -> Result<Option<String>> {
 /// one of these per entry; `finalize_hex()` consumes it to produce
 /// the lowercase-hex digest.
 enum HashSink {
+    Crc32(Crc32),
     Md5(Md5),
     Sha256(Sha256),
 }
@@ -278,13 +299,14 @@ enum HashSink {
 impl HashSink {
     fn new(algo: HashAlgo) -> Self {
         match algo {
+            HashAlgo::Crc32 => HashSink::Crc32(Crc32::new()),
             HashAlgo::Md5 => HashSink::Md5(Md5::new()),
             HashAlgo::Sha256 => HashSink::Sha256(Sha256::new()),
-            HashAlgo::Crc32 => unreachable!("crc32 is handled on the fast path"),
         }
     }
     fn finalize_hex(self) -> String {
         match self {
+            HashSink::Crc32(h) => format!("{:08x}", h.finalize()),
             HashSink::Md5(h) => hex_of(&h.finalize()),
             HashSink::Sha256(h) => hex_of(&h.finalize()),
         }
@@ -294,6 +316,7 @@ impl HashSink {
 impl Write for HashSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
+            HashSink::Crc32(h) => h.update(buf),
             HashSink::Md5(h) => h.update(buf),
             HashSink::Sha256(h) => h.update(buf),
         }
@@ -301,6 +324,24 @@ impl Write for HashSink {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+fn emit_na_line<W: Write>(
+    w: &mut W,
+    algo: HashAlgo,
+    name: &str,
+    json: bool,
+) -> io::Result<()> {
+    if json {
+        writeln!(
+            w,
+            "{{\"name\":{},\"algo\":\"{}\",\"hash\":null,\"note\":\"AES AE-2; password required\"}}",
+            json_str(name),
+            algo.label(),
+        )
+    } else {
+        writeln!(w, "n/a (AES AE-2 — pass --password)  {}", name)
     }
 }
 

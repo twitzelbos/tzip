@@ -109,6 +109,62 @@ fn hash_md5_matches_known_plaintext() {
 }
 
 #[test]
+fn hash_crc32_computes_plaintext_crc_on_aes_with_password() {
+    // AE-2 stores CRC-32 = 0 in the CDR per spec — the fast path
+    // must detect encryption and fall through to the body-decode
+    // worker pool, producing the SAME CRC32 as the plaintext
+    // archive of the same corpus.
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip(
+        tmp.path(),
+        &["create", "plain.zip", "corpus", "-m", "deflate", "-q"],
+    );
+    run_tzip(
+        tmp.path(),
+        &["create", "aes.zip", "corpus", "-m", "deflate", "-p", "hunter2", "-q"],
+    );
+    let plain = run_tzip(tmp.path(), &["hash", "plain.zip", "--algo", "crc32"]);
+    let aes = run_tzip(
+        tmp.path(),
+        &["hash", "aes.zip", "--algo", "crc32", "-p", "hunter2"],
+    );
+    let p = parse_hash_lines(&String::from_utf8_lossy(&plain.stdout));
+    let a = parse_hash_lines(&String::from_utf8_lossy(&aes.stdout));
+    assert_eq!(p, a, "AES AE-2 crc32 must match plaintext crc32");
+    // Sanity: not a bunch of 00000000s.
+    assert!(
+        a.values().any(|v| v != "00000000"),
+        "crc32 output must be the real plaintext CRC, not the AE-2 zero"
+    );
+}
+
+#[test]
+fn hash_crc32_marks_na_on_aes_without_password() {
+    // Encrypted entries + no password → we can't compute the real
+    // CRC32 and the CDR carries a spec-mandated zero. Output must
+    // flag that clearly instead of silently printing 00000000.
+    let tmp = tempfile::tempdir().unwrap();
+    make_corpus(&tmp.path().join("corpus"));
+    run_tzip(
+        tmp.path(),
+        &["create", "aes.zip", "corpus", "-m", "deflate", "-p", "hunter2", "-q"],
+    );
+    let out = run_tzip(tmp.path(), &["hash", "aes.zip", "--algo", "crc32"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("n/a (AES AE-2"),
+        "expected explicit n/a markers; got {}",
+        stdout
+    );
+    assert!(
+        !stdout.lines().any(|l| l.starts_with("00000000")),
+        "must NOT surface the AE-2 zero as a hash; got {}",
+        stdout
+    );
+}
+
+#[test]
 fn hash_sha256_is_the_same_through_aes() {
     let tmp = tempfile::tempdir().unwrap();
     make_corpus(&tmp.path().join("corpus"));

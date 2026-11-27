@@ -15,7 +15,18 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 /// Bundle identifier declared in `macos-fskit/Sources/Resources/Info.plist`.
-const BUNDLE_ID: &str = "io.qbio.tzip.fskit";
+///
+/// Read from the `TZIP_FSKIT_BUNDLE_ID` env var at compile time so a
+/// fork signing under a different Apple Developer team (where the
+/// provisioning profile's App ID lives in a different namespace)
+/// doesn't have to patch tracked source. Falls back to the
+/// project's `io.qbio.tzip.fskit` default when unset — matching the
+/// `.in` entitlements templates and `scripts/build-fskit-bundle.sh`'s
+/// `TZIP_FSKIT_BUNDLE_ID` default.
+const BUNDLE_ID: &str = match option_env!("TZIP_FSKIT_BUNDLE_ID") {
+    Some(id) => id,
+    None => "io.qbio.tzip.fskit",
+};
 
 extern "C" {
     fn tzip_sysext_activate(bundle_id: *const c_char, err_out: *mut *mut c_char) -> i32;

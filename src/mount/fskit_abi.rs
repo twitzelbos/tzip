@@ -169,8 +169,13 @@ unsafe fn open_volume_impl(
         );
     }
 
+    // `open_archive` returns an `OpenedArchive` wrapper carrying the
+    // remote-fingerprint for per-worker If-Match pinning. FSKit
+    // mounts hold a single backing source for the mount's lifetime
+    // (no spawned workers), so that plumbing doesn't apply here —
+    // peel the wrapper and hand the plain `Archive` to VFS.
     let archive: Archive = match open_archive(&url) {
-        Ok(a) => a,
+        Ok(a) => a.into_archive(),
         Err(e) => return write_err(out_err, &format!("open {}: {:#}", url, e)),
     };
 

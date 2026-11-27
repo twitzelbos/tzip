@@ -6,30 +6,44 @@
   <string>en</string>
   <key>CFBundleExecutable</key>
   <string>TzipFSExtension</string>
+  <!-- Bundle id of the FSKit extension. `scripts/build-fskit-bundle.sh`
+       rewrites this with the value of `$TZIP_FSKIT_BUNDLE_ID` at build
+       time when the env var is set, so forks with a different Apple
+       Developer namespace don't need to patch this file. Default is
+       the project's `io.qbio` namespace. -->
   <key>CFBundleIdentifier</key>
   <string>io.qbio.tzip.fskit</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
   <string>TzipFSExtension</string>
+  <!-- `XPC!` is the package type modern ExtensionKit expects for
+       standalone XPC-service extensions (FSKit extensions on
+       macOS 15.4+). `APPL` was the pre-ExtensionKit NSExtension
+       convention; using it here would make Launch Services skip
+       the bundle during File System Extensions discovery. -->
   <key>CFBundlePackageType</key>
-  <string>APPL</string>
+  <string>XPC!</string>
   <key>CFBundleShortVersionString</key>
   <string>0.3.0</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
   <string>15.4</string>
-  <key>NSExtension</key>
+
+  <!-- ExtensionKit metadata: Apple's own fskit.msdos / fskit.exfat
+       extensions use this block (not `NSExtension`) and reach it
+       via the modern ExtensionFoundation runtime. The `@main` entry
+       point lives in `TzipAppExtension.swift`. -->
+  <key>EXAppExtensionAttributes</key>
   <dict>
-    <key>NSExtensionPointIdentifier</key>
+    <key>EXExtensionPointIdentifier</key>
     <string>com.apple.fskit.fsmodule</string>
-    <key>NSExtensionPrincipalClass</key>
-    <string>TzipFSExtension.TzipFSExtension</string>
   </dict>
-  <!-- FSKit-specific keys: the filesystem type name the kernel uses to
-       route mount(2) calls to this extension, and the class that
-       implements FSUnaryFileSystemOperations. -->
+
+  <!-- FSKit-specific keys: the filesystem type name the kernel uses
+       to route `mount -t tzip` calls here, and the short name
+       `fskitd` looks up when resolving a mount dispatch. -->
   <key>FSKit</key>
   <dict>
     <key>FSFileSystemName</key>

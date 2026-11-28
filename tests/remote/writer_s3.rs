@@ -647,17 +647,27 @@ fn env_s3_refs<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a st
     v.iter().map(|(k, val)| (*k, val.as_str())).collect()
 }
 
-/// Create a corpus big enough to push `cd_offset` past 5 MiB, so
-/// the multipart (not single-PUT) path is exercised. Exact byte
-/// count doesn't matter as long as the LFH+body region clears
-/// MIN_PART_SIZE.
+/// Create a corpus big enough to push the composed `cd_offset +
+/// tail_len` past `SINGLE_PUT_MAX_TOTAL` (32 MiB, set in
+/// `src/update/s3.rs`), so the multipart (NOT single-PUT and
+/// NOT small-prefix multipart) dispatch branch is exercised.
+///
+/// Before the issue #112 fix a 5-MiB-plus corpus was enough —
+/// dispatch keyed only on `cd_offset`. After the fix, dispatch
+/// keys on the combined body size, and tests that want the
+/// canonical `multipart_append` path (server-side
+/// `UploadPartCopy` over a large kept prefix) need > 32 MiB of
+/// kept bytes.
 fn make_big_corpus(root: &Path) {
     fs::create_dir_all(root).unwrap();
-    // 20 × 400 KiB = 8 MiB of raw bodies.
+    // 20 × 2 MiB = 40 MiB of raw bodies — comfortably above
+    // SINGLE_PUT_MAX_TOTAL so these tests exercise the full
+    // `multipart_append` path (UploadPartCopy over the kept
+    // prefix).
     for i in 0u32..20 {
-        let mut body = Vec::with_capacity(400 * 1024);
-        for j in 0..(400 * 1024u32) {
-            body.push((i.wrapping_mul(97).wrapping_add(j)) as u8);
+        let mut body = vec![0u8; 2 * 1024 * 1024];
+        for (j, b) in body.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(97).wrapping_add(j as u32)) as u8;
         }
         fs::write(root.join(format!("page_{:03}.bin", i)), &body).unwrap();
     }
@@ -787,6 +797,149 @@ fn s3_append_small_archive_single_put_fallback() {
     let out = String::from_utf8(stdout).unwrap();
     assert!(out.contains("a.txt"));
     assert!(out.contains("b.txt"));
+}
+
+#[test]
+fn s3_append_small_prefix_large_tail_uses_multipart_not_single_put() {
+    // Issue #112 regression. Before the fix, the dispatch used
+    // `cd_offset < MIN_PART_SIZE` alone to pick the single-PUT
+    // fallback, regardless of how big the new tail was. A tiny
+    // seed + huge append body therefore produced a single
+    // multi-dozen-MiB PutObject that failed with `broken pipe` in
+    // the wild.
+    //
+    // After the fix, when the combined body exceeds
+    // `SINGLE_PUT_MAX_TOTAL` (32 MiB) we take the small-prefix
+    // multipart path — part 1 carries the small prefix plus the
+    // first 16 MiB of tail, subsequent parts stream the rest from
+    // the temp file.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("seed.txt"), b"seed\n").unwrap();
+    run_tzip_create(tmp.path(), &["create", "out.zip", "seed.txt", "-q"]);
+    let initial_body = fs::read(tmp.path().join("out.zip")).unwrap();
+    // Sanity: seed well below MIN_PART_SIZE so we exercise the
+    // small-prefix branch.
+    assert!(
+        initial_body.len() < 5 * 1024 * 1024,
+        "seed must be < 5 MiB to hit small-prefix branch, got {} bytes",
+        initial_body.len()
+    );
+
+    // Build ~40 MiB of inputs — comfortably above
+    // SINGLE_PUT_MAX_TOTAL (32 MiB).
+    let corpus = tmp.path().join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    // 20 × 2 MiB entries = 40 MiB of bodies. Deterministic fill
+    // keeps the body incompressible-ish under `-m store`.
+    for i in 0u32..20 {
+        let mut body = vec![0u8; 2 * 1024 * 1024];
+        for (j, b) in body.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(37).wrapping_add(j as u32)) as u8;
+        }
+        fs::write(corpus.join(format!("page_{:03}.bin", i)), &body).unwrap();
+    }
+
+    let server = serve_mock_s3_mpu("mybucket", "out.zip", initial_body);
+    let initial_etag = server.current_etag();
+    assert_eq!(
+        server.upload_count(),
+        0,
+        "mock should have no in-flight uploads before tzip runs"
+    );
+
+    let env = env_s3(&server);
+    let env_ref = env_s3_refs(&env);
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &[
+            "u",
+            "s3://mybucket/out.zip",
+            "corpus",
+            "-m",
+            "store",
+        ],
+        &env_ref,
+    );
+    assert!(
+        ok,
+        "small-prefix large-tail s3 u failed: {}",
+        stderr
+    );
+    // Must have taken the issue #112 branch, NOT the single-PUT
+    // branch that the old dispatcher would have taken.
+    assert!(
+        stderr.contains("small-prefix multipart") || stderr.contains("issue #112"),
+        "stderr must mention the small-prefix multipart branch: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("using single-PUT fallback"),
+        "must NOT fall back to single-PUT for a > 32 MiB combined body: {}",
+        stderr
+    );
+    // Must have gone through a multipart lifecycle.
+    assert!(
+        stderr.contains("multipart upload"),
+        "stderr must mention multipart upload: {}",
+        stderr
+    );
+    assert_ne!(
+        server.current_etag(),
+        initial_etag,
+        "object ETag should change after successful append"
+    );
+
+    // Archive must list ALL entries now — seed + 20 corpus files.
+    let (ls_ok, stdout, _) = run_tzip(
+        tmp.path(),
+        &["ls", "s3://mybucket/out.zip"],
+        &env_ref,
+    );
+    assert!(ls_ok);
+    let ls_out = String::from_utf8(stdout).unwrap();
+    assert!(ls_out.contains("seed.txt"), "seed missing after append");
+    for i in 0u32..20 {
+        let name = format!("page_{:03}.bin", i);
+        assert!(
+            ls_out.contains(&name),
+            "{} missing from archive after append",
+            name
+        );
+    }
+}
+
+#[test]
+fn s3_append_small_prefix_small_tail_still_uses_single_put() {
+    // Complementary to the above: ensure we DIDN'T regress the
+    // efficient path for everyday small appends. A tiny seed +
+    // single-file tail should stay on the single-PUT branch.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("a.txt"), b"a\n").unwrap();
+    run_tzip_create(tmp.path(), &["create", "out.zip", "a.txt", "-q"]);
+    let initial_body = fs::read(tmp.path().join("out.zip")).unwrap();
+    assert!(initial_body.len() < 5 * 1024 * 1024);
+
+    let server = serve_mock_s3_mpu("mybucket", "out.zip", initial_body);
+    fs::write(tmp.path().join("b.txt"), b"b\n").unwrap();
+    let env = env_s3(&server);
+    let env_ref = env_s3_refs(&env);
+    let (ok, _stdout, stderr) = run_tzip(
+        tmp.path(),
+        &["u", "s3://mybucket/out.zip", "b.txt"],
+        &env_ref,
+    );
+    assert!(ok, "small append failed: {}", stderr);
+    // Must use single-PUT (not multipart) for the tiny combined body.
+    assert!(
+        stderr.contains("single-PUT"),
+        "small-combined-body append must use single-PUT: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("multipart upload"),
+        "small-combined-body append must NOT escalate to multipart: {}",
+        stderr
+    );
 }
 
 #[test]

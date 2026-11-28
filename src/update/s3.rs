@@ -57,6 +57,23 @@ use crate::zipwriter::ZipWriter;
 /// which is S3's floor for non-last parts.
 const UPLOAD_PART_SIZE: u64 = 16 * 1024 * 1024;
 
+/// Combined (`prefix + new tail`) object size above which we prefer
+/// multipart over single-PUT even when the kept prefix is below
+/// `MIN_PART_SIZE`. S3 permits `PutObject` up to 5 GiB, but a
+/// single HTTP PUT at several dozen MiB over real-world networks
+/// is fragile — TCP timeouts, proxies, VPNs and cellular / Wi-Fi
+/// handoffs all produce `broken pipe` well below the 5 GiB
+/// ceiling (issue #112). Above this threshold, we reach for the
+/// hybrid `multipart_append_small_prefix` path which chunks the
+/// tail into 16 MiB parts regardless of how tiny the existing
+/// prefix is.
+///
+/// 32 MiB keeps the small-and-cheap single-PUT path for everyday
+/// small-archive appends (CI artifacts, logs, CDR-only grows),
+/// while catching any append body large enough to make single
+/// requests unreliable.
+const SINGLE_PUT_MAX_TOTAL: u64 = 32 * 1024 * 1024;
+
 /// Did `opts.archive` point at an `s3://` URL? If so, update mode
 /// takes the S3 append path instead of the local file path.
 pub fn is_s3_archive(archive: &Path) -> bool {
@@ -217,16 +234,26 @@ pub fn run_update_s3(opts: Options) -> Result<()> {
         .sync_all()
         .context("fsync temp append tail")?;
 
-    // ── 3. Decide dispatch: multipart or single-PUT fallback ─
+    // ── 3. Decide dispatch: multipart, small-prefix multipart, or single-PUT ─
     //
-    // Multipart's "all non-last parts ≥ 5 MiB" rule forces the
-    // fallback when the kept prefix is tiny — we can't send a
-    // sub-5-MiB `UploadPartCopy` as part 1, so we fetch the
-    // prefix client-side and send one `PutObject` instead.
+    // Three paths:
+    //   * `cd_offset + tail_len <= SINGLE_PUT_MAX_TOTAL`
+    //     → single-PUT fallback: one atomic `PutObject`. Simple,
+    //       fine for everyday small-archive growth.
+    //   * `cd_offset < MIN_PART_SIZE` but combined size is big
+    //     → `multipart_append_small_prefix` (issue #112): fetch
+    //       the tiny prefix client-side, merge it with the first
+    //       16 MiB of tail to form part 1, then stream the rest
+    //       as normal 16 MiB parts. Avoids the broken-pipe risk
+    //       of a huge single-PUT.
+    //   * `cd_offset >= MIN_PART_SIZE`
+    //     → standard multipart with server-side `UploadPartCopy`
+    //       for the kept prefix (zero bytes cross the client).
     let target = S3Target::open(spec)
         .with_context(|| format!("open s3 target for {}", archive_url))?;
 
-    if cd_offset < MIN_PART_SIZE {
+    let est_total = cd_offset + tail_len;
+    if est_total <= SINGLE_PUT_MAX_TOTAL {
         single_put_fallback(
             &target,
             &object_url,
@@ -235,6 +262,18 @@ pub fn run_update_s3(opts: Options) -> Result<()> {
             spec,
             orig_file_size,
             temp.path(),
+            tail_len,
+            opts.quiet,
+        )
+    } else if cd_offset < MIN_PART_SIZE {
+        multipart_append_small_prefix(
+            &target,
+            &object_url,
+            &source_etag,
+            cd_offset,
+            spec,
+            orig_file_size,
+            temp.as_file_mut(),
             tail_len,
             opts.quiet,
         )
@@ -507,11 +546,165 @@ fn multipart_append(
     Ok(())
 }
 
+/// Multipart append when the kept prefix is below `MIN_PART_SIZE`
+/// but the resulting object is too large for a single-PUT to be
+/// reliable (issue #112).
+///
+/// `UploadPartCopy` can't carry a sub-5-MiB region alone — S3
+/// rejects every non-last part < `MIN_PART_SIZE`. So we fetch the
+/// small prefix client-side (one Range GET), concatenate it with
+/// the first 16 MiB of our locally-encoded tail in memory, and
+/// send that as part #1 via `UploadPart`. Every subsequent part
+/// streams directly from the temp file via `upload_part_from_file`
+/// — no extra memory.
+///
+/// Peak memory for this path: `cd_offset + UPLOAD_PART_SIZE`
+/// (prefix + part-1 tail slice), bounded above by `MIN_PART_SIZE +
+/// UPLOAD_PART_SIZE = 21 MiB`.
+///
+/// The CAS story is identical to `multipart_append`: `If-Match` on
+/// `CompleteMultipartUpload` guarantees the live object only
+/// swaps if its ETag still matches what we opened.
+fn multipart_append_small_prefix(
+    target: &S3Target,
+    object_url: &str,
+    source_etag: &str,
+    cd_offset: u64,
+    spec: &str,
+    orig_file_size: u64,
+    temp: &mut File,
+    tail_len: u64,
+    quiet: bool,
+) -> Result<()> {
+    if !quiet {
+        eprintln!(
+            "tzip: cd_offset {} < 5 MiB with {}-byte tail — using small-prefix multipart (issue #112 path)",
+            cd_offset, tail_len
+        );
+    }
+
+    // Phase A: fetch the small prefix client-side. Same open-pattern
+    // as `single_put_fallback`; capped at `cd_offset < MIN_PART_SIZE`
+    // so the buffer is at most ~5 MiB.
+    let mut src = S3Source::open_with_len(spec, orig_file_size)
+        .with_context(|| format!("re-open s3 source for prefix fetch of {}", object_url))?;
+    let mut prefix = vec![0u8; cd_offset as usize];
+    src.seek(SeekFrom::Start(0))
+        .context("seek s3 source to 0")?;
+    src.read_exact(&mut prefix)
+        .context("read prefix bytes from s3 source")?;
+
+    let upload_id = target.create_multipart_upload()?;
+    if !quiet {
+        eprintln!("tzip: multipart upload {} started", upload_id);
+    }
+
+    let result = (|| -> Result<Vec<CompletedPart>> {
+        let mut parts: Vec<CompletedPart> = Vec::new();
+        let mut part_number: u32 = 1;
+
+        // Phase B: part #1 = prefix + first slice of tail. Sized to
+        // reach UPLOAD_PART_SIZE (16 MiB) so this is a healthy
+        // non-last part — well above S3's 5 MiB floor.
+        //
+        // If the entire tail is smaller than
+        // `UPLOAD_PART_SIZE - cd_offset`, we send prefix + all tail
+        // as a single (final) part — multipart with exactly one
+        // part. S3 permits that: last part is exempt from 5 MiB.
+        // But in practice we only reach this function when
+        // cd_offset + tail_len > SINGLE_PUT_MAX_TOTAL (32 MiB), so
+        // part #1 always clears MIN_PART_SIZE.
+        let tail_for_part1 = (UPLOAD_PART_SIZE.saturating_sub(cd_offset)).min(tail_len);
+        let mut part1 = prefix;
+        part1.reserve(tail_for_part1 as usize);
+        let before = part1.len();
+        part1.resize(before + tail_for_part1 as usize, 0);
+        temp.seek(SeekFrom::Start(0))?;
+        temp.read_exact(&mut part1[before..])
+            .context("read tail slice for part 1")?;
+        if !quiet {
+            eprintln!(
+                "tzip: upload-part     #{}  {} MiB (prefix {} + tail {} bytes)",
+                part_number,
+                (part1.len() as u64 + 1024 * 1024 - 1) / (1024 * 1024),
+                cd_offset,
+                tail_for_part1,
+            );
+        }
+        let etag = target.upload_part(&upload_id, part_number, &part1)?;
+        parts.push(CompletedPart { part_number, etag });
+        part_number += 1;
+        drop(part1);
+
+        // Phase C: remaining tail. Each chunk is UPLOAD_PART_SIZE
+        // (16 MiB) except the last, which takes everything left
+        // and is exempt from MIN_PART_SIZE.
+        let mut uploaded: u64 = tail_for_part1;
+        while uploaded < tail_len {
+            let remaining = tail_len - uploaded;
+            let this_part = if remaining > 2 * UPLOAD_PART_SIZE {
+                UPLOAD_PART_SIZE
+            } else {
+                remaining
+            };
+            if !quiet {
+                eprintln!(
+                    "tzip: upload-part     #{}  {} MiB (new tail)",
+                    part_number,
+                    (this_part + 1024 * 1024 - 1) / (1024 * 1024)
+                );
+            }
+            let etag = target.upload_part_from_file(
+                &upload_id,
+                part_number,
+                temp,
+                uploaded,
+                this_part,
+            )?;
+            parts.push(CompletedPart { part_number, etag });
+            part_number += 1;
+            uploaded += this_part;
+        }
+
+        Ok(parts)
+    })();
+
+    let parts = match result {
+        Ok(p) => p,
+        Err(e) => {
+            if !quiet {
+                eprintln!("tzip: upload failed, aborting multipart upload");
+            }
+            target.abort_multipart_upload(&upload_id);
+            return Err(e.context("s3 multipart upload (small prefix)"));
+        }
+    };
+
+    // Phase D: atomic Complete, same CAS semantics as `multipart_append`.
+    let if_match = if target.uses_custom_endpoint() {
+        None
+    } else {
+        Some(source_etag)
+    };
+    let new_etag = target
+        .complete_multipart_upload(&upload_id, &parts, if_match)
+        .map_err(|e| e.context("CompleteMultipartUpload"))?;
+
+    if !quiet {
+        eprintln!(
+            "tzip: s3 append complete — new etag {} for {}",
+            new_etag, object_url
+        );
+    }
+    Ok(())
+}
+
 /// Small-archive fallback: when the kept prefix is below
-/// `MIN_PART_SIZE`, multipart's "all non-last parts ≥ 5 MiB" rule
-/// forbids `UploadPartCopy` from carrying it alone. Fetch the
-/// prefix via `GET`, concat with the new tail, send one
-/// `PutObject` with `If-Match` for the same CAS semantics.
+/// `MIN_PART_SIZE` **AND** the combined result fits in
+/// `SINGLE_PUT_MAX_TOTAL`, fetch the prefix, concat with the new
+/// tail, send one `PutObject` with `If-Match` for the same CAS
+/// semantics. For larger combined bodies see
+/// `multipart_append_small_prefix` (issue #112).
 fn single_put_fallback(
     target: &S3Target,
     object_url: &str,
@@ -525,8 +718,9 @@ fn single_put_fallback(
 ) -> Result<()> {
     if !quiet {
         eprintln!(
-            "tzip: cd_offset {} < 5 MiB — using single-PUT fallback",
-            cd_offset
+            "tzip: cd_offset {} < 5 MiB, total ≤ {} MiB — using single-PUT fallback",
+            cd_offset,
+            SINGLE_PUT_MAX_TOTAL / (1024 * 1024)
         );
     }
     // Re-open the source for a single Range GET; cheaper than
@@ -538,11 +732,12 @@ fn single_put_fallback(
         .context("seek s3 source to 0")?;
     src.read_exact(&mut prefix)
         .context("read prefix bytes from s3 source")?;
-    // Concatenate prefix + temp tail into a single buffer. For
-    // the fallback path the total is < MIN_PART_SIZE + tail,
-    // bounded by whatever the user is appending; if the resulting
-    // object exceeds ~several GB the user should use multipart
-    // anyway (which kicks in automatically at cd_offset ≥ 5 MiB).
+    // Concatenate prefix + temp tail into a single buffer. The
+    // caller ensures `cd_offset + tail_len <= SINGLE_PUT_MAX_TOTAL`
+    // (32 MiB) so this request body stays well under the point
+    // where single PUT reliability degrades. Beyond that cap, the
+    // dispatcher routes through `multipart_append_small_prefix`
+    // instead (issue #112).
     let mut buf = prefix;
     buf.reserve(tail_len as usize);
     let mut temp_file = File::open(temp_path).context("reopen temp tail for PUT")?;
